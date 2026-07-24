@@ -28,6 +28,12 @@ MOCK_COORD = REPO / "rust" / "target" / "debug" / "quip-mock-coordinator"
 def _ensure_mock_coord() -> Path:
     if MOCK_COORD.is_file():
         return MOCK_COORD
+    # This end-to-end test drives the miner against the Rust quip-mock-coordinator,
+    # which lives in the quip-protocol workspace. In this standalone repo that
+    # workspace isn't present, so skip (the mock-coordinator is exercised by the
+    # coordinator's own repo).
+    if not (REPO / "rust").is_dir():
+        pytest.skip("quip-protocol rust workspace not present (standalone repo)")
     # Build if missing
     cargo = shutil.which("cargo")
     if not cargo:
