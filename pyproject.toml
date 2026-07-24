@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quip-miner-dwave"
+version = "0.3.0"
+description = "D-Wave (Ocean) QPU Ising miner for the quip.network v0.3 protocol"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "AGPL-3.0-or-later" }
+
+# quip_proto is the PyO3 SDK (miner gRPC stubs + scoring/wire/session). Pinned
+# to a shared tag of quip-protocol and built from source via maturin until it is
+# published to PyPI (needs Rust + protoc at install time).
+dependencies = [
+    "quip_proto @ git+https://gitlab.com/quip.network/quip-protocol.git@shared-v0.3.0#subdirectory=python",
+    "dwave-ocean-sdk>=9.0.0,<10",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio"]
+
+[project.scripts]
+quip-miner-dwave = "quip_miner_dwave.cli:main"
+
+[project.urls]
+Repository = "https://gitlab.com/quip.network/quip-miner-dwave"
+
+[tool.setuptools.packages.find]
+include = ["quip_miner_dwave*"]

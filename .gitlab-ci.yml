@@ -1,0 +1,58 @@
+stages: [test, build, release]
+
+variables:
+  PKG: quip-miner-dwave
+
+default:
+  image: python:3.12-slim
+  # quip_proto builds from source via maturin -> needs Rust + protoc + a compiler.
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq git curl build-essential protobuf-compiler
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    - . "$HOME/.cargo/env"
+    - pip install -q --upgrade pip
+
+test:
+  stage: test
+  script:
+    - pip install -e ".[dev]"
+    - pytest quip_miner_dwave/tests -v
+
+build-wheel:
+  stage: build
+  script:
+    - pip install -q build
+    - python -m build --wheel
+    - ls -l dist/
+  artifacts:
+    paths: [dist/]
+    expire_in: 1 week
+
+# On a tag: upload the wheel to the generic package registry and cut a Release.
+upload:
+  stage: release
+  image: curlimages/curl:latest
+  rules:
+    - if: $CI_COMMIT_TAG
+  before_script: []
+  script:
+    - |
+      for f in dist/*.whl; do
+        n=$(basename "$f")
+        curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$f" \
+          "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PKG}/${CI_COMMIT_TAG}/${n}"
+      done
+
+release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  rules:
+    - if: $CI_COMMIT_TAG
+  needs: [upload, build-wheel]
+  before_script: []
+  script:
+    - |
+      whl=$(basename dist/*.whl)
+      base="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PKG}/${CI_COMMIT_TAG}"
+      release-cli create --name "quip-miner-dwave ${CI_COMMIT_TAG}" --tag-name "${CI_COMMIT_TAG}" \
+        --assets-link "{\"name\":\"${whl}\",\"url\":\"${base}/${whl}\"}"
