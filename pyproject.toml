@@ -21,8 +21,10 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio"]
 
+# Console entry point matches the code's prog name and the coordinator's
+# default binary for the dwave backend.
 [project.scripts]
-quip-miner-dwave = "quip_miner_dwave.cli:main"
+quip-dwave-qa = "quip_miner_dwave.cli:main"
 
 [project.urls]
 Repository = "https://gitlab.com/quip.network/quip-miner-dwave"

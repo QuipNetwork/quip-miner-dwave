@@ -24,7 +24,7 @@ PyPI. A D-Wave Leap token is needed to reach real QPU hardware (set
 **Connect to a coordinator** (production):
 
 ```sh
-quip-miner-dwave --quip-coordinator unix:///run/quip/coord.sock
+quip-dwave-qa --quip-coordinator unix:///run/quip/coord.sock
 # or: python -m quip_miner_dwave --quip-coordinator ...
 ```
 
@@ -35,8 +35,8 @@ for golden-drawn problems, `--source list <jsonl>` for a fixed replay.
 **Introspection:**
 
 ```sh
-quip-miner-dwave --capabilities
-quip-miner-dwave --check
+quip-dwave-qa --capabilities
+quip-dwave-qa --check
 ```
 
 ## Tests
