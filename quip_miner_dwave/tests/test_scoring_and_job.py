@@ -54,6 +54,31 @@ def test_malformed_and_expired_rejects():
     sampler.close()
 
 
+def test_malformed_j_rejects():
+    # h decodes cleanly but j is not a whole number of i32s. Covers the second
+    # decode guard, which the h-only malformed case never reaches.
+    #
+    # The topology deliberately has no edges. With edges present, a swallowed
+    # decode error would leave j_vals empty and trip the j-length check
+    # instead, so the test would still see MALFORMED and prove nothing about
+    # the guard it is meant to cover.
+    sampler = OceanSampler(mock=True)
+    job = miner_pb2.Job(
+        job_id=b"bad-j",
+        kind=miner_pb2.ISING_SAMPLE,
+        deadline_ms=int(time.time() * 1000) + 60_000,
+        ising=miner_pb2.IsingProblem(
+            h_milli_le32=wire.encode_i32_le([1000, -1000]),
+            j_milli_le32=b"\x01\x02\x03",
+            num_reads=1,
+        ),
+    )
+    msgs = handle_job(job, sampler, session_nodes=[0, 1], session_edges=[])
+    assert len(msgs) == 1
+    assert msgs[0].reject.reason == miner_pb2.MALFORMED
+    sampler.close()
+
+
 def test_valid_job_produces_result_with_access_time():
     sampler = OceanSampler(mock=True)
     job = miner_pb2.Job(
