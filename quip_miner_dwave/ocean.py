@@ -386,11 +386,19 @@ class OceanSampler:
             samples.append(full)
             energies.append(e_corr)
 
+        # The cloud client aggregates identical reads into one record row
+        # carrying num_occurrences, so len(samples) counts distinct solutions,
+        # not anneals performed. Sum the occurrences to report reads actually
+        # run; the offline samplers do not aggregate, where the sum degrades to
+        # the row count anyway.
+        occurrences = getattr(ss.record, "num_occurrences", None)
+        reads_done = int(sum(occurrences)) if occurrences is not None else len(samples)
+
         return SampleResult(
             samples=samples,
             energies=energies,
             device_access_time_us=access_us,
-            num_reads=len(samples),
+            num_reads=reads_done,
             defect_info=defect_info,
             extra={"mock": "1" if self._is_mock else "0"},
         )
