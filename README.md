@@ -2,11 +2,17 @@
 
 D-Wave (Ocean) QPU Ising miner for the [quip.network](https://gitlab.com/quip.network)
 v0.3 mining protocol. Ships as a pip-installable Python package with a
-`quip-miner-dwave` console entry point.
+`quip-dwave-qa` console entry point.
 
 Unlike the classical miners (`quip-miner-cpu`/`-cuda`/`-metal`), there is no
-SA/Gibbs binary split — this backend samples on a D-Wave QPU via Ocean
-(`dwave.system.DWaveSampler`), with a classical fallback for tiny problems.
+SA/Gibbs binary split: this backend samples on a D-Wave QPU via Ocean
+(`dwave.system.DWaveSampler`), and every job goes to the QPU.
+
+For tests and offline runs, `QUIP_DWAVE_MOCK=1` or `--mock` swaps in a dimod
+sampler. The default is `ExactSolver`, which enumerates every state and so
+handles only the smallest problems. Set `QUIP_DWAVE_MOCK_BACKEND=sa` for
+`SimulatedAnnealingSampler`, which scales to realistic topology sizes. You
+select this path explicitly; the miner never switches to it on its own.
 
 ## Install
 
@@ -29,7 +35,7 @@ quip-dwave-qa --quip-coordinator unix:///run/quip/coord.sock
 ```
 
 **Driver / fixed-input (run in isolation, no chain).** Use the coordinator's
-`drive` harness pointed at the `quip-miner-dwave` entry point — `--source random`
+`drive` harness pointed at the `quip-dwave-qa` entry point — `--source random`
 for golden-drawn problems, `--source list <jsonl>` for a fixed replay.
 
 **Introspection:**
