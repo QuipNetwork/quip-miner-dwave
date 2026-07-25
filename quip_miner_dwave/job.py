@@ -5,7 +5,7 @@ import logging
 import time
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from quip_proto import miner_pb2, scoring, wire
+from quip_proto import miner_pb2, wire
 
 from quip_miner_dwave.ocean import OceanSampler, SampleResult
 
@@ -76,6 +76,12 @@ def handle_job(
     arrives). A ``topology_hash`` job with no cache rejects ``TOPOLOGY_MISSING``;
     a hash that differs from the cache rejects ``TOPOLOGY_MISMATCH`` — matching
     the Rust miners so both reject a topology desync identically.
+
+    ``h_milli_le32`` and ``j_milli_le32`` are dense positional arrays over the
+    resolved graph, so both must match it exactly: ``len(h) == len(nodes)`` and
+    ``len(j) == len(edges)``, or the job rejects ``MALFORMED``. Solving a
+    trimmed problem would return a plausible energy for a problem the
+    coordinator never sent.
     """
     job_id = job.job_id
 
@@ -147,11 +153,52 @@ def handle_job(
     if not nodes and h:
         nodes = list(range(len(h)))
 
-    h_dict = {int(nodes[i]): float(h[i]) for i in range(min(len(nodes), len(h)))}
-    j_dict: Dict[Tuple[int, int], float] = {}
-    for k, (u, v) in enumerate(edges):
-        if k < len(j_vals):
-            j_dict[(int(u), int(v))] = float(j_vals[k])
+    # ``h_milli_le32`` is a dense positional array over the resolved graph's
+    # nodes, so a length mismatch is a malformed job, not something to trim to
+    # fit: truncating drops biases the coordinator specified (or leaves trailing
+    # nodes unbiased) and then reports a credible energy for a different
+    # problem. Inline-EdgeList jobs derive nodes from ``len(h)`` and so can
+    # never trip this; it catches a job desynced from the session Topology.
+    if len(h) != len(nodes):
+        logger.warning(
+            "job %s: %d biases for a %d-node graph; rejecting MALFORMED",
+            job_id.hex(),
+            len(h),
+            len(nodes),
+        )
+        return [
+            miner_pb2.MinerMsg(
+                reject=miner_pb2.Reject(
+                    job_id=job_id, reason=miner_pb2.MALFORMED
+                )
+            )
+        ]
+
+    h_dict = {int(nodes[i]): float(h[i]) for i in range(len(nodes))}
+
+    # Same invariant for the couplings: ``j_milli_le32`` is positional over
+    # ``edges``, so a mismatch means the job and the resolved graph disagree.
+    # A short ``j`` is not "the rest are zero" — the wire format has no way to
+    # say that, so it is a desync, and silently un-coupling trailing edges
+    # changes the problem the QPU anneals.
+    if len(j_vals) != len(edges):
+        logger.warning(
+            "job %s: %d couplings for a %d-edge graph; rejecting MALFORMED",
+            job_id.hex(),
+            len(j_vals),
+            len(edges),
+        )
+        return [
+            miner_pb2.MinerMsg(
+                reject=miner_pb2.Reject(
+                    job_id=job_id, reason=miner_pb2.MALFORMED
+                )
+            )
+        ]
+
+    j_dict: Dict[Tuple[int, int], float] = {
+        (int(u), int(v)): float(j_vals[k]) for k, (u, v) in enumerate(edges)
+    }
 
     # Sampling budget precedence: per-job override > SetTarget override >
     # default. (Full energy-based adapt for the QPU path is a follow-up;
@@ -182,31 +229,17 @@ def handle_job(
         label=f"quip-{job_id.hex()[:8] if job_id else 'job'}",
     )
 
-    # ``scoring.energy_milli`` indexes ``spins[u]``/``spins[v]`` by edge
-    # endpoint, so edges must be positions into the dense spin vector (which is
-    # ordered by ``nodes``), not raw qubit ids. These coincide for inline
-    # EdgeList jobs (nodes == 0..n-1) but not for sparse session topologies.
-    pos = {int(n): i for i, n in enumerate(nodes)}
-    scored_edges: List[Tuple[int, int]] = []
-    scored_j: List[float] = []
-    for k, (u, v) in enumerate(edges):
-        if k >= len(j_vals):
-            break
-        iu = pos.get(int(u))
-        iv = pos.get(int(v))
-        if iu is not None and iv is not None:
-            scored_edges.append((iu, iv))
-            scored_j.append(j_vals[k])
-
+    # Report the sampler's own energy for the problem it actually annealed.
+    # Re-scoring here would buy nothing: the coordinator cannot trust a miner's
+    # energy regardless, so it re-scores whatever it accepts. ``energy_milli``
+    # is an integer field, so the only transform is quantizing to milli.
     solutions = []
-    for sample, _qpu_e in zip(result.samples, result.energies):
+    for sample, qpu_e in zip(result.samples, result.energies):
         spins = sample_dict_to_vector(sample, nodes if nodes else sorted(sample))
-        # Consensus energy: always recompute via golden-matched scorer
-        e_milli = scoring.energy_milli(spins, h, scored_j, scored_edges)
         solutions.append(
             miner_pb2.Solution(
                 spins_bytes=spins_to_bytes(spins),
-                energy_milli=e_milli,
+                energy_milli=int(round(qpu_e * 1000)),
             )
         )
 

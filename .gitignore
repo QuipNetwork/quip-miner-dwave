@@ -4,3 +4,11 @@ dist/
 build/
 *.egg-info/
 .venv/
+.env
+
+# Agent tooling state and assistant-specific instructions. AGENTS.md is the
+# cross-tool standard and is intentionally not ignored — it belongs in git.
+.serena/
+.claude/
+.codex/
+CLAUDE.md
