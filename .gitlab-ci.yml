@@ -5,6 +5,7 @@ variables:
 
 default:
   image: python:3.12-slim
+  tags: [linux, amd64]
   # quip_proto builds from source via maturin -> needs Rust + protoc + a compiler.
   before_script:
     - apt-get update -qq && apt-get install -y -qq git curl build-essential protobuf-compiler
