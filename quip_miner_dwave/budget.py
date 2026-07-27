@@ -9,6 +9,7 @@ uses start/continue hysteresis: idle until the pool reaches
 from __future__ import annotations
 
 import time
+import tomllib
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
@@ -39,10 +40,6 @@ def warn_unknown_backend_keys(toml_text: str) -> None:
     if not toml_text or not toml_text.strip():
         return
     try:
-        try:
-            import tomllib
-        except ImportError:  # pragma: no cover - py3.10
-            import tomli as tomllib  # type: ignore
         data = tomllib.loads(toml_text)
     except Exception:
         return
@@ -213,10 +210,6 @@ def budget_from_backend_toml(toml_text: str) -> Optional[QPUTimeManager]:
     if not toml_text or not toml_text.strip():
         return None
     try:
-        try:
-            import tomllib
-        except ImportError:  # pragma: no cover - py3.10
-            import tomli as tomllib  # type: ignore
         data = tomllib.loads(toml_text)
     except Exception:
         return None

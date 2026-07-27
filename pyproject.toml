@@ -7,7 +7,9 @@ name = "quip-miner-dwave"
 version = "0.3.0"
 description = "D-Wave (Ocean) QPU Ising miner for the quip.network v0.3 protocol"
 readme = "README.md"
-requires-python = ">=3.10"
+# Floor set by quip_proto, which requires >=3.11. Declaring 3.10 here made a
+# 3.10 install fail at dependency resolution instead of at metadata check.
+requires-python = ">=3.11"
 license = { text = "AGPL-3.0-or-later" }
 
 # quip_proto is the PyO3 SDK (miner gRPC stubs + scoring/wire/session). Tracks
