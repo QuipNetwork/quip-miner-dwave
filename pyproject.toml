@@ -11,10 +11,12 @@ requires-python = ">=3.10"
 license = { text = "AGPL-3.0-or-later" }
 
 # quip_proto is the PyO3 SDK (miner gRPC stubs + scoring/wire/session). Pinned
-# to a shared tag of quip-protocol and built from source via maturin until it is
-# published to PyPI (needs Rust + protoc at install time).
+# to a quip-protocol rev and built from source via maturin until it is published
+# to PyPI (needs Rust + protoc at install time). This is the same rev that
+# quip-miner-metal and quip-miner-cpu pin; it lives on quip-protocol's `v0.3`
+# branch, which has not merged to `main` yet.
 dependencies = [
-    "quip_proto @ git+https://gitlab.com/quip.network/quip-protocol.git@shared-v0.3.0#subdirectory=python",
+    "quip_proto @ git+https://gitlab.com/quip.network/quip-protocol.git@9c06503861fc90161a0f964bf63d4a1e89c260de#subdirectory=python",
     "dwave-ocean-sdk>=9.0.0,<10",
 ]
 
