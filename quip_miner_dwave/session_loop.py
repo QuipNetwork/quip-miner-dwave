@@ -50,6 +50,16 @@ def _status(
     )
 
 
+def _is_abandoned(generation: int, watermark: int) -> bool:
+    """True if a job's ``generation`` was abandoned by a Cancel(``watermark``).
+
+    Generation ``0`` is a mempool job with no PoW cancellation scope and is
+    never abandoned; a PoW job is abandoned once its generation is at or below
+    the coordinator's reseed watermark. Mirrors the Rust ``CancelGuard``.
+    """
+    return generation != 0 and generation <= watermark
+
+
 def _unix_target(uri: str) -> str:
     """Normalize ``unix:///path`` or bare path to a grpc UDS target."""
     if uri.startswith("unix://"):
@@ -100,6 +110,9 @@ def run_session(
             yield item
 
     jobs_done = 0
+    # Watermark set by Cancel(max_generation): any job at or below it belongs to
+    # a generation the coordinator abandoned on reseed and is skipped, not sampled.
+    cancel_watermark = 0
     grace_ms = 5000
     config: Optional[session_sdk.SessionConfig] = None
     session_nodes: list[int] = []
@@ -245,10 +258,23 @@ def run_session(
                 session_target = cm.set_target
             elif which == "job":
                 with state_lock:
+                    cancelled = _is_abandoned(cm.job.generation, cancel_watermark)
                     budget_ok = (
                         pending_budget is None
                         or pending_budget.should_mine().should_mine
                     )
+                if cancelled:
+                    # Abandoned generation (coordinator reseeded): don't spend
+                    # QPU access on it. Refund the credit so the coordinator
+                    # keeps the pipeline full — mirrors the Rust miners' skip at
+                    # dequeue. In-flight submissions are left to finish; the
+                    # coordinator discards their stale-generation Results.
+                    out_q.put(
+                        miner_pb2.MinerMsg(
+                            job_request=miner_pb2.JobRequest(credits=1)
+                        )
+                    )
+                    continue
                 if not budget_ok:
                     out_q.put(
                         miner_pb2.MinerMsg(
@@ -273,7 +299,10 @@ def run_session(
                 else:
                     process_job(*args)
             elif which == "cancel":
+                # Raise the reseed watermark so every job at/below max_generation
+                # is skipped at dequeue instead of sampled on the QPU.
                 with state_lock:
+                    cancel_watermark = max(cancel_watermark, cm.cancel.max_generation)
                     done = jobs_done
                 out_q.put(_status(miner_id, done, abandoned=1))
             elif which == "ping":
