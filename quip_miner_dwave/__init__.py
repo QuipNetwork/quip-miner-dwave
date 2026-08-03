@@ -3,7 +3,7 @@
 Binary entry point: ``quip-dwave-qa`` (``python -m quip_miner_dwave``).
 """
 
-__version__ = "0.3.0"
+__version__ = "0.3.0rc1"
 
 # sysexits-style exit codes (mirrored by quip_protocol::session::ExitCode)
 EXIT_CLEAN = 0
