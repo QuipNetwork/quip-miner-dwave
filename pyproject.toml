@@ -12,21 +12,20 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "AGPL-3.0-or-later" }
 
-# quip_proto is the PyO3 SDK (miner gRPC stubs + scoring/wire/session). Tracks
-# quip-protocol's `v0.3` branch and is built from source via maturin until it is
-# published to PyPI (needs Rust + protoc at install time). v0.3 has not merged to
-# quip-protocol's `main`, which is still v0.2.
+# quip_proto is the PyO3 SDK (miner gRPC stubs + scoring/wire/session). It comes
+# from quip-miner's GitLab PyPI package registry, not from a git URL, so
+# installing this miner does not have to compile the Rust extension:
 #
-# A branch, not a rev: installs resolve it at build time, so two installs on
-# different days can pick up different consensus primitives. That is deliberate
-# while v0.3 moves; pin a rev here once the protocol settles.
+#   pip install --extra-index-url \
+#     https://gitlab.com/api/v4/projects/71492472/packages/pypi/simple ...
 #
-# No `#subdirectory=` fragment: as of the v0.3 cutover the SDK's pyproject.toml
-# is the repo root (maturin, python-source = "python"). Naming the old `python`
-# subdirectory makes pip check out the ref and then fail with "does not appear
-# to be a Python project".
+# The registry serves a cp311-abi3 wheel for macOS/arm64 (one wheel for every
+# CPython >= 3.11) and an sdist for everything else. The sdist still needs Rust
+# and protoc; the wheel needs neither. A version range, not a pin: v0.3 is still
+# moving, so a floor plus the 0.4 wall keeps rc-to-rc bumps from having to land
+# in lockstep across both repos. Pin exactly once the protocol settles.
 dependencies = [
-    "quip_proto @ git+https://gitlab.com/quip.network/quip-protocol.git@v0.3",
+    "quip_proto>=0.3.0rc3,<0.4.0",
     "dwave-ocean-sdk>=9.0.0,<10",
 ]
 

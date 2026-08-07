@@ -2,11 +2,16 @@ stages: [test, build, release]
 
 variables:
   PKG: quip-miner-dwave
+  # quip_proto is published to quip-miner's (project 71492472) PyPI package
+  # registry rather than to PyPI. Public project, so this needs no credentials.
+  PIP_EXTRA_INDEX_URL: https://gitlab.com/api/v4/projects/71492472/packages/pypi/simple
 
 default:
   image: python:3.12-slim
   tags: [linux, amd64]
-  # quip_proto builds from source via maturin -> needs Rust + protoc + a compiler.
+  # These jobs run on linux/amd64, which the registry publishes no quip_proto
+  # wheel for, so pip builds the sdist here -> Rust + protoc + a compiler.
+  # macOS/arm64 users install the prebuilt abi3 wheel and need none of it.
   before_script:
     - apt-get update -qq && apt-get install -y -qq git curl build-essential protobuf-compiler
     - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y

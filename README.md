@@ -17,12 +17,22 @@ select this path explicitly; the miner never switches to it on its own.
 ## Install
 
 ```sh
-pip install "quip-miner-dwave @ git+https://gitlab.com/quip.network/quip-miner-dwave.git"
+pip install \
+  --extra-index-url https://gitlab.com/api/v4/projects/71492472/packages/pypi/simple \
+  "quip-miner-dwave @ git+https://gitlab.com/quip.network/quip-miner-dwave.git"
 ```
 
-The `quip_proto` SDK dependency is built from source (maturin), so installing
-needs **Rust** and **protoc** on the machine until `quip_proto` is published to
-PyPI. A D-Wave Leap token is needed to reach real QPU hardware (set
+The extra index is quip-miner's package registry, which is where the `quip_proto`
+SDK lives. That project is public, so the index needs no credentials.
+
+On **macOS/arm64** the registry carries a prebuilt `cp311-abi3` wheel covering
+every CPython 3.11 and later. pip unpacks that wheel as it comes, so the machine
+needs only Python. On every other platform pip falls back to the sdist and
+builds the PyO3 extension, which does need **Rust** and **protoc**. Adding
+`--only-binary quip_proto` turns that fallback into a hard failure instead of a
+silent compile.
+
+A D-Wave Leap token is needed to reach real QPU hardware (set
 `DWAVE_API_TOKEN`); offline/classical sampling needs no token.
 
 ## Running
