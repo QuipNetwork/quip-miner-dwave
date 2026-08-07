@@ -21,32 +21,44 @@ import os
 
 from PyInstaller.utils.hooks import collect_all
 
+# The repository root, one directory above this spec. CI installs the package
+# normally, so site-packages carries quip_miner_dwave; a development checkout
+# installs it with `pip install -e .`, which hides it behind a .pth import hook
+# that PyInstaller's static analysis does not follow. Without this the binary
+# built, ran, and died with "No module named 'quip_miner_dwave'".
+_ROOT = os.path.dirname(SPECPATH)  # noqa: F821 - PyInstaller global
+
 # collect_all() pulls submodules, data files and shared libraries for packages
 # whose imports PyInstaller cannot follow statically.
 #
 # `dwave` is a PEP 420 namespace package with no __init__.py, so each
 # subpackage has to be named on its own — collecting "dwave" finds nothing.
-# The rest are Ocean's runtime dependencies, imported lazily deep inside
-# dwave.cloud and dwave.system; without them the binary builds and then dies
-# with ModuleNotFoundError on first use.
+# The miner itself only touches dimod and dwave.system; the rest sit behind
+# lazy imports inside those two, and without them the binary builds and then
+# dies with ModuleNotFoundError on first use.
+#
+# The list is the transitive closure observed by importing dimod and
+# dwave.system and then reading sys.modules. Ocean 9 replaced dwave_networkx
+# with dwave.graphs and references neither penaltymodel, dwave.samplers nor
+# diskcache anywhere under dwave/ or dimod/, so collecting those four only
+# inflated the bundle.
 _PACKAGES = [
     "dimod",
     "dwave.cloud",
     "dwave.embedding",
-    "dwave.preprocessing",
-    "dwave.samplers",
-    "dwave.system",
+    "dwave.graphs",
     "dwave.optimization",
-    "dwave_networkx",
+    "dwave.preprocessing",
+    "dwave.system",
     "minorminer",
-    "penaltymodel",
     "homebase",
     "fasteners",
-    "diskcache",
     "plucky",
     # The quip_proto SDK is a compiled pyo3 abi3 extension (_core.abi3.so)
-    # alongside the generated gRPC stubs.
+    # alongside the generated gRPC stubs, which live in the separate top-level
+    # `quip` package (quip.v1.miner_pb2*) that quip_proto/__init__.py imports.
     "quip_proto",
+    "quip",
 ]
 
 datas, binaries, hiddenimports = [], [], []
@@ -72,7 +84,7 @@ _EXCLUDES = ["matplotlib", "pandas", "sklearn", "IPython", "tkinter"]
 
 a = Analysis(
     [os.path.join(SPECPATH, "quip_dwave_qa.py")],  # noqa: F821 - PyInstaller global
-    pathex=[],
+    pathex=[_ROOT],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
