@@ -16,14 +16,49 @@ select this path explicitly; the miner never switches to it on its own.
 
 ## Install
 
+### Released executable (macOS, Apple Silicon)
+
+Each release publishes `quip-dwave-qa-darwin-arm64`, a self-contained
+executable that bundles Python, the Ocean SDK, and the compiled `quip_proto`
+extension. Drop it in and run it. The host needs only the file.
+
+```sh
+TAG=v0.3.0-rc3   # or a later release
+BASE=https://gitlab.com/api/v4/projects/84792347/packages/generic/quip-miner-dwave
+curl -fLO "$BASE/$TAG/quip-dwave-qa-darwin-arm64"
+chmod +x quip-dwave-qa-darwin-arm64
+mv quip-dwave-qa-darwin-arm64 /usr/local/bin/quip-dwave-qa
+```
+
+Rename it, because the coordinator spawns whatever `[dwave] binary` names and
+its default is `quip-dwave-qa`. The CPU, CUDA, and Metal miners install the
+same way.
+
+### From source
+
 ```sh
 pip install "quip-miner-dwave @ git+https://gitlab.com/quip.network/quip-miner-dwave.git"
 ```
 
-The `quip_proto` SDK dependency is built from source (maturin), so installing
-needs **Rust** and **protoc** on the machine until `quip_proto` is published to
-PyPI. A D-Wave Leap token is needed to reach real QPU hardware (set
-`DWAVE_API_TOKEN`); offline/classical sampling needs no token.
+The `quip_proto` SDK dependency builds from source through maturin, so this path
+needs **Rust** and **protoc** on the machine.
+
+Reaching real QPU hardware takes a D-Wave Leap token, set through
+`DWAVE_API_TOKEN`. Offline and classical sampling take no token.
+
+### Building the executable yourself
+
+```sh
+pip install ".[dev]" pyinstaller
+pyinstaller --clean --noconfirm pyinstaller/quip-dwave-qa.spec
+QUIP_DWAVE_MOCK=1 ./dist/quip-dwave-qa --check
+```
+
+`pyinstaller/quip-dwave-qa.spec` names each collected package and gives the
+reason. Ocean keeps compiled modules inside PEP 420 namespace packages that
+PyInstaller does not find on its own, and PyInstaller reports a successful
+build for a binary that cannot import `dimod`. Run the result before trusting
+it.
 
 ## Running
 

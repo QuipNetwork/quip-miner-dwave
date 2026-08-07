@@ -29,7 +29,66 @@ build-wheel:
     paths: [dist/]
     expire_in: 1 week
 
-# On a tag: upload the wheel to the generic package registry and cut a Release.
+# The coordinator spawns miners as subprocesses (`[dwave] binary =
+# "quip-dwave-qa"`), so the miner also ships the way the CPU, CUDA and Metal
+# miners do: one self-contained executable per OS/arch, named so that stripping
+# the suffix gives the binary the coordinator asks for. The user's machine
+# needs nothing but the file.
+#
+# Runs on the group's Apple Silicon runners (`cray`, `tesla-arm`), which are
+# shell executors: `image:` does not apply and the default before_script's
+# apt-get would fail, so this job replaces it wholesale.
+build-macos-arm64:
+  stage: build
+  tags: [macos, arm64]
+  rules:
+    - if: $CI_COMMIT_TAG
+  variables:
+    CARGO_HOME: $CI_PROJECT_DIR/.cargo
+  before_script:
+    # quip_proto is a pyo3 extension compiled from source here. PyInstaller
+    # freezes the resulting .so into the executable, so this toolchain is a
+    # build-machine requirement only.
+    #
+    # --no-modify-path: CARGO_HOME sits inside the build directory, so the
+    # `source $CARGO_HOME/env` line rustup appends to the runner's shell
+    # profile would break every later login shell once the job is cleaned up.
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.97.1 --no-modify-path
+    - source "$CARGO_HOME/env"
+    # protobuf: quip-proto's build.rs runs protoc. python@3.12: quip_proto
+    # requires >= 3.11 and the runner's system python3 is below that floor.
+    - brew install protobuf python@3.12
+  script:
+    - python3.12 -m venv .venv
+    - . .venv/bin/activate
+    - pip install -q --upgrade pip
+    - pip install -q ".[dev]" pyinstaller
+    # Library-level check before freezing. A break in Ocean or quip_proto
+    # surfaces here with a readable traceback instead of as a
+    # ModuleNotFoundError from inside the bundle.
+    - pytest quip_miner_dwave/tests -q
+    - pyinstaller --clean --noconfirm --distpath dist --workpath .pyi-build pyinstaller/quip-dwave-qa.spec
+    - mv dist/quip-dwave-qa dist/quip-dwave-qa-darwin-arm64
+    - ls -l dist/
+    # The bundle has to run, not just build: PyInstaller reports success for a
+    # binary that cannot import Ocean. `--check` imports dimod and dwave, which
+    # is exactly what the namespace-package handling in the spec fixes.
+    - ./dist/quip-dwave-qa-darwin-arm64 --version
+    - ./dist/quip-dwave-qa-darwin-arm64 --capabilities
+    - QUIP_DWAVE_MOCK=1 ./dist/quip-dwave-qa-darwin-arm64 --check
+    # Self-contained means macOS system libraries only. A link against
+    # Homebrew's libpython or libprotobuf would mean the binary runs on this
+    # builder and nowhere else.
+    - otool -L dist/quip-dwave-qa-darwin-arm64 | tail -n +2
+    - "! otool -L dist/quip-dwave-qa-darwin-arm64 | grep -qE '/opt/homebrew|/usr/local'"
+  artifacts:
+    paths: [dist/]
+    expire_in: 1 week
+
+# On a tag: upload the wheel and the macOS executable to the generic package
+# registry, then cut a Release linking both. Neither build job is optional, so
+# a missing artifact means one of them failed — fail here rather than quietly
+# publishing a release with a hole in it.
 upload:
   stage: release
   image: curlimages/curl:latest
@@ -38,7 +97,13 @@ upload:
   before_script: []
   script:
     - |
-      for f in dist/*.whl; do
+      for want in dist/*.whl dist/quip-dwave-qa-darwin-arm64; do
+        if [ ! -f "$want" ]; then
+          echo "missing $want — an upstream build job did not produce it" >&2
+          exit 1
+        fi
+      done
+      for f in dist/*.whl dist/quip-dwave-qa-darwin-arm64; do
         n=$(basename "$f")
         curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$f" \
           "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PKG}/${CI_COMMIT_TAG}/${n}"
@@ -49,11 +114,13 @@ release:
   image: registry.gitlab.com/gitlab-org/release-cli:latest
   rules:
     - if: $CI_COMMIT_TAG
-  needs: [upload, build-wheel]
+  needs: [upload, build-wheel, build-macos-arm64]
   before_script: []
   script:
     - |
       whl=$(basename dist/*.whl)
+      bin=quip-dwave-qa-darwin-arm64
       base="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PKG}/${CI_COMMIT_TAG}"
       release-cli create --name "quip-miner-dwave ${CI_COMMIT_TAG}" --tag-name "${CI_COMMIT_TAG}" \
-        --assets-link "{\"name\":\"${whl}\",\"url\":\"${base}/${whl}\"}"
+        --assets-link "{\"name\":\"${whl}\",\"url\":\"${base}/${whl}\"}" \
+        --assets-link "{\"name\":\"${bin}\",\"url\":\"${base}/${bin}\"}"
