@@ -14,3 +14,9 @@ build/
 .claude/
 .codex/
 CLAUDE.md
+
+# Local operator artifacts, never commit
+leap_usage_report_*.csv
+qpu-1-logs/
+*.log
+*.log.[0-9]
