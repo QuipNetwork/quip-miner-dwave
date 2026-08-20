@@ -42,8 +42,9 @@ pip install "quip-miner-dwave @ git+https://gitlab.com/quip.network/quip-miner-d
 ```
 
 The `quip_solver_core` SDK dependency installs from a published PyPI wheel on
-platforms that have one (Linux). Elsewhere pip falls back to building it from
-source through maturin, which needs **Rust** and **protoc** on the machine.
+Linux (amd64 and aarch64) and macOS (Apple Silicon). Elsewhere pip falls back
+to building it from source through maturin, which needs **Rust** on the
+machine.
 
 Reaching real QPU hardware takes a D-Wave Leap token, set through
 `DWAVE_API_TOKEN`. Offline and classical sampling take no token.
