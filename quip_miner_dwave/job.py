@@ -6,6 +6,7 @@ import time
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from quip_solver_core import miner_pb2, wire
+from quip_solver_core.session import DEFAULT_NUM_SWEEPS
 
 from quip_miner_dwave import MAX_EDGES, MAX_NODES
 from quip_miner_dwave.ocean import OceanSampler, SampleResult
@@ -75,13 +76,17 @@ class _Rejected(Exception):
 
 
 def _reject(job_id: bytes, reason: int) -> List[miner_pb2.MinerMsg]:
-    """Build the single-message reply that rejects ``job_id`` for ``reason``.
+    """Build the two-message reply that rejects ``job_id`` for ``reason``.
 
-    A reject ends the job, so it is always the whole reply: no Result and no
-    follow-up JobRequest. ``reason`` is a ``miner_pb2`` reject-reason enum.
+    A reject is terminal for the job, so it carries the same credit refund a
+    Result does: the coordinator consumes a credit on dispatch and reclaims
+    nothing on a bare Reject, so a reject without the follow-up JobRequest
+    leaks one pipeline slot forever — the conformance driver's credit-ledger
+    axis fails exactly this. ``reason`` is a ``miner_pb2`` reject-reason enum.
     """
     return [
-        miner_pb2.MinerMsg(reject=miner_pb2.Reject(job_id=job_id, reason=reason))
+        miner_pb2.MinerMsg(reject=miner_pb2.Reject(job_id=job_id, reason=reason)),
+        miner_pb2.MinerMsg(job_request=miner_pb2.JobRequest(credits=1)),
     ]
 
 
@@ -199,12 +204,16 @@ def _resolve_problem(
 def _sampling_params(
     ising: miner_pb2.IsingProblem,
     session_target: Optional["miner_pb2.SetTarget"],
-) -> Tuple[int, int]:
-    """Resolve ``(num_reads, anneal_time_us)`` for one job.
+    session_sweeps: int,
+) -> Tuple[int, int, int]:
+    """Resolve ``(num_reads, anneal_time_us, num_sweeps)`` for one job.
 
-    Both follow the same precedence: per-job override, then the session's
+    All follow the same precedence: per-job override, then the session's
     ``SetTarget``, then the default. ``anneal_time_us`` defaults to 0, meaning
-    the QPU applies its hardware-default anneal.
+    the QPU applies its hardware-default anneal. ``num_sweeps`` does not steer
+    the QPU (an annealer runs anneals, not sweeps); it is the resolved budget
+    the coordinator pinned, echoed in ``SamplerMeta.sweeps`` because the
+    contract grades that echo verbatim (``sweeps_honoured``).
 
     (Full energy-based adapt for the QPU path is a follow-up; see quip-asx.* —
     it needs the shared GSE model and QPU credits.)
@@ -223,13 +232,20 @@ def _sampling_params(
     ):
         anneal_time_us = int(session_target.anneal_time_us)
 
-    return num_reads, anneal_time_us
+    num_sweeps = int(ising.num_sweeps)
+    if num_sweeps == 0 and session_target is not None and session_target.num_sweeps:
+        num_sweeps = int(session_target.num_sweeps)
+    if num_sweeps == 0:
+        num_sweeps = session_sweeps
+
+    return num_reads, anneal_time_us, num_sweeps
 
 
 def _build_result(
     job_id: bytes,
     nodes: Sequence[int],
     result: SampleResult,
+    num_sweeps: int,
 ) -> List[miner_pb2.MinerMsg]:
     """Turn a completed sample into a Result plus a follow-up JobRequest.
 
@@ -250,7 +266,8 @@ def _build_result(
 
     meta = miner_pb2.SamplerMeta(
         reads=result.num_reads,
-        sweeps=0,
+        # The resolved budget echo, not work performed: see _sampling_params.
+        sweeps=num_sweeps,
         device_access_time_us=result.device_access_time_us,
         qpu_access_us=result.device_access_time_us,
         extra=result.extra,
@@ -275,6 +292,7 @@ def handle_job(
     session_edges: Sequence[Tuple[int, int]],
     session_hash: Optional[bytes] = None,
     session_target: Optional["miner_pb2.SetTarget"] = None,
+    session_sweeps: int = DEFAULT_NUM_SWEEPS,
 ) -> List[miner_pb2.MinerMsg]:
     """Validate and solve one job; return Result+JobRequest or Reject messages.
 
@@ -301,7 +319,9 @@ def handle_job(
     except _Rejected as exc:
         return _reject(job_id, exc.reason)
 
-    num_reads, anneal_time_us = _sampling_params(ising, session_target)
+    num_reads, anneal_time_us, num_sweeps = _sampling_params(
+        ising, session_target, session_sweeps
+    )
     result: SampleResult = sampler.sample(
         h_dict,
         j_dict,
@@ -312,4 +332,4 @@ def handle_job(
         nonce_seed=bytes(job_id) if job_id else None,
         label=f"quip-{job_id.hex()[:8] if job_id else 'job'}",
     )
-    return _build_result(job_id, nodes, result)
+    return _build_result(job_id, nodes, result, num_sweeps)

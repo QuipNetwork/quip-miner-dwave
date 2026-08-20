@@ -34,6 +34,7 @@ from quip_miner_dwave.budget import (
     warn_unknown_backend_keys,
 )
 from quip_miner_dwave.job import handle_job
+from quip_solver_core.session import DEFAULT_NUM_SWEEPS, num_sweeps_from_toml
 from quip_miner_dwave.ocean import OceanSampler
 
 logger = logging.getLogger(__name__)
@@ -281,6 +282,7 @@ def run_session(
     session_edges: list[Tuple[int, int]] = []
     session_hash: Optional[bytes] = None
     session_target: Optional[miner_pb2.SetTarget] = None
+    session_sweeps: int = DEFAULT_NUM_SWEEPS
     pending_budget = budget
     # Pipeline: up to queue_depth QPU submissions in flight (overlaps cloud RTT).
     # jobs_done + pending_budget are shared with worker threads -> guard them.
@@ -290,7 +292,7 @@ def run_session(
     best_energy_milli: Optional[int] = None
     PROGRESS_LOG_INTERVAL = 10
 
-    def process_job(job, s_nodes, s_edges, s_hash, s_target):
+    def process_job(job, s_nodes, s_edges, s_hash, s_target, s_sweeps):
         # Runs on a pool thread: sample (blocking on the QPU), then enqueue
         # replies. Shared-state mutations are guarded by state_lock.
         nonlocal jobs_done, best_energy_milli
@@ -302,6 +304,7 @@ def run_session(
             session_edges=s_edges,
             session_hash=s_hash,
             session_target=s_target,
+            session_sweeps=s_sweeps,
         )
         wall_ms = int((time.monotonic() - started) * 1000)
         for reply in replies:
@@ -434,6 +437,9 @@ def run_session(
                 # Uniform config handling: warn on any key the dwave schema
                 # doesn't recognize before consuming the ones it does.
                 warn_unknown_backend_keys(cm.configure.backend_toml)
+                # Session-wide sweep budget: a top-level num_sweeps key, or
+                # the SDK default. Echoed per Result in SamplerMeta.sweeps.
+                session_sweeps = num_sweeps_from_toml(cm.configure.backend_toml)
                 if pending_budget is None and cm.configure.backend_toml:
                     pending_budget = budget_from_backend_toml(cm.configure.backend_toml)
                 out_q.put(miner_pb2.MinerMsg(ready=miner_pb2.Ready()))
@@ -491,6 +497,14 @@ def run_session(
                             )
                         )
                     )
+                    # A reject is terminal: refund the credit like job.py's
+                    # reject path, or the budget gate starves dispatch one
+                    # slot per rejected job.
+                    out_q.put(
+                        miner_pb2.MinerMsg(
+                            job_request=miner_pb2.JobRequest(credits=1)
+                        )
+                    )
                     continue
                 # Submit for concurrent sampling; the pool bounds in-flight to
                 # queue_depth (credits keep the coordinator dispatching that many).
@@ -500,6 +514,7 @@ def run_session(
                     list(session_edges),
                     session_hash,
                     session_target,
+                    session_sweeps,
                 )
                 if job_pool is not None:
                     job_pool.submit(process_job, *args)
