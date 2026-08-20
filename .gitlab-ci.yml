@@ -41,34 +41,17 @@ build-macos-arm64:
   tags: [macos, arm64]
   rules:
     - if: $CI_COMMIT_TAG
-  variables:
-    CARGO_HOME: $CI_PROJECT_DIR/.cargo
   before_script:
-    # quip-solver-core publishes no macOS wheel, so pip builds its pyo3
-    # extension from source here. PyInstaller freezes the resulting .so
-    # into the executable, so this toolchain is a build-machine requirement
-    # only.
-    #
-    # --no-modify-path: CARGO_HOME sits inside the build directory, so the
-    # `source $CARGO_HOME/env` line rustup appends to the runner's shell
-    # profile would break every later login shell once the job is cleaned up.
-    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.97.1 --no-modify-path
-    - source "$CARGO_HOME/env"
-    # protobuf: quip-solver-core's build.rs runs protoc. python@3.12:
-    # quip-solver-core requires >= 3.11 and the runner's system python3 is
-    # below that floor.
-    - brew install protobuf python@3.12
+    # python@3.12: quip-solver-core requires >= 3.11 and the runner's system
+    # python3 is below that floor. No build toolchain: quip-solver-core
+    # publishes a macOS arm64 wheel since 0.0.1-rc1, so pip installs it
+    # prebuilt — the rustup/protobuf bootstrap that built it from source is
+    # gone with the source build.
+    - brew install python@3.12
   script:
     - python3.12 -m venv .venv
     - . .venv/bin/activate
     - pip install -q --upgrade pip
-    # From the repository tag, not the PyPI sdist: the 0.0.0 sdist marks the
-    # `quip` gRPC-stub package wheel-only ([tool.maturin] include in its
-    # pyproject), so a build from the sdist installs without `quip` and every
-    # import fails. The repository tree carries the package, and this
-    # preinstalled 0.0.0 satisfies the `==0.0.0` pin below, so pip does not
-    # fall back to the sdist.
-    - pip install -q "quip-solver-core @ git+https://gitlab.com/quip.network/quip-solver-core.git@v0.0.0"
     - pip install -q ".[dev]" pyinstaller
     # Library-level check before freezing. A break in Ocean or
     # quip_solver_core surfaces here with a readable traceback instead of as a
