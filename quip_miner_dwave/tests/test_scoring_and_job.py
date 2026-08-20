@@ -34,7 +34,8 @@ def test_malformed_and_expired_rejects():
         ),
     )
     msgs = handle_job(bad, sampler, session_nodes=[0, 1], session_edges=[(0, 1)])
-    assert len(msgs) == 1
+    assert [m.WhichOneof("msg") for m in msgs] == ["reject", "job_request"]
+    assert msgs[1].job_request.credits == 1
     assert msgs[0].reject.reason == miner_pb2.MALFORMED
 
     # EXPIRED
@@ -73,7 +74,8 @@ def test_oversized_job_rejects_too_large():
         ),
     )
     msgs = handle_job(big, sampler, session_nodes=list(range(n)), session_edges=[])
-    assert len(msgs) == 1
+    assert [m.WhichOneof("msg") for m in msgs] == ["reject", "job_request"]
+    assert msgs[1].job_request.credits == 1
     assert msgs[0].reject.reason == miner_pb2.TOO_LARGE
     sampler.close()
 
@@ -98,7 +100,8 @@ def test_malformed_j_rejects():
         ),
     )
     msgs = handle_job(job, sampler, session_nodes=[0, 1], session_edges=[])
-    assert len(msgs) == 1
+    assert [m.WhichOneof("msg") for m in msgs] == ["reject", "job_request"]
+    assert msgs[1].job_request.credits == 1
     assert msgs[0].reject.reason == miner_pb2.MALFORMED
     sampler.close()
 
@@ -202,7 +205,8 @@ def test_topology_hash_job_without_cache_rejects_missing():
     msgs = handle_job(
         job, sampler, session_nodes=[], session_edges=[], session_hash=None
     )
-    assert len(msgs) == 1
+    assert [m.WhichOneof("msg") for m in msgs] == ["reject", "job_request"]
+    assert msgs[1].job_request.credits == 1
     assert msgs[0].reject.reason == miner_pb2.TOPOLOGY_MISSING
     sampler.close()
 
@@ -217,7 +221,8 @@ def test_topology_hash_job_wrong_hash_rejects_mismatch():
         session_edges=[(0, 1)],
         session_hash=b"\x11" * 32,
     )
-    assert len(msgs) == 1
+    assert [m.WhichOneof("msg") for m in msgs] == ["reject", "job_request"]
+    assert msgs[1].job_request.credits == 1
     assert msgs[0].reject.reason == miner_pb2.TOPOLOGY_MISMATCH
     sampler.close()
 
@@ -334,7 +339,8 @@ def test_h_longer_than_session_topology_rejects_malformed():
     sampler = OceanSampler(mock=True)
     job = _topology_job(b"h-long", [1000, -1000, 250])
     msgs = handle_job(job, sampler, session_nodes=[10, 20], session_edges=[(10, 20)])
-    assert len(msgs) == 1
+    assert [m.WhichOneof("msg") for m in msgs] == ["reject", "job_request"]
+    assert msgs[1].job_request.credits == 1
     assert msgs[0].reject.reason == miner_pb2.MALFORMED
     sampler.close()
 
@@ -344,7 +350,8 @@ def test_h_shorter_than_session_topology_rejects_malformed():
     sampler = OceanSampler(mock=True)
     job = _topology_job(b"h-short", [1000])
     msgs = handle_job(job, sampler, session_nodes=[10, 20], session_edges=[(10, 20)])
-    assert len(msgs) == 1
+    assert [m.WhichOneof("msg") for m in msgs] == ["reject", "job_request"]
+    assert msgs[1].job_request.credits == 1
     assert msgs[0].reject.reason == miner_pb2.MALFORMED
     sampler.close()
 
@@ -367,7 +374,8 @@ def test_j_longer_than_topology_edges_rejects_malformed():
     sampler = OceanSampler(mock=True)
     job = _topology_job(b"j-long", [1000, -1000], [500, 250])
     msgs = handle_job(job, sampler, session_nodes=[10, 20], session_edges=[(10, 20)])
-    assert len(msgs) == 1
+    assert [m.WhichOneof("msg") for m in msgs] == ["reject", "job_request"]
+    assert msgs[1].job_request.credits == 1
     assert msgs[0].reject.reason == miner_pb2.MALFORMED
     sampler.close()
 
@@ -380,8 +388,68 @@ def test_j_shorter_than_topology_edges_rejects_malformed():
     msgs = handle_job(
         job, sampler, session_nodes=_TWO_EDGE_NODES, session_edges=_TWO_EDGES
     )
-    assert len(msgs) == 1
+    assert [m.WhichOneof("msg") for m in msgs] == ["reject", "job_request"]
+    assert msgs[1].job_request.credits == 1
     assert msgs[0].reject.reason == miner_pb2.MALFORMED
+    sampler.close()
+
+
+def test_result_meta_echoes_the_resolved_sweep_budget():
+    """``SamplerMeta.sweeps`` echoes the resolved budget (the pin is a budget,
+    not work the QPU performs), with per-job > SetTarget > session-default
+    precedence. The conformance driver's ``sweeps_honoured`` axis grades the
+    echo verbatim; it was hardcoded 0 before."""
+    from quip_solver_core.session import DEFAULT_NUM_SWEEPS
+
+    sampler = OceanSampler(mock=True)
+
+    def job(num_sweeps=0):
+        return miner_pb2.Job(
+            job_id=b"job-sweeps",
+            kind=miner_pb2.ISING_SAMPLE,
+            deadline_ms=int(time.time() * 1000) + 60_000,
+            ising=miner_pb2.IsingProblem(
+                h_milli_le32=wire.encode_i32_le([1000, -1000]),
+                j_milli_le32=wire.encode_i32_le([500]),
+                edges=miner_pb2.EdgeList(u=[0], v=[1]),
+                num_reads=1,
+                num_sweeps=num_sweeps,
+            ),
+        )
+
+    def meta_sweeps(msgs):
+        return next(
+            m.result.meta.sweeps for m in msgs if m.WhichOneof("msg") == "result"
+        )
+
+    kw = dict(session_nodes=[0, 1], session_edges=[(0, 1)])
+    # Absolute default.
+    assert meta_sweeps(handle_job(job(), sampler, **kw)) == DEFAULT_NUM_SWEEPS
+    # Session default, as resolved from Configure.backend_toml.
+    assert meta_sweeps(handle_job(job(), sampler, session_sweeps=512, **kw)) == 512
+    # A SetTarget pin wins over the session default.
+    target = miner_pb2.SetTarget(num_sweeps=256)
+    assert (
+        meta_sweeps(
+            handle_job(
+                job(), sampler, session_target=target, session_sweeps=512, **kw
+            )
+        )
+        == 256
+    )
+    # A per-job override wins over everything.
+    assert (
+        meta_sweeps(
+            handle_job(
+                job(num_sweeps=128),
+                sampler,
+                session_target=target,
+                session_sweeps=512,
+                **kw,
+            )
+        )
+        == 128
+    )
     sampler.close()
 
 
