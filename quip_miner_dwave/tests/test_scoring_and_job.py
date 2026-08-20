@@ -2,7 +2,7 @@
 import time
 from typing import Dict, Optional, Tuple
 
-from quip_proto import miner_pb2, scoring, wire
+from quip_solver_core import miner_pb2, scoring, wire
 
 from quip_miner_dwave.job import handle_job
 from quip_miner_dwave.ocean import OceanSampler, SampleResult
@@ -51,6 +51,30 @@ def test_malformed_and_expired_rejects():
     )
     msgs = handle_job(expired, sampler, session_nodes=[0, 1], session_edges=[(0, 1)])
     assert msgs[0].reject.reason == miner_pb2.EXPIRED
+    sampler.close()
+
+
+def test_oversized_job_rejects_too_large():
+    # The capability envelope (MAX_NODES) advertised in Hello/Capabilities is
+    # enforced: a job above it must reject TOO_LARGE, never reach the sampler.
+    from quip_miner_dwave import MAX_NODES
+
+    sampler = OceanSampler(mock=True)
+    n = MAX_NODES + 1
+    big = miner_pb2.Job(
+        job_id=b"huge",
+        kind=miner_pb2.ISING_SAMPLE,
+        deadline_ms=int(time.time() * 1000) + 60_000,
+        ising=miner_pb2.IsingProblem(
+            h_milli_le32=wire.encode_i32_le([0] * n),
+            j_milli_le32=b"",
+            edges=miner_pb2.EdgeList(u=[], v=[]),
+            num_reads=1,
+        ),
+    )
+    msgs = handle_job(big, sampler, session_nodes=list(range(n)), session_edges=[])
+    assert len(msgs) == 1
+    assert msgs[0].reject.reason == miner_pb2.TOO_LARGE
     sampler.close()
 
 

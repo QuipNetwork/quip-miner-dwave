@@ -5,8 +5,9 @@ import logging
 import time
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from quip_proto import miner_pb2, wire
+from quip_solver_core import miner_pb2, wire
 
+from quip_miner_dwave import MAX_EDGES, MAX_NODES
 from quip_miner_dwave.ocean import OceanSampler, SampleResult
 
 logger = logging.getLogger(__name__)
@@ -119,6 +120,13 @@ def _validate_job(
         j_vals = decode_milli_f64(ising.j_milli_le32) if ising.j_milli_le32 else []
     except ValueError:
         raise _Rejected(miner_pb2.MALFORMED) from None
+
+    # TOO_LARGE: the job exceeds the capability envelope this backend
+    # advertises in Hello, Capabilities, and --capabilities. Sampling past it
+    # would hand Ocean (or the exact mock solver) a problem the miner never
+    # claimed to serve.
+    if len(h) > MAX_NODES or len(j_vals) > MAX_EDGES:
+        raise _Rejected(miner_pb2.TOO_LARGE)
 
     if job.deadline_ms and job.deadline_ms < now_unix_ms():
         raise _Rejected(miner_pb2.EXPIRED)

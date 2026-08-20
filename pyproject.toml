@@ -4,30 +4,25 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "quip-miner-dwave"
-version = "0.3.0"
+version = "0.3.1rc1"
 description = "D-Wave (Ocean) QPU Ising miner for the quip.network v0.3 protocol"
 readme = "README.md"
-# Floor set by quip_proto, which requires >=3.11. Declaring 3.10 here made a
-# 3.10 install fail at dependency resolution instead of at metadata check.
+# Floor set by quip_solver_core, which requires >=3.11. Declaring 3.10 here
+# made a 3.10 install fail at dependency resolution instead of at metadata
+# check.
 requires-python = ">=3.11"
 license = { text = "AGPL-3.0-or-later" }
 
-# quip_proto is the PyO3 SDK (miner gRPC stubs + scoring/wire/session). Built
-# from source via maturin until it is published to PyPI (needs Rust + protoc at
-# install time).
+# quip_solver_core is the published PyO3 SDK (miner gRPC stubs +
+# scoring/wire/session), installed as a prebuilt wheel from PyPI.
 #
-# A rev, not a branch. This repo has no lockfile, so a branch ref let two
-# installs on different days resolve different consensus primitives — tolerable
-# while v0.3 moved, not for a stable release. b13ac8f7 is the v0.3 tip this
-# release was built and tested against; the Rust miners pin the same rev through
-# their Cargo.lock. Move it deliberately, together with a version bump.
-#
-# No `#subdirectory=` fragment: as of the v0.3 cutover the SDK's pyproject.toml
-# is the repo root (maturin, python-source = "python"). Naming the old `python`
-# subdirectory makes pip check out the ref and then fail with "does not appear
-# to be a Python project".
+# An exact version, not a floating range. This repo has no lockfile, so a
+# floating dependency let two installs on different days resolve different
+# consensus primitives — tolerable while the SDK lived at a moving git branch,
+# not for a stable release. Move the pin deliberately, together with a version
+# bump.
 dependencies = [
-    "quip_proto @ git+https://gitlab.com/quip.network/quip-protocol.git@b13ac8f723ef38049b83e6390659f381ddfbeb17",
+    "quip-solver-core==0.0.0",
     "dwave-ocean-sdk>=9.0.0,<10",
 ]
 

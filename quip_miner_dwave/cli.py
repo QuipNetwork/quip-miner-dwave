@@ -9,9 +9,9 @@ import signal
 import sys
 import threading
 
+from google.protobuf.json_format import MessageToDict
+
 from quip_miner_dwave import (
-    ALGORITHM,
-    BACKEND,
     EXIT_CLEAN,
     EXIT_CONFIG_INVALID,
     EXIT_ENV_INCOMPATIBLE,
@@ -24,7 +24,7 @@ from quip_miner_dwave.ocean import (
     mock_mode_enabled,
     ocean_importable,
 )
-from quip_miner_dwave.session_loop import run_session_sync
+from quip_miner_dwave.session_loop import capabilities_message, run_session_sync
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -63,16 +63,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def print_capabilities() -> None:
+    """SPEC section 8: print the protobuf JSON mapping of ``Capabilities``.
+
+    Field names are lowerCamelCase and the output stays identical to the
+    in-session ``GetCapabilities`` reply — the two are one message.
+    """
     print(
         json.dumps(
-            {
-                "backend": BACKEND,
-                "algorithm": ALGORITHM,
-                "supported_kinds": ["ISING_SAMPLE"],
-                "max_nodes": 10000,
-                "max_edges": 100000,
-                "features": ["quantum-anneal", "native-topology"],
-            }
+            MessageToDict(
+                capabilities_message(),
+                always_print_fields_with_no_presence=True,
+                preserving_proto_field_name=False,
+            )
         )
     )
 

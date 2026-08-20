@@ -14,3 +14,9 @@ EXIT_TOKEN_REJECTED = 77
 
 BACKEND = "dwave-qpu"
 ALGORITHM = "quantum-anneal"
+# Capability advertisement, shared between --capabilities (cli.py) and the
+# live Hello/Capabilities session traffic (session_loop.py) so the two never
+# drift apart.
+MAX_NODES = 10_000
+MAX_EDGES = 100_000
+FEATURES = ("quantum-anneal", "native-topology")

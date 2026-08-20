@@ -19,8 +19,9 @@ select this path explicitly; the miner never switches to it on its own.
 ### Released executable (macOS, Apple Silicon)
 
 Each release publishes `quip-dwave-qa-darwin-arm64`, a self-contained
-executable that bundles Python, the Ocean SDK, and the compiled `quip_proto`
-extension. Drop it in and run it. The host needs only the file.
+executable that bundles Python, the Ocean SDK, and the compiled
+`quip_solver_core` extension. Drop it in and run it. The host needs only the
+file.
 
 ```sh
 TAG=v0.3.0-rc3   # or a later release
@@ -40,8 +41,9 @@ same way.
 pip install "quip-miner-dwave @ git+https://gitlab.com/quip.network/quip-miner-dwave.git"
 ```
 
-The `quip_proto` SDK dependency builds from source through maturin, so this path
-needs **Rust** and **protoc** on the machine.
+The `quip_solver_core` SDK dependency installs from a published PyPI wheel on
+platforms that have one (Linux). Elsewhere pip falls back to building it from
+source through maturin, which needs **Rust** and **protoc** on the machine.
 
 Reaching real QPU hardware takes a D-Wave Leap token, set through
 `DWAVE_API_TOKEN`. Offline and classical sampling take no token.
