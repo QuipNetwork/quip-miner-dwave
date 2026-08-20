@@ -6,11 +6,9 @@ variables:
 default:
   image: python:3.12-slim
   tags: [linux, amd64]
-  # quip_proto builds from source via maturin -> needs Rust + protoc + a compiler.
+  # quip_solver_core installs from a published PyPI wheel on Linux -> no Rust,
+  # protoc, or compiler needed here.
   before_script:
-    - apt-get update -qq && apt-get install -y -qq git curl build-essential protobuf-compiler
-    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-    - . "$HOME/.cargo/env"
     - pip install -q --upgrade pip
 
 test:
@@ -46,25 +44,27 @@ build-macos-arm64:
   variables:
     CARGO_HOME: $CI_PROJECT_DIR/.cargo
   before_script:
-    # quip_proto is a pyo3 extension compiled from source here. PyInstaller
-    # freezes the resulting .so into the executable, so this toolchain is a
-    # build-machine requirement only.
+    # quip-solver-core publishes no macOS wheel, so pip builds its pyo3
+    # extension from the sdist here. PyInstaller freezes the resulting .so
+    # into the executable, so this toolchain is a build-machine requirement
+    # only.
     #
     # --no-modify-path: CARGO_HOME sits inside the build directory, so the
     # `source $CARGO_HOME/env` line rustup appends to the runner's shell
     # profile would break every later login shell once the job is cleaned up.
     - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.97.1 --no-modify-path
     - source "$CARGO_HOME/env"
-    # protobuf: quip-proto's build.rs runs protoc. python@3.12: quip_proto
-    # requires >= 3.11 and the runner's system python3 is below that floor.
+    # protobuf: quip-solver-core's build.rs runs protoc. python@3.12:
+    # quip-solver-core requires >= 3.11 and the runner's system python3 is
+    # below that floor.
     - brew install protobuf python@3.12
   script:
     - python3.12 -m venv .venv
     - . .venv/bin/activate
     - pip install -q --upgrade pip
     - pip install -q ".[dev]" pyinstaller
-    # Library-level check before freezing. A break in Ocean or quip_proto
-    # surfaces here with a readable traceback instead of as a
+    # Library-level check before freezing. A break in Ocean or
+    # quip_solver_core surfaces here with a readable traceback instead of as a
     # ModuleNotFoundError from inside the bundle.
     - pytest quip_miner_dwave/tests -q
     - pyinstaller --clean --noconfirm --distpath dist --workpath .pyi-build pyinstaller/quip-dwave-qa.spec

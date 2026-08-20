@@ -54,10 +54,11 @@ _PACKAGES = [
     "homebase",
     "fasteners",
     "plucky",
-    # The quip_proto SDK is a compiled pyo3 abi3 extension (_core.abi3.so)
-    # alongside the generated gRPC stubs, which live in the separate top-level
-    # `quip` package (quip.v1.miner_pb2*) that quip_proto/__init__.py imports.
-    "quip_proto",
+    # The quip_solver_core SDK is a compiled pyo3 abi3 extension
+    # (_core.abi3.so) alongside the generated gRPC stubs, which live in the
+    # separate top-level `quip` package (quip.v1.miner_pb2*) that
+    # quip_solver_core/__init__.py imports.
+    "quip_solver_core",
     "quip",
 ]
 

@@ -24,6 +24,11 @@ def test_capabilities(capsys):
     out = capsys.readouterr().out
     assert "dwave-qpu" in out
     assert "quantum-anneal" in out
+    # SPEC section 8: protobuf JSON field names (lowerCamelCase), including
+    # the fields the pre-0.0.0 hand-written output omitted.
+    assert "maxNodes" in out
+    assert "streamWidth" in out
+    assert "protocolVersion" in out
 
 
 def test_missing_coordinator():

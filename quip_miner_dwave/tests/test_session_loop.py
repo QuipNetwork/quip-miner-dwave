@@ -6,9 +6,11 @@ import logging
 
 from quip_miner_dwave.session_loop import (
     _is_abandoned,
+    capabilities_message,
     log_attempt,
     log_progress,
 )
+from quip_miner_dwave import ALGORITHM, BACKEND, FEATURES, MAX_EDGES, MAX_NODES
 
 
 def test_mempool_generation_is_never_abandoned():
@@ -27,6 +29,20 @@ def test_pow_generation_at_or_below_watermark_is_abandoned():
 def test_pow_generation_above_watermark_survives():
     assert _is_abandoned(6, 5) is False  # newer than the reseed
     assert _is_abandoned(1, 0) is False  # no cancel yet (watermark 0)
+
+
+def test_capabilities_message_matches_advertised_caps():
+    # Must answer a GetCapabilities without touching the device, so it is a
+    # pure function of the same static numbers Hello and --capabilities use.
+    caps = capabilities_message()
+    assert caps.backend == BACKEND
+    assert caps.algorithm == ALGORITHM
+    assert list(caps.supported_kinds) == [1]  # ISING_SAMPLE
+    assert caps.max_nodes == MAX_NODES
+    assert caps.max_edges == MAX_EDGES
+    assert list(caps.features) == list(FEATURES)
+    assert caps.protocol_version == 1
+    assert caps.stream_width == 1
 
 
 # First 8 bytes of a longer job id, matching the observed CPU miner line.

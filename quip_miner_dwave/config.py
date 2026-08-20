@@ -1,6 +1,6 @@
 """Uniform config-override discipline for the dwave miner.
 
-Python mirror of the Rust ``quip_miner_core::config`` helpers so every miner
+Python mirror of the Rust ``quip_solver_core::config`` helpers so every miner
 type behaves the same: config (from the coordinator's ``Configure``) overrides
 CLI/env with a warning, and unrecognized keys warn. Credentials are not carried
 here — the dwave miner uses D-Wave's own config (dwave.conf + env).

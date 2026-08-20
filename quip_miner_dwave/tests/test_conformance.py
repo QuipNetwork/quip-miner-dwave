@@ -1,11 +1,7 @@
-"""End-to-end conformance: miner vs committed quip-mock-coordinator binary.
+"""End-to-end conformance: miner vs the quip-solver-drive binary.
 
-Spawns the Rust mock coordinator's ``drive_miner`` flow by running the
-``quip-mock-coordinator`` binary's test-equivalent path — actually we drive
-the miner ourselves against a subprocess of the coordinator harness.
-
-The committed harness entry is ``quip-mock-coordinator`` which expects a miner
-binary path. We point it at a small shell wrapper that launches
+Spawns ``quip-solver-drive`` (the standalone CLI from the published
+``quip-solver-conformance`` crate) against a small shell wrapper that launches
 ``python -m quip_miner_dwave`` with mock mode.
 """
 from __future__ import annotations
@@ -22,37 +18,37 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[3]  # worktree root
 PYTHON = Path(sys.executable)
-MOCK_COORD = REPO / "rust" / "target" / "debug" / "quip-mock-coordinator"
+DRIVE_BIN = REPO / "rust" / "target" / "debug" / "quip-solver-drive"
 
 
-def _ensure_mock_coord() -> Path:
-    if MOCK_COORD.is_file():
-        return MOCK_COORD
-    # This end-to-end test drives the miner against the Rust quip-mock-coordinator,
-    # which lives in the quip-protocol workspace. In this standalone repo that
-    # workspace isn't present, so skip (the mock-coordinator is exercised by the
-    # coordinator's own repo).
+def _ensure_drive_bin() -> Path:
+    if DRIVE_BIN.is_file():
+        return DRIVE_BIN
+    # This end-to-end test drives the miner against quip-solver-drive, built
+    # from the published quip-solver-conformance crate. That crate is not
+    # vendored into this standalone Python repo, so skip (conformance against
+    # it is exercised by the Rust miner repos that already depend on it).
     if not (REPO / "rust").is_dir():
-        pytest.skip("quip-protocol rust workspace not present (standalone repo)")
+        pytest.skip("quip-solver-conformance rust checkout not present (standalone repo)")
     # Build if missing
     cargo = shutil.which("cargo")
     if not cargo:
-        pytest.skip("cargo not available to build quip-mock-coordinator")
+        pytest.skip("cargo not available to build quip-solver-drive")
     r = subprocess.run(
-        [cargo, "build", "-p", "quip-mock-coordinator"],
+        [cargo, "build", "-p", "quip-solver-conformance", "--bin", "quip-solver-drive"],
         cwd=str(REPO / "rust"),
         capture_output=True,
         text=True,
         timeout=300,
     )
     if r.returncode != 0:
-        pytest.fail(f"build mock-coordinator failed:\n{r.stderr}")
-    assert MOCK_COORD.is_file()
-    return MOCK_COORD
+        pytest.fail(f"build quip-solver-drive failed:\n{r.stderr}")
+    assert DRIVE_BIN.is_file()
+    return DRIVE_BIN
 
 
 def _write_miner_wrapper(tmpdir: Path) -> Path:
-    """Shell script the coordinator can exec as a miner binary."""
+    """Shell script quip-solver-drive can exec as a solver binary."""
     wrapper = tmpdir / "quip-dwave-qa"
     # Ensure python package path + mock mode
     script = f"""#!/usr/bin/env bash
@@ -66,24 +62,23 @@ exec "{PYTHON}" -m quip_miner_dwave --mock "$@"
     return wrapper
 
 
-def test_conformance_against_mock_coordinator():
-    coord = _ensure_mock_coord()
+def test_conformance_against_quip_solver_drive():
+    drive = _ensure_drive_bin()
     with tempfile.TemporaryDirectory(prefix="quip-dwave-conf-") as td:
         tdp = Path(td)
         miner = _write_miner_wrapper(tdp)
-        # quip-mock-coordinator CLI: takes miner binary + optional socket
-        # From main.rs — check args
+        # quip-solver-drive CLI: quip-solver-drive <solver-bin> <unix://socket>
         env = os.environ.copy()
         env["QUIP_SESSION_TOKEN"] = "test-token"
         env["QUIP_DWAVE_MOCK"] = "1"
         env["PYTHONPATH"] = str(REPO / "python") + (
             os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
         )
-        # The coordinator binary drives the miner: see main.rs
+        # quip-solver-drive prints report.summary() and exits 0 iff conformant.
         sock = tdp / "conf.sock"
         uri = f"unix://{sock}"
         proc = subprocess.run(
-            [str(coord), str(miner), uri],
+            [str(drive), str(miner), uri],
             capture_output=True,
             text=True,
             timeout=60,
@@ -91,10 +86,9 @@ def test_conformance_against_mock_coordinator():
             cwd=str(REPO),
         )
         out = (proc.stdout or "") + (proc.stderr or "")
-        # Coordinator exits 0 on success (handshake + results + clean miner exit)
         if proc.returncode != 0:
             pytest.fail(
-                f"mock-coordinator returned {proc.returncode}\n"
+                f"quip-solver-drive returned {proc.returncode}\n"
                 f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
             )
         # Soft assertions on log noise if any

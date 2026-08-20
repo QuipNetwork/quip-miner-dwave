@@ -139,7 +139,7 @@ class OceanSampler:
 
     Callers always pass logical Ising problems. Defect clamping and sample
     reconstruction are handled here; energy scoring for consensus stays in
-    the session layer via ``quip_proto.scoring``.
+    the session layer via ``quip_solver_core.scoring``.
     """
 
     def __init__(

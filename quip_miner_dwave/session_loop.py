@@ -1,7 +1,8 @@
 """gRPC session loop: Hello → Welcome → Configure → credit/job cycle.
 
-Mirrors ``rust/quip-mock-miner`` behavior using the ``quip_proto`` Python SDK.
-Uses the synchronous gRPC client with a request queue (reliable over UDS).
+Mirrors the ``quip-mock-miner`` reference miner (quip-miner repo) using the
+``quip_solver_core`` Python SDK. Uses the synchronous gRPC client with a request queue (reliable
+over UDS).
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ from typing import Iterator, Optional, Tuple
 
 import grpc
 
-from quip_proto import miner_pb2, miner_pb2_grpc, session as session_sdk
+from quip_solver_core import miner_pb2, miner_pb2_grpc, session as session_sdk
 
 from quip_miner_dwave import (
     ALGORITHM,
@@ -23,6 +24,9 @@ from quip_miner_dwave import (
     EXIT_CLEAN,
     EXIT_INTERNAL_FATAL,
     EXIT_TOKEN_REJECTED,
+    FEATURES,
+    MAX_EDGES,
+    MAX_NODES,
 )
 from quip_miner_dwave.budget import (
     QPUTimeManager,
@@ -42,7 +46,7 @@ _LOG_BACKEND = "dwave"
 
 
 def _short_job_id(job_id: bytes) -> str:
-    """Render the leading bytes of a job id, matching quip-miner-core."""
+    """Render the leading bytes of a job id, matching quip-solver-core."""
     head = bytes(job_id[:8]).hex()
     if len(job_id) > 8:
         return head + ".."
@@ -190,9 +194,29 @@ def _is_abandoned(generation: int, watermark: int) -> bool:
 
     Generation ``0`` is a mempool job with no PoW cancellation scope and is
     never abandoned; a PoW job is abandoned once its generation is at or below
-    the coordinator's reseed watermark. Mirrors the Rust ``CancelGuard``.
+    the coordinator's reseed watermark. Mirrors the Rust ``CancelToken``.
     """
     return generation != 0 and generation <= watermark
+
+
+def capabilities_message() -> miner_pb2.Capabilities:
+    """Build the ``Capabilities`` message: what this backend supports.
+
+    Must answer without touching the device, so it is a pure function of the
+    same static numbers ``Hello`` advertises. ``--capabilities`` prints the
+    protobuf JSON of this exact message and the in-session ``GetCapabilities``
+    reply wraps it, so the two answers cannot drift apart (SPEC section 8).
+    """
+    return miner_pb2.Capabilities(
+        backend=BACKEND,
+        algorithm=ALGORITHM,
+        supported_kinds=[miner_pb2.ISING_SAMPLE],
+        max_nodes=MAX_NODES,
+        max_edges=MAX_EDGES,
+        features=list(FEATURES),
+        protocol_version=session_sdk.PROTOCOL_VERSION,
+        stream_width=1,
+    )
 
 
 def _unix_target(uri: str) -> str:
@@ -225,6 +249,9 @@ def run_session(
             BACKEND,
             ALGORITHM,
             [miner_pb2.ISING_SAMPLE],
+            MAX_NODES,
+            MAX_EDGES,
+            features=list(FEATURES),
         )
     except session_sdk.MissingToken:
         logger.error("QUIP_SESSION_TOKEN unset")
@@ -280,6 +307,12 @@ def run_session(
         for reply in replies:
             kind = reply.WhichOneof("msg")
             with state_lock:
+                if kind == "result" and _is_abandoned(job.generation, cancel_watermark):
+                    # SPEC section 5: no Result for an abandoned generation.
+                    # The cancel landed while the QPU sampled this job; the
+                    # coordinator reseeded past it and reclaims the credit
+                    # itself, so the reply is dropped whole.
+                    continue
                 if kind == "result":
                     jobs_done += 1
                     meta = reply.result.meta
@@ -474,15 +507,22 @@ def run_session(
                     process_job(*args)
             elif which == "cancel":
                 # Raise the reseed watermark so every job at/below max_generation
-                # is skipped at dequeue instead of sampled on the QPU.
+                # is skipped at dequeue instead of sampled on the QPU. The Status
+                # reply reports the real watermark, not just an ack flag, so the
+                # coordinator can see the current cancel point outside a Cancel
+                # round-trip too (Ping reports it the same way, below).
                 with state_lock:
                     cancel_watermark = max(cancel_watermark, cm.cancel.max_generation)
                     done = jobs_done
-                out_q.put(_status(miner_id, done, abandoned=1))
+                    watermark = cancel_watermark
+                out_q.put(_status(miner_id, done, abandoned=watermark))
             elif which == "ping":
                 with state_lock:
                     done = jobs_done
-                out_q.put(_status(miner_id, done))
+                    watermark = cancel_watermark
+                out_q.put(_status(miner_id, done, abandoned=watermark))
+            elif which == "get_capabilities":
+                out_q.put(miner_pb2.MinerMsg(capabilities=capabilities_message()))
             elif which == "shutdown":
                 grace_ms = cm.shutdown.grace_ms or 5000
                 break
