@@ -45,7 +45,7 @@ build-macos-arm64:
     CARGO_HOME: $CI_PROJECT_DIR/.cargo
   before_script:
     # quip-solver-core publishes no macOS wheel, so pip builds its pyo3
-    # extension from the sdist here. PyInstaller freezes the resulting .so
+    # extension from source here. PyInstaller freezes the resulting .so
     # into the executable, so this toolchain is a build-machine requirement
     # only.
     #
@@ -62,6 +62,13 @@ build-macos-arm64:
     - python3.12 -m venv .venv
     - . .venv/bin/activate
     - pip install -q --upgrade pip
+    # From the repository tag, not the PyPI sdist: the 0.0.0 sdist marks the
+    # `quip` gRPC-stub package wheel-only ([tool.maturin] include in its
+    # pyproject), so a build from the sdist installs without `quip` and every
+    # import fails. The repository tree carries the package, and this
+    # preinstalled 0.0.0 satisfies the `==0.0.0` pin below, so pip does not
+    # fall back to the sdist.
+    - pip install -q "quip-solver-core @ git+https://gitlab.com/quip.network/quip-solver-core.git@v0.0.0"
     - pip install -q ".[dev]" pyinstaller
     # Library-level check before freezing. A break in Ocean or
     # quip_solver_core surfaces here with a readable traceback instead of as a
