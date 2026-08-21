@@ -17,6 +17,26 @@ test:
     - pip install -e ".[dev]"
     - pytest quip_miner_dwave/tests -v
 
+# End-to-end contract gate: drives the mock-mode miner through
+# quip-solver-drive, the scripted coordinator from the published
+# quip-solver-conformance crate. This harness caught the credit-ledger and
+# sweeps-echo defects that the unit suite could not; without this job the
+# repo's only conformance coverage lives in the Rust miner repos.
+#
+# The rust image is bookworm, so its apt python3 (3.11) meets the >= 3.11
+# floor. Keep --version in step with the quip-solver-core pin in
+# pyproject.toml: both publish from one repository and one tag.
+conformance:
+  stage: test
+  image: rust:1.97.1
+  before_script:
+    - apt-get update -qq && apt-get install -y --no-install-recommends python3 python3-venv python3-pip
+    - python3 -m venv /opt/venv
+    - /opt/venv/bin/pip install -q -e ".[dev]"
+  script:
+    - cargo install --locked quip-solver-conformance --version 0.0.1-rc2
+    - QUIP_SOLVER_DRIVE="$CARGO_HOME/bin/quip-solver-drive" /opt/venv/bin/pytest quip_miner_dwave/tests/test_conformance.py -v
+
 build-wheel:
   stage: build
   script:

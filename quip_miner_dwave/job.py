@@ -322,14 +322,26 @@ def handle_job(
     num_reads, anneal_time_us, num_sweeps = _sampling_params(
         ising, session_target, session_sweeps
     )
-    result: SampleResult = sampler.sample(
-        h_dict,
-        j_dict,
-        num_reads=num_reads,
-        # 0 leaves annealing_time unset so the QPU default applies.
-        anneal_time_us=anneal_time_us or None,
-        # Use job_id bytes as the defect-clamp seed when present.
-        nonce_seed=bytes(job_id) if job_id else None,
-        label=f"quip-{job_id.hex()[:8] if job_id else 'job'}",
-    )
+    try:
+        result: SampleResult = sampler.sample(
+            h_dict,
+            j_dict,
+            num_reads=num_reads,
+            # 0 leaves annealing_time unset so the QPU default applies.
+            anneal_time_us=anneal_time_us or None,
+            # Use job_id bytes as the defect-clamp seed when present.
+            nonce_seed=bytes(job_id) if job_id else None,
+            label=f"quip-{job_id.hex()[:8] if job_id else 'job'}",
+        )
+    except Exception:
+        # Ocean raises many exception types (Leap auth, network, solver
+        # offline), and a job worker's exception would otherwise die inside a
+        # discarded pool Future: no Result, no Reject, a coordinator credit
+        # consumed forever, and nothing in the log. Answer the job instead:
+        # OVERLOADED marks the failure transient — the coordinator may resend
+        # elsewhere or later — and the traceback reaches the operator.
+        logger.exception(
+            "job %s: sampler raised; rejecting OVERLOADED", job_id.hex()
+        )
+        return _reject(job_id, miner_pb2.OVERLOADED)
     return _build_result(job_id, nodes, result, num_sweeps)

@@ -394,6 +394,34 @@ def test_j_shorter_than_topology_edges_rejects_malformed():
     sampler.close()
 
 
+def test_sampler_exception_rejects_overloaded_with_refund():
+    """A QPU/Leap exception must answer the job, not strand it: the reply is
+    a transient OVERLOADED reject carrying the credit refund, instead of an
+    exception dying inside a discarded pool Future."""
+
+    class ExplodingSampler:
+        def sample(self, *args, **kwargs):
+            raise RuntimeError("leap: solver offline")
+
+    job = miner_pb2.Job(
+        job_id=b"boom",
+        kind=miner_pb2.ISING_SAMPLE,
+        deadline_ms=int(time.time() * 1000) + 60_000,
+        ising=miner_pb2.IsingProblem(
+            h_milli_le32=wire.encode_i32_le([1000, -1000]),
+            j_milli_le32=wire.encode_i32_le([500]),
+            edges=miner_pb2.EdgeList(u=[0], v=[1]),
+            num_reads=1,
+        ),
+    )
+    msgs = handle_job(
+        job, ExplodingSampler(), session_nodes=[0, 1], session_edges=[(0, 1)]
+    )
+    assert [m.WhichOneof("msg") for m in msgs] == ["reject", "job_request"]
+    assert msgs[0].reject.reason == miner_pb2.OVERLOADED
+    assert msgs[1].job_request.credits == 1
+
+
 def test_result_meta_echoes_the_resolved_sweep_budget():
     """``SamplerMeta.sweeps`` echoes the resolved budget (the pin is a budget,
     not work the QPU performs), with per-job > SetTarget > session-default
