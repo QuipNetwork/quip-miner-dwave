@@ -39,6 +39,20 @@ from quip_miner_dwave.ocean import OceanSampler
 
 logger = logging.getLogger(__name__)
 
+
+def _surface_pool_failure(future) -> None:
+    """Log a job-worker exception instead of letting the Future swallow it.
+
+    ``handle_job`` answers every failure it can see (a sampler exception
+    rejects OVERLOADED with a credit refund); this backstop catches the ones
+    it cannot — a crash in the reply bookkeeping itself. Replies may be
+    partially sent at that point, so no blind refund: the log line is the
+    difference between a diagnosable incident and silence.
+    """
+    exc = future.exception()
+    if exc is not None:
+        logger.error("job worker crashed: %r", exc, exc_info=exc)
+
 _STOP = object()
 
 # Operator log token. Distinct from BACKEND ("dwave-qpu"), which is the
@@ -517,7 +531,9 @@ def run_session(
                     session_sweeps,
                 )
                 if job_pool is not None:
-                    job_pool.submit(process_job, *args)
+                    job_pool.submit(process_job, *args).add_done_callback(
+                        _surface_pool_failure
+                    )
                 else:
                     process_job(*args)
             elif which == "cancel":

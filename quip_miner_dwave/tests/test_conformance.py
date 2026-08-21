@@ -1,8 +1,13 @@
 """End-to-end conformance: miner vs the quip-solver-drive binary.
 
-Spawns ``quip-solver-drive`` (the standalone CLI from the published
-``quip-solver-conformance`` crate) against a small shell wrapper that launches
-``python -m quip_miner_dwave`` with mock mode.
+Spawns ``quip-solver-drive`` (the scripted-coordinator CLI from the published
+``quip-solver-conformance`` crate) against a wrapper that launches
+``python -m quip_miner_dwave --mock``.
+
+The driver binary resolves in order: the ``QUIP_SOLVER_DRIVE`` environment
+variable, then ``quip-solver-drive`` on ``PATH``. Without either the test
+skips — the driver is a Rust binary and this repo carries no Rust toolchain.
+CI runs it in the ``conformance`` job, which cargo-installs the crate.
 """
 from __future__ import annotations
 
@@ -16,46 +21,35 @@ from pathlib import Path
 
 import pytest
 
-REPO = Path(__file__).resolve().parents[3]  # worktree root
-PYTHON = Path(sys.executable)
-DRIVE_BIN = REPO / "rust" / "target" / "debug" / "quip-solver-drive"
 
-
-def _ensure_drive_bin() -> Path:
-    if DRIVE_BIN.is_file():
-        return DRIVE_BIN
-    # This end-to-end test drives the miner against quip-solver-drive, built
-    # from the published quip-solver-conformance crate. That crate is not
-    # vendored into this standalone Python repo, so skip (conformance against
-    # it is exercised by the Rust miner repos that already depend on it).
-    if not (REPO / "rust").is_dir():
-        pytest.skip("quip-solver-conformance rust checkout not present (standalone repo)")
-    # Build if missing
-    cargo = shutil.which("cargo")
-    if not cargo:
-        pytest.skip("cargo not available to build quip-solver-drive")
-    r = subprocess.run(
-        [cargo, "build", "-p", "quip-solver-conformance", "--bin", "quip-solver-drive"],
-        cwd=str(REPO / "rust"),
-        capture_output=True,
-        text=True,
-        timeout=300,
+def _drive_bin() -> Path:
+    explicit = os.environ.get("QUIP_SOLVER_DRIVE")
+    if explicit:
+        p = Path(explicit)
+        if not p.is_file():
+            pytest.fail(f"QUIP_SOLVER_DRIVE points at no file: {explicit}")
+        return p
+    found = shutil.which("quip-solver-drive")
+    if found:
+        return Path(found)
+    pytest.skip(
+        "quip-solver-drive not found: set QUIP_SOLVER_DRIVE or put it on "
+        "PATH (cargo install --locked quip-solver-conformance)"
     )
-    if r.returncode != 0:
-        pytest.fail(f"build quip-solver-drive failed:\n{r.stderr}")
-    assert DRIVE_BIN.is_file()
-    return DRIVE_BIN
 
 
 def _write_miner_wrapper(tmpdir: Path) -> Path:
-    """Shell script quip-solver-drive can exec as a solver binary."""
+    """Shell script quip-solver-drive can exec as a solver binary.
+
+    Uses the interpreter running this test, so the wrapper sees the same
+    installed ``quip_miner_dwave`` package — no repository-layout
+    assumptions.
+    """
     wrapper = tmpdir / "quip-dwave-qa"
-    # Ensure python package path + mock mode
     script = f"""#!/usr/bin/env bash
 set -euo pipefail
-export PYTHONPATH="{REPO / 'python'}${{PYTHONPATH:+:$PYTHONPATH}}"
 export QUIP_DWAVE_MOCK=1
-exec "{PYTHON}" -m quip_miner_dwave --mock "$@"
+exec "{sys.executable}" -m quip_miner_dwave --mock "$@"
 """
     wrapper.write_text(script)
     wrapper.chmod(wrapper.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
@@ -63,33 +57,24 @@ exec "{PYTHON}" -m quip_miner_dwave --mock "$@"
 
 
 def test_conformance_against_quip_solver_drive():
-    drive = _ensure_drive_bin()
+    drive = _drive_bin()
     with tempfile.TemporaryDirectory(prefix="quip-dwave-conf-") as td:
         tdp = Path(td)
         miner = _write_miner_wrapper(tdp)
-        # quip-solver-drive CLI: quip-solver-drive <solver-bin> <unix://socket>
         env = os.environ.copy()
         env["QUIP_SESSION_TOKEN"] = "test-token"
         env["QUIP_DWAVE_MOCK"] = "1"
-        env["PYTHONPATH"] = str(REPO / "python") + (
-            os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
-        )
-        # quip-solver-drive prints report.summary() and exits 0 iff conformant.
         sock = tdp / "conf.sock"
-        uri = f"unix://{sock}"
+        # quip-solver-drive prints the per-axis report and exits 0 iff the
+        # composite verdict passes.
         proc = subprocess.run(
-            [str(drive), str(miner), uri],
+            [str(drive), str(miner), f"unix://{sock}"],
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=120,
             env=env,
-            cwd=str(REPO),
         )
         out = (proc.stdout or "") + (proc.stderr or "")
-        if proc.returncode != 0:
-            pytest.fail(
-                f"quip-solver-drive returned {proc.returncode}\n"
-                f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
-            )
-        # Soft assertions on log noise if any
-        assert "handshake" not in out.lower() or "ok" in out.lower() or proc.returncode == 0
+        assert proc.returncode == 0 and "[FAIL]" not in out, (
+            f"quip-solver-drive returned {proc.returncode}\n{out}"
+        )
