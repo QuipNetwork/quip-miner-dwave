@@ -103,12 +103,24 @@ def prepare_problem(
     defective_edges: Optional[set] = None,
     nonce_seed: Union[int, bytes, None] = None,
 ) -> Tuple[Dict[int, float], Dict[Tuple[int, int], float], Optional[DefectInfo]]:
-    """Apply defect clamping when defects and a seed are present."""
+    """Apply defect clamping when the live graph is missing qubits or couplers.
+
+    The seed picks spins for clamped qubits, so it is required only when there
+    are qubits to clamp. Missing couplers alone still have to be removed: a
+    coupler the QPU does not have makes SAPI reject the whole problem with
+    ``ProblemStructureError``, which is what a seedless early return used to
+    cause on a chip whose qubits all match but whose couplers do not.
+    """
     de = defective_edges or set()
-    if not (defective_qubits or de) or nonce_seed is None:
+    if not (defective_qubits or de):
         return h, j, None
+    if defective_qubits and nonce_seed is None:
+        raise ValueError(
+            "clamping defective qubits needs a nonce seed; "
+            f"{len(defective_qubits)} qubits are missing from the live graph"
+        )
     h_r, j_r, fixed, offset, removed = clamp_fixed_variables(
-        h, j, nonce_seed, defective_qubits, de
+        h, j, nonce_seed if nonce_seed is not None else 0, defective_qubits, de
     )
     return h_r, j_r, DefectInfo(fixed, offset, removed)
 
