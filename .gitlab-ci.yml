@@ -81,7 +81,25 @@ build-macos-arm64:
     # publishes a macOS arm64 wheel since 0.0.1-rc1, so pip installs it
     # prebuilt — the rustup/protobuf bootstrap that built it from source is
     # gone with the source build.
-    - brew install python@3.12
+    #
+    # Install only when the interpreter is genuinely absent. `brew install`
+    # writes into the Homebrew prefix even for a formula that is already
+    # present, so it fails on a runner whose prefix belongs to another user:
+    # quip-miner's v0.3.1-rc6 tag died that way on a newly added host, against
+    # an unwritable /opt/homebrew. Skipping the install where python3.12
+    # already exists avoids the write, and a runner that has neither the
+    # interpreter nor a usable brew now says so in three lines instead of
+    # printing Homebrew's chown advice for twenty.
+    - |
+      if ! command -v python3.12 >/dev/null 2>&1; then
+        if ! brew install python@3.12; then
+          echo "python3.12 is missing on $(hostname) and 'brew install python@3.12' failed" >&2
+          echo "the Homebrew prefix is likely not writable by the runner user ($(id -un))" >&2
+          echo "install python@3.12 for that user, or drop this host from the macos+arm64 pool" >&2
+          exit 1
+        fi
+      fi
+    - python3.12 --version
   script:
     - python3.12 -m venv .venv
     - . .venv/bin/activate
