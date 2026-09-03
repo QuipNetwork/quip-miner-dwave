@@ -106,3 +106,43 @@ def test_progress_line_matches_the_shared_format(caplog):
         in caplog.text
     )
     assert caplog.records[0].levelno == logging.INFO
+
+
+def _estimate(pool_s, until_s):
+    from quip_miner_dwave.budget import QPUTimeEstimate
+
+    return QPUTimeEstimate(
+        should_mine=False,
+        pool_us=pool_s * 1_000_000,
+        burst_active=False,
+        seconds_until_can_mine=until_s,
+        estimated_block_time_us=10_000.0,
+    )
+
+
+def test_budget_closed_line_reports_the_next_window(caplog):
+    from quip_miner_dwave.session_loop import _log_budget_closed
+
+    caplog.set_level(logging.DEBUG)
+    _log_budget_closed(_estimate(300.0, 21_600.0))
+    assert "budget exhausted" in caplog.text
+    assert "next window in 6h 0m" in caplog.text
+    assert [r.levelname for r in caplog.records] == ["INFO"]
+
+
+def test_unreachable_budget_is_an_error_not_an_info(caplog):
+    from quip_miner_dwave.session_loop import _log_budget_closed
+
+    caplog.set_level(logging.DEBUG)
+    _log_budget_closed(_estimate(300.0, float("inf")))
+    assert [r.levelname for r in caplog.records] == ["ERROR"]
+    assert "never" in caplog.text
+    assert "budget_cap" in caplog.text
+
+
+def test_budget_closed_without_an_estimate_still_logs_once(caplog):
+    from quip_miner_dwave.session_loop import _log_budget_closed
+
+    caplog.set_level(logging.DEBUG)
+    _log_budget_closed(None)
+    assert [r.levelname for r in caplog.records] == ["INFO"]
