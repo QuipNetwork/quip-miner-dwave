@@ -47,7 +47,9 @@ to building it from source through maturin, which needs **Rust** on the
 machine.
 
 Reaching real QPU hardware takes a D-Wave Leap token, set through
-`DWAVE_API_TOKEN`. Offline and classical sampling take no token.
+`DWAVE_API_TOKEN`. `DWAVE_API_KEY`, the name the v0.2 stack used, still works:
+the miner copies it to `DWAVE_API_TOKEN` at startup and logs a deprecation
+warning. Offline and classical sampling take no token.
 
 ### Building the executable yourself
 

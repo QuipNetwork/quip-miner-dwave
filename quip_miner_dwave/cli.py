@@ -20,6 +20,7 @@ from quip_miner_dwave import (
 )
 from quip_miner_dwave.ocean import (
     OceanSampler,
+    adopt_legacy_token_env,
     credentials_present,
     mock_mode_enabled,
     ocean_importable,
@@ -146,6 +147,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.capabilities:
         print_capabilities()
         return EXIT_CLEAN
+    # Before anything reads credentials: a v0.2 node delivers the token under
+    # the pre-Ocean name, and both --check and the session path resolve it
+    # through the SDK.
+    adopt_legacy_token_env()
+
     if args.check:
         return run_check(force_mock=args.mock)
 
