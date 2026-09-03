@@ -427,7 +427,14 @@ class OceanSampler:
             j,
             defective_qubits=self._defective_qubits,
             defective_edges=self._defective_edges,
-            nonce_seed=nonce_seed if self._defective_qubits else None,
+            # Either kind of defect needs the reduction. Withholding the seed
+            # when only couplers are missing skipped it entirely and sent the
+            # QPU a graph it does not have.
+            nonce_seed=(
+                nonce_seed
+                if (self._defective_qubits or self._defective_edges)
+                else None
+            ),
         )
         # Thread-pooled submit
         fut = self._submit_pool.submit(
