@@ -30,9 +30,38 @@ from quip_miner_dwave.topology import native_topology_hash
 logger = logging.getLogger(__name__)
 
 
+# Ocean's canonical token variable, and the name the v0.2 stack shipped. The
+# quip-node-manager compose files still deliver the Leap token as
+# DWAVE_API_KEY, which Ocean never reads: DWaveSampler then raises "API token
+# not defined" while a perfectly good token sits in the environment. Promote
+# the old name at startup so an upgraded node keeps mining.
+OCEAN_TOKEN_ENV = "DWAVE_API_TOKEN"
+LEGACY_TOKEN_ENV = "DWAVE_API_KEY"
+
+
+def adopt_legacy_token_env() -> bool:
+    """Copy ``DWAVE_API_KEY`` to ``DWAVE_API_TOKEN`` when only the old name is set.
+
+    Returns True when the promotion happened. ``DWAVE_API_TOKEN`` always wins:
+    a value under the canonical name is never overwritten.
+    """
+    legacy = os.environ.get(LEGACY_TOKEN_ENV, "").strip()
+    if not legacy or os.environ.get(OCEAN_TOKEN_ENV, "").strip():
+        return False
+    os.environ[OCEAN_TOKEN_ENV] = legacy
+    logger.warning(
+        "%s is deprecated and will be dropped; using its value as %s. "
+        "Set %s instead.",
+        LEGACY_TOKEN_ENV,
+        OCEAN_TOKEN_ENV,
+        OCEAN_TOKEN_ENV,
+    )
+    return True
+
+
 def credentials_present() -> bool:
     """True if a D-Wave API token is available via env or SDK config file."""
-    if os.environ.get("DWAVE_API_TOKEN"):
+    if os.environ.get(OCEAN_TOKEN_ENV):
         return True
     conf = os.path.expanduser("~/.config/dwave/dwave.conf")
     if os.path.isfile(conf):
