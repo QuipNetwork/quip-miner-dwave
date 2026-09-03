@@ -310,6 +310,7 @@ class OceanSampler:
                 key = (min(u, v), max(u, v))
                 if key not in live_edge_set:
                     self._defective_edges.add((u, v))
+            self._log_topology_fit(len(nodes_l), len(edges_l))
         else:
             # Mock / no live hardware: treat session topology as native.
             self._live_nodes = nodes_l
@@ -317,6 +318,44 @@ class OceanSampler:
             self._defective_qubits = []
             self._defective_edges = set()
             self._native_hash = native_topology_hash(nodes_l, edges_l)
+
+    def _log_topology_fit(self, session_nodes: int, session_edges: int) -> None:
+        """Report how much of the session topology this solver can anneal.
+
+        Qubits the live chip lacks are clamped to pseudorandom spins and the
+        couplers it lacks are scored after the fact (see ``defects``), so a
+        solver whose working graph is not the network's returns energies that
+        are valid, accepted, and a fraction of what the graph allows. Without
+        this line that shows up only as results that never reach target.
+        """
+        missing_nodes = len(self._defective_qubits)
+        missing_edges = len(self._defective_edges)
+        if not missing_nodes and not missing_edges:
+            logger.info(
+                "[QPU] session topology matches the live graph "
+                "(%d nodes, %d couplers)",
+                session_nodes,
+                session_edges,
+            )
+            return
+        node_pct = 100.0 * missing_nodes / session_nodes if session_nodes else 0.0
+        edge_pct = 100.0 * missing_edges / session_edges if session_edges else 0.0
+        # A production chip is missing a handful of qubits. Missing a tenth of
+        # the graph is a different chip, not hardware defects.
+        log = logger.error if max(node_pct, edge_pct) > 10.0 else logger.warning
+        log(
+            "[QPU] live solver is missing %d/%d nodes (%.1f%%) and %d/%d "
+            "couplers (%.1f%%) of the session topology; the missing part is "
+            "clamped, not annealed, so energies land short of target. Check "
+            "that DWAVE_API_SOLVER names the chip the network's topology "
+            "came from.",
+            missing_nodes,
+            session_nodes,
+            node_pct,
+            missing_edges,
+            session_edges,
+            edge_pct,
+        )
 
     def close(self) -> None:
         self._submit_pool.shutdown(wait=False)
