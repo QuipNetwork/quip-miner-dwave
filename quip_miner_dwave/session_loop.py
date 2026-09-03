@@ -110,6 +110,33 @@ def _reject_reason_name(reason: int) -> str:
         return str(reason)
 
 
+def _log_budget_closed(estimate) -> None:
+    """One line when the QPU budget gate shuts, with the reopening estimate.
+
+    The per-attempt rejects sit at debug on purpose: a shut gate rejects every
+    job the coordinator already staged, and narrating each one at warning
+    buries the session log without adding anything this line did not say.
+    """
+    if estimate is None:
+        logger.info("[QPU] budget exhausted; parking credits until it recovers")
+        return
+    pool_s = estimate.pool_us / 1_000_000
+    until = estimate.seconds_until_can_mine
+    if until == float("inf"):
+        logger.error(
+            "[QPU] budget can never reach the mining threshold as configured "
+            "(pool %.0fs): no job will ever be accepted. Check daily_budget, "
+            "min_block_budget and budget_cap.",
+            pool_s,
+        )
+        return
+    logger.info(
+        "[QPU] budget exhausted (pool %.0fs); parking credits, next window in %s",
+        pool_s,
+        _format_duration_ms(int(until * 1000)),
+    )
+
+
 def log_attempt(
     job_id: bytes,
     *,
@@ -298,6 +325,12 @@ def run_session(
     session_target: Optional[miner_pb2.SetTarget] = None
     session_sweeps: int = DEFAULT_NUM_SWEEPS
     pending_budget = budget
+    # Credits are parked while the QPU budget gate is shut: the coordinator only
+    # dispatches against credits we grant, so withholding them is how a miner
+    # applies backpressure. queue_depth is the grant to restore when the pool
+    # reopens (the coordinator's liveness Ping drives that re-check).
+    credits_parked = False
+    queue_depth = 3
     # Pipeline: up to queue_depth QPU submissions in flight (overlaps cloud RTT).
     # jobs_done + pending_budget are shared with worker threads -> guard them.
     state_lock = threading.Lock()
@@ -309,7 +342,7 @@ def run_session(
     def process_job(job, s_nodes, s_edges, s_hash, s_target, s_sweeps):
         # Runs on a pool thread: sample (blocking on the QPU), then enqueue
         # replies. Shared-state mutations are guarded by state_lock.
-        nonlocal jobs_done, best_energy_milli
+        nonlocal jobs_done, best_energy_milli, credits_parked
         started = time.monotonic()
         replies = handle_job(
             job,
@@ -389,8 +422,15 @@ def run_session(
                         wall_ms=wall_ms,
                     )
                 if kind == "job_request" and pending_budget is not None:
-                    if not pending_budget.should_mine().should_mine:
+                    estimate = pending_budget.should_mine()
+                    if not estimate.should_mine:
                         pending_budget.end_burst()
+                        # Dropping the request is what parks the credit. Mark it
+                        # so the Ping re-check knows to restore the full grant;
+                        # without this the miner sits at zero credits for good.
+                        if not credits_parked:
+                            credits_parked = True
+                            _log_budget_closed(estimate)
                         continue
             out_q.put(reply)
 
@@ -458,6 +498,7 @@ def run_session(
                     pending_budget = budget_from_backend_toml(cm.configure.backend_toml)
                 out_q.put(miner_pb2.MinerMsg(ready=miner_pb2.Ready()))
                 depth = config.queue_depth if config else 3
+                queue_depth = depth
                 if job_pool is None:
                     job_pool = ThreadPoolExecutor(
                         max_workers=max(1, depth), thread_name_prefix="dwave-job"
@@ -468,6 +509,9 @@ def run_session(
                             job_request=miner_pb2.JobRequest(credits=depth)
                         )
                     )
+                else:
+                    credits_parked = True
+                    _log_budget_closed(pending_budget.should_mine())
             elif which == "topology":
                 topo = cm.topology
                 session_nodes = list(topo.nodes)
@@ -482,10 +526,10 @@ def run_session(
             elif which == "job":
                 with state_lock:
                     cancelled = _is_abandoned(cm.job.generation, cancel_watermark)
-                    budget_ok = (
-                        pending_budget is None
-                        or pending_budget.should_mine().should_mine
+                    budget_estimate = (
+                        None if pending_budget is None else pending_budget.should_mine()
                     )
+                    budget_ok = budget_estimate is None or budget_estimate.should_mine
                 if cancelled:
                     # Abandoned generation (coordinator reseeded): don't spend
                     # QPU access on it. Refund the credit so the coordinator
@@ -500,9 +544,16 @@ def run_session(
                     )
                     continue
                 if not budget_ok:
-                    log_attempt(
-                        cm.job.job_id, rejected="OVERLOADED", wall_ms=0
+                    logger.debug(
+                        "[quip-miner-%s] attempt %s: rejected OVERLOADED (budget)",
+                        _LOG_BACKEND,
+                        _short_job_id(cm.job.job_id),
                     )
+                    with state_lock:
+                        first_closure = not credits_parked
+                        credits_parked = True
+                    if first_closure:
+                        _log_budget_closed(budget_estimate)
                     out_q.put(
                         miner_pb2.MinerMsg(
                             reject=miner_pb2.Reject(
@@ -511,14 +562,10 @@ def run_session(
                             )
                         )
                     )
-                    # A reject is terminal: refund the credit like job.py's
-                    # reject path, or the budget gate starves dispatch one
-                    # slot per rejected job.
-                    out_q.put(
-                        miner_pb2.MinerMsg(
-                            job_request=miner_pb2.JobRequest(credits=1)
-                        )
-                    )
+                    # No replacement credit. The coordinator dispatches against
+                    # credits alone, so refunding one here turns a shut gate into
+                    # a reject/dispatch spin at memory speed — the credit comes
+                    # back when the pool reopens (the Ping re-check below).
                     continue
                 # Submit for concurrent sampling; the pool bounds in-flight to
                 # queue_depth (credits keep the coordinator dispatching that many).
@@ -557,6 +604,32 @@ def run_session(
             elif which == "shutdown":
                 grace_ms = cm.shutdown.grace_ms or 5000
                 break
+
+            # Parked credits come back the moment the pool reopens. Every
+            # inbound message is a chance to notice, and the coordinator's
+            # liveness Ping arrives every 15s even with nothing dispatched, so
+            # a miner waiting on budget needs no timer of its own.
+            if pending_budget is not None:
+                with state_lock:
+                    reopened = (
+                        pending_budget.should_mine() if credits_parked else None
+                    )
+                    if reopened is not None and reopened.should_mine:
+                        credits_parked = False
+                    else:
+                        reopened = None
+                if reopened is not None:
+                    logger.info(
+                        "[QPU] budget available again (pool %.0fs); resuming at "
+                        "%s credits",
+                        reopened.pool_us / 1_000_000,
+                        queue_depth,
+                    )
+                    out_q.put(
+                        miner_pb2.MinerMsg(
+                            job_request=miner_pb2.JobRequest(credits=queue_depth)
+                        )
+                    )
 
             # Soft idle timeout: if the coordinator stalls mid-session.
             idle_s = config.idle_timeout_s if config else 300

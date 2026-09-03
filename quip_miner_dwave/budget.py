@@ -8,12 +8,15 @@ uses start/continue hysteresis: idle until the pool reaches
 
 from __future__ import annotations
 
+import logging
 import time
 import tomllib
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from quip_miner_dwave.config import warn_unknown_fields
+
+logger = logging.getLogger(__name__)
 
 # Config keys the dwave backend recognizes in Configure.backend_toml. Anything
 # else (outside SESSION_KEYS) is a typo and gets warned about, uniform with the
@@ -28,6 +31,8 @@ DWAVE_CONFIG_KEYS = frozenset(
         "min_block_budget_seconds",
         "budget_cap",
         "budget_cap_seconds",
+        "initial_budget",
+        "initial_budget_seconds",
         "anneal_time_us",
         "num_reads",
     }
@@ -99,6 +104,20 @@ class QPUTimeManager:
         cap_s = config.budget_cap_seconds
         if cap_s is None:
             cap_s = max(config.daily_budget_seconds, config.min_block_budget_seconds)
+        elif cap_s < config.min_block_budget_seconds:
+            # The gate opens at min_block_budget, and the pool can never exceed
+            # the cap: a cap below the threshold means should_mine() is false
+            # forever and every job is rejected OVERLOADED. Lift the cap to the
+            # threshold rather than mine never, and name both values.
+            logger.error(
+                "budget_cap (%.0fs) is below min_block_budget (%.0fs): the pool "
+                "could never reach the mining threshold. Raising the cap to "
+                "%.0fs. Set budget_cap >= min_block_budget to silence this.",
+                cap_s,
+                config.min_block_budget_seconds,
+                config.min_block_budget_seconds,
+            )
+            cap_s = config.min_block_budget_seconds
         self._pool_cap_us: float = cap_s * 1_000_000
         self._accrual_rate_us_per_s: float = (
             config.daily_budget_seconds * 1_000_000 / 86400.0
