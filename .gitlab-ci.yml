@@ -62,6 +62,20 @@ build-macos-arm64:
   rules:
     - if: $CI_COMMIT_TAG
   before_script:
+    # The shell executor starts a non-login bash, which reads no profile, so
+    # Homebrew's prefix is on PATH only where a runner happens to export it
+    # elsewhere. The v0.3.2-rc5 tag failed on one runner with
+    # "brew: command not found" while the same job passed on another. Put both
+    # prefixes on PATH (Apple Silicon, then Intel) and say so plainly when the
+    # runner really has no Homebrew, instead of failing at exit status 127
+    # three lines later.
+    - export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+    - |
+      command -v brew >/dev/null || {
+        echo "no Homebrew on this runner ($(hostname)); it cannot build the bundle" >&2
+        exit 1
+      }
+    - eval "$(brew shellenv)"
     # python@3.12: quip-solver-core requires >= 3.11 and the runner's system
     # python3 is below that floor. No build toolchain: quip-solver-core
     # publishes a macOS arm64 wheel since 0.0.1-rc1, so pip installs it
