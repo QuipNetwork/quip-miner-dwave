@@ -18,6 +18,15 @@ from quip_miner_dwave import (
     EXIT_INTERNAL_FATAL,
     __version__,
 )
+from quip_miner_dwave.capture import (
+    DEFAULT_ALLOWED_H_MILLI,
+    DEFAULT_ALLOWED_J_MILLI,
+    capture_spec,
+    compare_specs,
+    format_comparison,
+    load_spec,
+    write_spec,
+)
 from quip_miner_dwave.ocean import (
     OceanSampler,
     adopt_legacy_token_env,
@@ -60,7 +69,93 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="force offline mock sampler (also set by QUIP_DWAVE_MOCK=1)",
     )
+    p.add_argument(
+        "--dump-topology",
+        metavar="PATH",
+        default=None,
+        help="write this solver's working graph as a coordinator topology "
+        "spec and exit (feed it to `quip-coordinator seed-chain --topology`)",
+    )
+    p.add_argument(
+        "--solver",
+        default=None,
+        help="solver to capture from (default: whatever DWAVE_API_SOLVER or "
+        "the SDK config selects)",
+    )
+    p.add_argument(
+        "--compare",
+        metavar="PATH",
+        default=None,
+        help="with --dump-topology: also diff the capture against the spec "
+        "currently in force",
+    )
+    p.add_argument(
+        "--allowed-h-milli",
+        default=",".join(str(v) for v in DEFAULT_ALLOWED_H_MILLI),
+        help="comma-separated allowed h values for the captured spec "
+        "(network policy, not a chip property)",
+    )
+    p.add_argument(
+        "--allowed-j-milli",
+        default=",".join(str(v) for v in DEFAULT_ALLOWED_J_MILLI),
+        help="comma-separated allowed J values for the captured spec",
+    )
     return p
+
+
+def _milli_list(raw: str, flag: str) -> list[int]:
+    try:
+        values = [int(part) for part in raw.split(",") if part.strip()]
+    except ValueError as exc:
+        raise SystemExit(f"{flag}: expected comma-separated integers, got {raw!r}") from exc
+    if not values:
+        raise SystemExit(f"{flag}: needs at least one value")
+    return values
+
+
+def run_dump_topology(args) -> int:
+    """``--dump-topology``: capture the live working graph, optionally diffed.
+
+    Connects eagerly, unlike session mode: the point of the run is to read the
+    chip.
+    """
+    if not ocean_importable():
+        print("FAIL: dwave-ocean-sdk / dimod not importable", file=sys.stderr)
+        return EXIT_ENV_INCOMPATIBLE
+    sampler = OceanSampler(solver_name=args.solver, mock=False)
+    try:
+        sampler.ensure_connected()
+    except Exception as exc:  # noqa: BLE001 - operator-facing message, not a trace
+        print(f"FAIL: could not reach the solver: {exc}", file=sys.stderr)
+        return EXIT_ENV_INCOMPATIBLE
+    try:
+        spec = capture_spec(
+            sampler.live_nodes,
+            sampler.live_edges,
+            allowed_h_milli=_milli_list(args.allowed_h_milli, "--allowed-h-milli"),
+            allowed_j_milli=_milli_list(args.allowed_j_milli, "--allowed-j-milli"),
+        )
+        write_spec(spec, args.dump_topology)
+        print(
+            f"captured {len(spec['nodes'])} nodes and {len(spec['edges'])} couplers "
+            f"to {args.dump_topology}"
+        )
+        print(
+            f"allowed_h_milli={spec['allowed_h_milli']} "
+            f"allowed_j_milli={spec['allowed_j_milli']}"
+        )
+        if args.compare:
+            print()
+            print(format_comparison(compare_specs(load_spec(args.compare), spec)))
+        print()
+        print(
+            "The on-chain topology hash is computed by the coordinator; register "
+            "with: quip-coordinator seed-chain --topology "
+            f"{args.dump_topology}"
+        )
+    finally:
+        sampler.close()
+    return EXIT_CLEAN
 
 
 def print_capabilities() -> None:
@@ -151,6 +246,9 @@ def main(argv: list[str] | None = None) -> int:
     # the pre-Ocean name, and both --check and the session path resolve it
     # through the SDK.
     adopt_legacy_token_env()
+
+    if args.dump_topology:
+        return run_dump_topology(args)
 
     if args.check:
         return run_check(force_mock=args.mock)
