@@ -1,22 +1,43 @@
-"""QPU budget reservoir: accumulate-then-burst pacing (ported from v0.2).
+"""QPU budget with even distribution across the quota period.
 
-A pool of QPU-access-time budget accrues at ``daily_budget / 86400`` per
-wall-second and is spent by :meth:`QPUTimeManager.record_access_time`. Mining
-uses start/continue hysteresis: idle until the pool reaches
-``min_block_budget``, then burst until the pool drains to 0.
+Replaces the v0.2/v0.3 daily reservoir. That model accumulated credit and then
+burnt it in one continuous run, which left the miner dark for a contiguous
+multi-hour block once the pool drained — long enough for the rest of the field
+to close the gap while the QPU sat idle.
+
+This model paces instead of bursting. The allowance at any instant is the flat
+share of the budget that the elapsed part of the period has earned::
+
+    allowance = budget * (now - period_start) / (period_end - period_start)
+
+Mining is allowed while cumulative spend sits under that line. Spend comes from
+:mod:`quip_miner_dwave.usage`, so it survives a restart, and the period follows
+D-Wave's own quota semantics: a fixed day of the month, UTC, clamped to the
+month's length.
+
+Because spend only ever runs a fraction of a qblock past the line before the
+gate shuts, and the line keeps rising, the miner idles for one qblock at a time
+rather than one night at a time.
 """
 
 from __future__ import annotations
 
+import calendar
 import logging
-import time
 import tomllib
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from quip_miner_dwave.config import warn_unknown_fields
+from quip_miner_dwave.usage import UsageLedger
 
 logger = logging.getLogger(__name__)
+
+# Where the usage ledger lives when the coordinator does not name a path. The
+# deployment already mounts /data for config.toml and the attempts dashboard,
+# so it is the one directory known to outlive the container.
+DEFAULT_USAGE_DB = "/data/qpu-usage.db"
 
 # Config keys the dwave backend recognizes in Configure.backend_toml. Anything
 # else (outside SESSION_KEYS) is a typo and gets warned about, uniform with the
@@ -25,18 +46,22 @@ logger = logging.getLogger(__name__)
 # not the coordinator.
 DWAVE_CONFIG_KEYS = frozenset(
     {
-        "daily_budget",
-        "daily_budget_seconds",
-        "min_block_budget",
-        "min_block_budget_seconds",
-        "budget_cap",
-        "budget_cap_seconds",
-        "initial_budget",
-        "initial_budget_seconds",
+        "budget",
+        "budget_seconds",
+        "budget_reset_day",
+        "usage_db",
         "anneal_time_us",
         "num_reads",
     }
 )
+
+
+class BudgetUnavailable(Exception):
+    """The budget cannot be enforced, so the miner must not mine.
+
+    Raised for an invalid quota shape or a ledger that will not open. Both mean
+    the same thing operationally: spend would go unmetered.
+    """
 
 
 def warn_unknown_backend_keys(toml_text: str) -> None:
@@ -67,165 +92,117 @@ def parse_duration(duration_str: str) -> float:
     return float(s)
 
 
+def _reset_at(year: int, month: int, day: int) -> datetime:
+    """The reset instant for one month, clamped to that month's length.
+
+    A reset day of 31 has to mean "the 28th" in February; clamping keeps every
+    month in the year exactly one period long with no gaps or overlaps.
+    """
+    last = calendar.monthrange(year, month)[1]
+    return datetime(year, month, min(day, last), tzinfo=timezone.utc)
+
+
+def period_bounds(now: float, reset_day: int) -> tuple[float, float]:
+    """UTC ``[start, end)`` of the quota month containing ``now``."""
+    dt = datetime.fromtimestamp(now, timezone.utc)
+    start = _reset_at(dt.year, dt.month, reset_day)
+    if dt < start:
+        # This month's reset has not happened yet, so the live period opened
+        # with last month's.
+        year, month = (dt.year - 1, 12) if dt.month == 1 else (dt.year, dt.month - 1)
+        start = _reset_at(year, month, reset_day)
+    year, month = (
+        (start.year + 1, 1) if start.month == 12 else (start.year, start.month + 1)
+    )
+    return start.timestamp(), _reset_at(year, month, reset_day).timestamp()
+
+
 @dataclass
-class QPUTimeConfig:
-    """Reservoir configuration."""
+class BudgetConfig:
+    """Quota shape: how much QPU time per reset period."""
 
-    daily_budget_seconds: float
-    min_block_budget_seconds: float = 90.0
-    budget_cap_seconds: Optional[float] = None
-    initial_budget_seconds: Optional[float] = None
-    min_blocks_for_estimation: int = 5
-    ema_alpha: float = 0.3
+    budget_seconds: float
+    reset_day: int = 1
+    usage_db: str = DEFAULT_USAGE_DB
 
 
 @dataclass
-class QPUTimeEstimate:
-    """Result of a reservoir mining decision."""
+class ParticipationDecision:
+    """Whether the pacer will fund the next qblock, and why."""
 
-    should_mine: bool
-    pool_us: float
-    burst_active: bool
-    seconds_until_can_mine: float
-    estimated_block_time_us: float
+    participate: bool
+    headroom_us: float
+    allowance_us: float
+    spent_us: float
+    period_start: float
+    period_end: float
+    seconds_until_headroom: float
 
 
-class QPUTimeManager:
-    """Carry-over QPU budget reservoir with start/continue hysteresis."""
+class BudgetPacer:
+    """Even-distribution gate over one period's QPU allotment."""
 
-    def __init__(self, config: QPUTimeConfig):
+    def __init__(self, config: BudgetConfig, ledger: UsageLedger):
         self.config = config
-        self.block_times_us: list[float] = []
-        self.cumulative_used_us: float = 0.0
-        self.ema_estimate_us: Optional[float] = None
-        self._pool_us: float = 0.0
-        self._burst_active: bool = False
-        self._last_accrual_s: float = time.time()
-        cap_s = config.budget_cap_seconds
-        if cap_s is None:
-            cap_s = max(config.daily_budget_seconds, config.min_block_budget_seconds)
-        elif cap_s < config.min_block_budget_seconds:
-            # The gate opens at min_block_budget, and the pool can never exceed
-            # the cap: a cap below the threshold means should_mine() is false
-            # forever and every job is rejected OVERLOADED. Lift the cap to the
-            # threshold rather than mine never, and name both values.
-            logger.error(
-                "budget_cap (%.0fs) is below min_block_budget (%.0fs): the pool "
-                "could never reach the mining threshold. Raising the cap to "
-                "%.0fs. Set budget_cap >= min_block_budget to silence this.",
-                cap_s,
-                config.min_block_budget_seconds,
-                config.min_block_budget_seconds,
-            )
-            cap_s = config.min_block_budget_seconds
-        self._pool_cap_us: float = cap_s * 1_000_000
-        self._accrual_rate_us_per_s: float = (
-            config.daily_budget_seconds * 1_000_000 / 86400.0
-        )
-        if config.initial_budget_seconds is not None:
-            self._pool_us = min(
-                self._pool_cap_us,
-                max(0.0, config.initial_budget_seconds * 1_000_000),
-            )
+        self.ledger = ledger
 
-    def reset_clock(self, now: float) -> None:
-        """Test seam: pin the accrual clock."""
-        self._last_accrual_s = now
+    def decide(self, now: float) -> ParticipationDecision:
+        """Evaluate spend against the flat allowance line at ``now``."""
+        start, end = period_bounds(now, self.config.reset_day)
+        span = end - start
+        elapsed = min(max(now - start, 0.0), span)
+        budget_us = self.config.budget_seconds * 1_000_000
+        allowance_us = budget_us * elapsed / span
+        spent_us = self.ledger.spent_us_since(start)
+        headroom_us = allowance_us - spent_us
 
-    def _accrue(self, now: float) -> None:
-        elapsed = now - self._last_accrual_s
-        if elapsed > 0:
-            self._pool_us = min(
-                self._pool_cap_us,
-                self._pool_us + self._accrual_rate_us_per_s * elapsed,
-            )
-            self._last_accrual_s = now
-
-    def record_access_time(
-        self, qpu_access_time_us: float, now: Optional[float] = None
-    ) -> None:
-        """Debit the pool after a completed QPU job."""
-        self._accrue(now if now is not None else time.time())
-        self._pool_us -= qpu_access_time_us
-        self.block_times_us.append(qpu_access_time_us)
-        self.cumulative_used_us += qpu_access_time_us
-        n = len(self.block_times_us)
-        if n >= self.config.min_blocks_for_estimation:
-            if self.ema_estimate_us is None:
-                self.ema_estimate_us = sum(self.block_times_us) / n
-            else:
-                a = self.config.ema_alpha
-                self.ema_estimate_us = (
-                    a * qpu_access_time_us + (1 - a) * self.ema_estimate_us
-                )
-
-    def estimate_next_block_time(self) -> float:
-        if not self.block_times_us:
-            return 10_000.0
-        if len(self.block_times_us) < self.config.min_blocks_for_estimation:
-            return max(self.block_times_us) * 1.5
-        if self.ema_estimate_us is not None:
-            return self.ema_estimate_us * 1.2
-        return (sum(self.block_times_us) / len(self.block_times_us)) * 1.2
-
-    def should_mine(self, now: Optional[float] = None) -> QPUTimeEstimate:
-        """Decide whether budget allows sampling (start/continue hysteresis)."""
-        now = now if now is not None else time.time()
-        self._accrue(now)
-        estimated = self.estimate_next_block_time()
-        buffer_us = self.config.min_block_budget_seconds * 1_000_000
-        pool_us = self._pool_us
-
-        if self._burst_active:
-            may = pool_us > 0.0
-        else:
-            may = pool_us >= buffer_us
-        self._burst_active = may
-
-        if may:
+        if headroom_us > 0:
             until = 0.0
         else:
-            deficit = max(0.0, buffer_us - pool_us)
-            rate = self._accrual_rate_us_per_s
-            until = deficit / rate if rate > 0 else float("inf")
+            rate_us_per_s = budget_us / span
+            # Time for the rising line to reach current spend; never longer
+            # than the wait for the reset, which zeroes spend outright.
+            catch_up = (
+                -headroom_us / rate_us_per_s if rate_us_per_s > 0 else float("inf")
+            )
+            until = min(catch_up, max(0.0, end - now))
 
-        return QPUTimeEstimate(
-            should_mine=may,
-            pool_us=pool_us,
-            burst_active=self._burst_active,
-            seconds_until_can_mine=until,
-            estimated_block_time_us=estimated,
+        return ParticipationDecision(
+            participate=headroom_us > 0,
+            headroom_us=headroom_us,
+            allowance_us=allowance_us,
+            spent_us=spent_us,
+            period_start=start,
+            period_end=end,
+            seconds_until_headroom=until,
         )
 
-    def end_burst(self) -> None:
-        """Force re-accumulation to the full buffer."""
-        self._burst_active = False
+    def record_access_time(self, qpu_access_time_us: float, now: float) -> None:
+        """Bill a completed job against the period."""
+        self.ledger.record(qpu_access_time_us, now=now)
 
-    def get_stats(self, now: Optional[float] = None) -> Dict[str, Any]:
-        now = now if now is not None else time.time()
-        self._accrue(now)
-        # Reuses should_mine()'s hysteresis evaluation for seconds_until_can_mine
-        # (note: should_mine() also refreshes self._burst_active as a side
-        # effect, consistent with the pool/state already accrued to `now`).
-        estimate = self.should_mine(now)
+    def stats(self, now: float) -> Dict[str, Any]:
+        decision = self.decide(now)
         return {
-            "pool_seconds": self._pool_us / 1_000_000,
-            "burst_active": self._burst_active,
-            "daily_budget_seconds": self.config.daily_budget_seconds,
-            "min_block_budget_seconds": self.config.min_block_budget_seconds,
-            "cumulative_used_seconds": self.cumulative_used_us / 1_000_000,
-            "ema_estimate_seconds": (
-                self.ema_estimate_us / 1_000_000
-                if self.ema_estimate_us is not None
-                else None
-            ),
-            "estimated_block_time_seconds": self.estimate_next_block_time() / 1_000_000,
-            "seconds_until_can_mine": estimate.seconds_until_can_mine,
+            "budget_seconds": self.config.budget_seconds,
+            "reset_day": self.config.reset_day,
+            "period_start": decision.period_start,
+            "period_end": decision.period_end,
+            "allowance_seconds": decision.allowance_us / 1_000_000,
+            "spent_seconds": decision.spent_us / 1_000_000,
+            "headroom_seconds": decision.headroom_us / 1_000_000,
+            "jobs_this_period": self.ledger.jobs_since(decision.period_start),
+            "seconds_until_headroom": decision.seconds_until_headroom,
         }
 
 
-def budget_from_backend_toml(toml_text: str) -> Optional[QPUTimeManager]:
-    """Build a manager from Configure.backend_toml, or None if no budget keys."""
+def budget_from_backend_toml(toml_text: str) -> Optional[BudgetPacer]:
+    """Build a pacer from ``Configure.backend_toml``, or None if unbudgeted.
+
+    Raises :class:`BudgetUnavailable` when a budget is configured but cannot
+    be enforced: an unmetered miner would spend the period's quota in a day, so
+    refusing to start is the safe failure.
+    """
     if not toml_text or not toml_text.strip():
         return None
     try:
@@ -233,54 +210,32 @@ def budget_from_backend_toml(toml_text: str) -> Optional[QPUTimeManager]:
     except Exception:
         return None
 
-    raw = data.get("daily_budget") or data.get("daily_budget_seconds")
+    raw = data.get("budget") or data.get("budget_seconds")
     if raw is None:
         return None
-    if isinstance(raw, (int, float)):
-        daily = float(raw)
-    else:
-        daily = parse_duration(str(raw))
+    amount = float(raw) if isinstance(raw, (int, float)) else parse_duration(str(raw))
 
-    min_block = data.get("min_block_budget") or data.get("min_block_budget_seconds")
-    if min_block is None:
-        min_s = min(90.0, daily) if daily > 0 else 0.0
-    elif isinstance(min_block, (int, float)):
-        min_s = float(min_block)
-    else:
-        min_s = parse_duration(str(min_block))
-
-    cap_raw = data.get("budget_cap") or data.get("budget_cap_seconds")
-    cap_s: Optional[float]
-    if cap_raw is None:
-        cap_s = None
-    elif isinstance(cap_raw, (int, float)):
-        cap_s = float(cap_raw)
-    else:
-        cap_s = parse_duration(str(cap_raw))
-
-    init_raw = data.get("initial_budget") or data.get("initial_budget_seconds")
-    init_s: Optional[float]
-    if init_raw is None:
-        # Default: seed one buffer so a fresh process can mine immediately.
-        init_s = min_s
-    elif isinstance(init_raw, (int, float)):
-        init_s = float(init_raw)
-    else:
-        key = str(init_raw).strip().lower()
-        if key == "min":
-            init_s = min_s
-        elif key == "daily":
-            init_s = daily
-        elif key == "cap":
-            init_s = cap_s if cap_s is not None else max(daily, min_s)
-        else:
-            init_s = parse_duration(key)
-
-    return QPUTimeManager(
-        QPUTimeConfig(
-            daily_budget_seconds=daily,
-            min_block_budget_seconds=min_s,
-            budget_cap_seconds=cap_s,
-            initial_budget_seconds=init_s,
+    reset_day = int(data.get("budget_reset_day", 1))
+    if not 1 <= reset_day <= 31:
+        raise BudgetUnavailable(
+            f"budget_reset_day must be 1-31, got {reset_day}"
         )
+
+    db_path = str(data.get("usage_db") or DEFAULT_USAGE_DB)
+    try:
+        ledger = UsageLedger(db_path)
+    except Exception as exc:
+        raise BudgetUnavailable(
+            f"cannot open the QPU usage ledger at {db_path}: {exc}. "
+            "Set usage_db to a writable path on a persistent volume; the miner "
+            "will not mine without a durable record of spend."
+        ) from exc
+
+    return BudgetPacer(
+        BudgetConfig(
+            budget_seconds=amount,
+            reset_day=reset_day,
+            usage_db=db_path,
+        ),
+        ledger,
     )
