@@ -9,7 +9,7 @@ from quip_solver_core import miner_pb2, wire
 from quip_solver_core.session import DEFAULT_NUM_SWEEPS
 
 from quip_miner_dwave import MAX_EDGES, MAX_NODES
-from quip_miner_dwave.ocean import OceanSampler, SampleResult
+from quip_miner_dwave.ocean import SampleResult, SupportsSample
 
 logger = logging.getLogger(__name__)
 
@@ -70,12 +70,14 @@ class _Rejected(Exception):
     Reject message in one place, in :func:`handle_job`.
     """
 
-    def __init__(self, reason: int):
+    def __init__(self, reason: miner_pb2.RejectReason):
         super().__init__(reason)
         self.reason = reason
 
 
-def _reject(job_id: bytes, reason: int) -> List[miner_pb2.MinerMsg]:
+def _reject(
+    job_id: bytes, reason: miner_pb2.RejectReason
+) -> List[miner_pb2.MinerMsg]:
     """Build the two-message reply that rejects ``job_id`` for ``reason``.
 
     A reject is terminal for the job, so it carries the same credit refund a
@@ -286,7 +288,7 @@ def _build_result(
 
 def handle_job(
     job: miner_pb2.Job,
-    sampler: OceanSampler,
+    sampler: SupportsSample,
     *,
     session_nodes: Sequence[int],
     session_edges: Sequence[Tuple[int, int]],

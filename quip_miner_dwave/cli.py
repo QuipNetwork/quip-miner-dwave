@@ -29,6 +29,7 @@ from quip_miner_dwave.capture import (
 )
 from quip_miner_dwave.ocean import (
     OceanSampler,
+    SupportsClose,
     adopt_legacy_token_env,
     credentials_present,
     mock_mode_enabled,
@@ -194,7 +195,7 @@ def run_check(*, force_mock: bool = False) -> int:
     return EXIT_CLEAN
 
 
-def install_sigterm_handler(sampler: OceanSampler) -> None:
+def install_sigterm_handler(sampler: SupportsClose) -> None:
     """Register a SIGTERM handler that closes ``sampler`` before exiting.
 
     A default-disposition SIGTERM (``kill``, orchestrator shutdown) tears

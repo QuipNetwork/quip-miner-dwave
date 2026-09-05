@@ -71,6 +71,7 @@ def test_sigterm_handler_closes_sampler_and_exits_clean():
         install_sigterm_handler(sampler)
         handler = signal.getsignal(signal.SIGTERM)
         assert handler is not original
+        assert callable(handler)
         with pytest.raises(SystemExit) as exc_info:
             handler(signal.SIGTERM, None)
         assert exc_info.value.code == EXIT_CLEAN
@@ -86,6 +87,7 @@ def test_sigterm_handler_is_idempotent():
     try:
         install_sigterm_handler(sampler)
         handler = signal.getsignal(signal.SIGTERM)
+        assert callable(handler)
         with pytest.raises(SystemExit):
             handler(signal.SIGTERM, None)
         # Second delivery: already triggered, must return quietly (no raise).
