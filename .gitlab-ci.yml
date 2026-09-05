@@ -88,11 +88,15 @@ build-macos-arm64:
     #
     # quip-solver-core requires >= 3.11 and publishes a macOS arm64 wheel, so
     # there is still no compiler, rustup or protoc bootstrap here.
+    #
+    # Always install, never "install only if missing". That guard was needed
+    # for brew, whose install writes to a shared prefix and fails when the
+    # prefix belongs to someone else. uv installs into $HOME, so there is no
+    # such hazard, and skipping the install would leave whatever uv the host
+    # happens to carry — which defeats the pin. A macos+arm64 host was found
+    # carrying 0.11.7 this way.
     - export PATH="$HOME/.local/bin:$PATH"
-    - |
-      if ! command -v uv >/dev/null 2>&1; then
-        curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh
-      fi
+    - curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh
     - uv --version
     # uv downloads 3.12 when the host does not already have it. before_script
     # and script share one shell, so this venv stays active below.
