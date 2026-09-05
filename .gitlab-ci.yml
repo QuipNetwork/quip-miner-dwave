@@ -2,6 +2,9 @@ stages: [test, build, release]
 
 variables:
   PKG: quip-miner-dwave
+  # Pinned so a macOS build is reproducible and an upstream installer
+  # change cannot land mid-release.
+  UV_VERSION: "0.12.10"
 
 default:
   image: python:3.12-slim
@@ -61,50 +64,47 @@ build-macos-arm64:
   tags: [macos, arm64]
   rules:
     - if: $CI_COMMIT_TAG
+    # Also run on a merge request that changes the build itself. The macOS
+    # bootstrap can only be proved on a real macOS runner, and proving it after
+    # a tag is pushed is too late: a tag pipeline runs the .gitlab-ci.yml that
+    # exists at that tag, so a fix cannot rescue a release already cut.
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        - .gitlab-ci.yml
+        - pyinstaller/**/*
   before_script:
-    # The shell executor starts a non-login bash, which reads no profile, so
-    # Homebrew's prefix is on PATH only where a runner happens to export it
-    # elsewhere. The v0.3.2-rc5 tag failed on one runner with
-    # "brew: command not found" while the same job passed on another. Put both
-    # prefixes on PATH (Apple Silicon, then Intel) and say so plainly when the
-    # runner really has no Homebrew, instead of failing at exit status 127
-    # three lines later.
-    - export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
-    - |
-      command -v brew >/dev/null || {
-        echo "no Homebrew on this runner ($(hostname)); it cannot build the bundle" >&2
-        exit 1
-      }
-    - eval "$(brew shellenv)"
-    # python@3.12: quip-solver-core requires >= 3.11 and the runner's system
-    # python3 is below that floor. No build toolchain: quip-solver-core
-    # publishes a macOS arm64 wheel since 0.0.1-rc1, so pip installs it
-    # prebuilt — the rustup/protobuf bootstrap that built it from source is
-    # gone with the source build.
+    # No Homebrew. This job needs one thing from the host, a Python 3.12
+    # interpreter, and Homebrew is the wrong way to get it on a shared runner:
+    # `brew install` writes into the Homebrew prefix even for a formula that is
+    # already present, so it fails outright on any host whose prefix belongs to
+    # another user. That failure took out three tags — v0.3.2-rc5,
+    # quip-miner v0.3.1-rc6 and v0.3.2-rc8 — each time on a newly added host,
+    # and each time the host had to be fixed by hand before a release could go
+    # out.
     #
-    # Install only when the interpreter is genuinely absent. `brew install`
-    # writes into the Homebrew prefix even for a formula that is already
-    # present, so it fails on a runner whose prefix belongs to another user:
-    # quip-miner's v0.3.1-rc6 tag died that way on a newly added host, against
-    # an unwritable /opt/homebrew. Skipping the install where python3.12
-    # already exists avoids the write, and a runner that has neither the
-    # interpreter nor a usable brew now says so in three lines instead of
-    # printing Homebrew's chown advice for twenty.
-    - |
-      if ! command -v python3.12 >/dev/null 2>&1; then
-        if ! brew install python@3.12; then
-          echo "python3.12 is missing on $(hostname) and 'brew install python@3.12' failed" >&2
-          echo "the Homebrew prefix is likely not writable by the runner user ($(id -un))" >&2
-          echo "install python@3.12 for that user, or drop this host from the macos+arm64 pool" >&2
-          exit 1
-        fi
-      fi
-    - python3.12 --version
-  script:
-    - python3.12 -m venv .venv
+    # uv fetches a python-build-standalone interpreter into the runner user's
+    # own directory. Nothing writes to /opt/homebrew, prefix ownership stops
+    # mattering, and a new macos+arm64 host can build with no preparation.
+    #
+    # quip-solver-core requires >= 3.11 and publishes a macOS arm64 wheel, so
+    # there is still no compiler, rustup or protoc bootstrap here.
+    #
+    # Always install, never "install only if missing". That guard was needed
+    # for brew, whose install writes to a shared prefix and fails when the
+    # prefix belongs to someone else. uv installs into $HOME, so there is no
+    # such hazard, and skipping the install would leave whatever uv the host
+    # happens to carry — which defeats the pin. A macos+arm64 host was found
+    # carrying 0.11.7 this way.
+    - export PATH="$HOME/.local/bin:$PATH"
+    - curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh
+    - uv --version
+    # uv downloads 3.12 when the host does not already have it. before_script
+    # and script share one shell, so this venv stays active below.
+    - uv venv --python 3.12 .venv
     - . .venv/bin/activate
-    - pip install -q --upgrade pip
-    - pip install -q ".[dev]" pyinstaller
+    - python --version
+  script:
+    - uv pip install -q ".[dev]" pyinstaller
     # Library-level check before freezing. A break in Ocean or
     # quip_solver_core surfaces here with a readable traceback instead of as a
     # ModuleNotFoundError from inside the bundle.
@@ -118,11 +118,11 @@ build-macos-arm64:
     - ./dist/quip-dwave-qa-darwin-arm64 --version
     - ./dist/quip-dwave-qa-darwin-arm64 --capabilities
     - QUIP_DWAVE_MOCK=1 ./dist/quip-dwave-qa-darwin-arm64 --check
-    # Self-contained means macOS system libraries only. A link against
-    # Homebrew's libpython or libprotobuf would mean the binary runs on this
+    # Self-contained means macOS system libraries only. A link against a
+    # Homebrew or uv-managed libpython would mean the binary runs on this
     # builder and nowhere else.
     - otool -L dist/quip-dwave-qa-darwin-arm64 | tail -n +2
-    - "! otool -L dist/quip-dwave-qa-darwin-arm64 | grep -qE '/opt/homebrew|/usr/local'"
+    - "! otool -L dist/quip-dwave-qa-darwin-arm64 | grep -qE '/opt/homebrew|/usr/local|/\\.local/share/uv'"
   artifacts:
     paths: [dist/]
     expire_in: 1 week
