@@ -1,6 +1,6 @@
 """Energy reporting + job reject paths (offline mock sampler)."""
 import time
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from quip_solver_core import miner_pb2, scoring, wire
 
@@ -450,7 +450,7 @@ def test_result_meta_echoes_the_resolved_sweep_budget():
             m.result.meta.sweeps for m in msgs if m.WhichOneof("msg") == "result"
         )
 
-    kw = dict(session_nodes=[0, 1], session_edges=[(0, 1)])
+    kw: dict[str, Any] = dict(session_nodes=[0, 1], session_edges=[(0, 1)])
     # Absolute default.
     assert meta_sweeps(handle_job(job(), sampler, **kw)) == DEFAULT_NUM_SWEEPS
     # Session default, as resolved from Configure.backend_toml.

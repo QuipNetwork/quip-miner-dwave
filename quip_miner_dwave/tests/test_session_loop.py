@@ -108,41 +108,105 @@ def test_progress_line_matches_the_shared_format(caplog):
     assert caplog.records[0].levelno == logging.INFO
 
 
-def _estimate(pool_s, until_s):
-    from quip_miner_dwave.budget import QPUTimeEstimate
+def _decision(headroom_s, until_s=0.0, spent_s=0.0, allowance_s=0.0):
+    from quip_miner_dwave.budget import ParticipationDecision
 
-    return QPUTimeEstimate(
-        should_mine=False,
-        pool_us=pool_s * 1_000_000,
-        burst_active=False,
-        seconds_until_can_mine=until_s,
-        estimated_block_time_us=10_000.0,
+    return ParticipationDecision(
+        participate=headroom_s > 0,
+        headroom_us=headroom_s * 1_000_000,
+        allowance_us=allowance_s * 1_000_000,
+        spent_us=spent_s * 1_000_000,
+        period_start=0.0,
+        period_end=0.0,
+        seconds_until_headroom=until_s,
     )
 
 
-def test_budget_closed_line_reports_the_next_window(caplog):
-    from quip_miner_dwave.session_loop import _log_budget_closed
+def test_joining_a_qblock_names_the_headroom_and_the_spend(caplog):
+    from quip_miner_dwave.session_loop import _log_qblock_joined
 
     caplog.set_level(logging.DEBUG)
-    _log_budget_closed(_estimate(300.0, 21_600.0))
-    assert "budget exhausted" in caplog.text
+    _log_qblock_joined(204, _decision(600.0, spent_s=400.0, allowance_s=1000.0))
+    assert "joining qblock 204" in caplog.text
+    assert "600s of headroom" in caplog.text
+    assert "spent 400s of 1000s" in caplog.text
+    assert [r.levelname for r in caplog.records] == ["INFO"]
+
+
+def test_sitting_out_a_qblock_reports_the_next_window(caplog):
+    from quip_miner_dwave.session_loop import _log_qblock_sat_out
+
+    caplog.set_level(logging.DEBUG)
+    _log_qblock_sat_out(205, _decision(-300.0, until_s=21_600.0))
+    assert "sitting out qblock 205" in caplog.text
+    assert "300s past the budget line" in caplog.text
     assert "next window in 6h 0m" in caplog.text
     assert [r.levelname for r in caplog.records] == ["INFO"]
 
 
-def test_unreachable_budget_is_an_error_not_an_info(caplog):
-    from quip_miner_dwave.session_loop import _log_budget_closed
+def test_crossing_the_line_mid_qblock_logs_the_overshoot_and_the_wait(caplog):
+    from quip_miner_dwave.session_loop import _log_line_crossed
 
     caplog.set_level(logging.DEBUG)
-    _log_budget_closed(_estimate(300.0, float("inf")))
-    assert [r.levelname for r in caplog.records] == ["ERROR"]
-    assert "never" in caplog.text
-    assert "budget_cap" in caplog.text
-
-
-def test_budget_closed_without_an_estimate_still_logs_once(caplog):
-    from quip_miner_dwave.session_loop import _log_budget_closed
-
-    caplog.set_level(logging.DEBUG)
-    _log_budget_closed(None)
+    _log_line_crossed(_decision(-12.0, until_s=300.0))
+    assert "budget line crossed mid-qblock" in caplog.text
+    assert "12s over" in caplog.text
+    assert "next window in 5m 0s" in caplog.text
+    assert "rejoins at the qblock after that" in caplog.text
     assert [r.levelname for r in caplog.records] == ["INFO"]
+
+
+def _pacer_at(spent_s, allowance_s, budget_s=3000.0, reset_day=9):
+    """A pacer whose ledger and clock put spend at a chosen point on the line."""
+    from datetime import datetime, timezone
+
+    from quip_miner_dwave.budget import BudgetConfig, BudgetPacer, period_bounds
+    from quip_miner_dwave.usage import UsageLedger
+
+    led = UsageLedger(":memory:")
+    pacer = BudgetPacer(BudgetConfig(budget_s, reset_day), led)
+    start, end = period_bounds(
+        datetime(2026, 9, 19, tzinfo=timezone.utc).timestamp(), reset_day
+    )
+    now = start + (end - start) * (allowance_s / budget_s)
+    if spent_s:
+        led.record(spent_s * 1_000_000, now=now)
+    return pacer, now
+
+
+def test_configure_states_the_quota_the_period_and_the_spend(caplog):
+    from quip_miner_dwave.session_loop import _log_budget_configured
+
+    caplog.set_level(logging.DEBUG)
+    pacer, now = _pacer_at(spent_s=400.0, allowance_s=1000.0)
+    _log_budget_configured(pacer, now)
+    assert "budget 3000s per period" in caplog.text
+    assert "resets day 9" in caplog.text
+    assert "period 2026-09-09 -> 2026-10-09" in caplog.text
+    assert "spent 400s of 1000s earned so far; jobs this period: 1" in caplog.text
+
+
+def test_configure_says_why_it_waits_when_headroom_is_available(caplog):
+    # Idle with budget in hand is the confusing case: the line must name the
+    # qblock boundary as the reason, or it reads as a hang.
+    from quip_miner_dwave.session_loop import _log_budget_configured
+
+    caplog.set_level(logging.DEBUG)
+    pacer, now = _pacer_at(spent_s=400.0, allowance_s=1000.0)
+    _log_budget_configured(pacer, now)
+    assert "waiting: 600s of headroom is available" in caplog.text
+    assert "held until the next qblock boundary" in caplog.text
+    assert "whole round rather than part of one" in caplog.text
+
+
+def test_configure_estimates_the_wait_when_spend_is_past_the_line(caplog):
+    from quip_miner_dwave.session_loop import _log_budget_configured
+
+    caplog.set_level(logging.DEBUG)
+    # 1200s spent against 1000s earned: 200s over, earned back at 3000s/30d.
+    pacer, now = _pacer_at(spent_s=1200.0, allowance_s=1000.0)
+    _log_budget_configured(pacer, now)
+    assert "waiting: 200s past the budget line" in caplog.text
+    assert "no credits are granted" in caplog.text
+    assert "Next window in 48h 0m" in caplog.text
+    assert "following qblock boundary" in caplog.text

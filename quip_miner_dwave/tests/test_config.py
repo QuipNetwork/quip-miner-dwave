@@ -22,19 +22,19 @@ def test_config_override_reports_only_on_change(caplog):
 def test_warn_unknown_fields_filters_session_keys(caplog):
     with caplog.at_level(logging.WARNING):
         warn_unknown_fields(
-            "dwave", ["daily_budget", "num_sweeps", "typo"], DWAVE_CONFIG_KEYS
+            "dwave", ["budget", "num_sweeps", "typo"], DWAVE_CONFIG_KEYS
         )
     warned = [r.message for r in caplog.records]
     assert any("unknown field 'typo' for dwave" in m for m in warned)
     # recognized + session keys are not flagged
-    assert not any("daily_budget" in m or "num_sweeps" in m for m in warned)
+    assert not any("budget" in m or "num_sweeps" in m for m in warned)
 
 
 def test_warn_unknown_backend_keys_parses_toml(caplog):
     with caplog.at_level(logging.WARNING):
-        warn_unknown_backend_keys('daily_budget = "1h"\nnum_reads = 100\nbogus = 1\n')
+        warn_unknown_backend_keys('budget = "40h"\nnum_reads = 100\nbogus = 1\n')
     warned = [r.message for r in caplog.records]
     assert any("unknown field 'bogus'" in m for m in warned)
     # recognized keys are not flagged; connection creds live in D-Wave env, so
     # they are NOT recognized here and would warn (intentional).
-    assert not any("daily_budget" in m or "num_reads" in m for m in warned)
+    assert not any("budget" in m or "num_reads" in m for m in warned)

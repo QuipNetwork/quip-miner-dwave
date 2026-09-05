@@ -17,7 +17,7 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
 
 
 from quip_miner_dwave.defects import (
@@ -116,6 +116,32 @@ class SampleResult:
     num_reads: int
     defect_info: Optional[DefectInfo] = None
     extra: Dict[str, str] = field(default_factory=dict)
+
+
+class SupportsSample(Protocol):
+    """The one call :func:`quip_miner_dwave.job.handle_job` makes on a sampler.
+
+    Naming the surface instead of the concrete class is what lets the tests
+    drive job.py with a recording or exploding double, which is the only way to
+    cover the failure paths without a live QPU.
+    """
+
+    def sample(
+        self,
+        h: Dict[int, float],
+        j: Dict[Tuple[int, int], float],
+        *,
+        num_reads: int = 1,
+        anneal_time_us: Optional[int] = None,
+        nonce_seed: Optional[bytes] = None,
+        label: str = "quip-dwave-qa",
+    ) -> SampleResult: ...
+
+
+class SupportsClose(Protocol):
+    """The surface the SIGTERM handler needs: release the cloud client."""
+
+    def close(self) -> None: ...
 
 
 class MockSampler:
@@ -395,7 +421,7 @@ class OceanSampler:
             solver = getattr(self.sampler, "solver", None)
             if solver is not None and hasattr(solver, "sample_ising"):
                 return solver.sample_ising(h, j, **kwargs)
-        return self.sampler.sample_ising(h, j, **kwargs)
+        return sample_fn(h, j, **kwargs)
 
     @staticmethod
     def _decode_future(future_or_ss: Any):
