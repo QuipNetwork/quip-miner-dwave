@@ -9,6 +9,7 @@ from quip_solver_core import miner_pb2, wire
 from quip_solver_core.session import DEFAULT_NUM_SWEEPS
 
 from quip_miner_dwave import MAX_EDGES, MAX_NODES
+from quip_miner_dwave.config import SamplingDefaults
 from quip_miner_dwave.ocean import SampleResult, SupportsSample
 
 logger = logging.getLogger(__name__)
@@ -207,12 +208,16 @@ def _sampling_params(
     ising: miner_pb2.IsingProblem,
     session_target: Optional["miner_pb2.SetTarget"],
     session_sweeps: int,
+    session_defaults: SamplingDefaults = SamplingDefaults(),
 ) -> Tuple[int, int, int]:
     """Resolve ``(num_reads, anneal_time_us, num_sweeps)`` for one job.
 
     All follow the same precedence: per-job override, then the session's
-    ``SetTarget``, then the default. ``anneal_time_us`` defaults to 0, meaning
-    the QPU applies its hardware-default anneal. ``num_sweeps`` does not steer
+    ``SetTarget``, then ``session_defaults`` from ``Configure.backend_toml``,
+    then the hard-coded default. Zero means "unset" at every rung, so an
+    operator's ``anneal_time_us`` applies to jobs the coordinator left blank
+    without ever overriding one it filled in. ``anneal_time_us`` resolving to 0
+    means the QPU applies its hardware-default anneal. ``num_sweeps`` does not steer
     the QPU (an annealer runs anneals, not sweeps); it is the resolved budget
     the coordinator pinned, echoed in ``SamplerMeta.sweeps`` because the
     contract grades that echo verbatim (``sweeps_honoured``).
@@ -224,6 +229,8 @@ def _sampling_params(
     if num_reads == 0 and session_target is not None and session_target.num_reads:
         num_reads = int(session_target.num_reads)
     if num_reads == 0:
+        num_reads = session_defaults.num_reads
+    if num_reads == 0:
         num_reads = 1
 
     anneal_time_us = int(ising.anneal_time_us)
@@ -233,6 +240,8 @@ def _sampling_params(
         and session_target.anneal_time_us
     ):
         anneal_time_us = int(session_target.anneal_time_us)
+    if anneal_time_us == 0:
+        anneal_time_us = session_defaults.anneal_time_us
 
     num_sweeps = int(ising.num_sweeps)
     if num_sweeps == 0 and session_target is not None and session_target.num_sweeps:
@@ -295,6 +304,7 @@ def handle_job(
     session_hash: Optional[bytes] = None,
     session_target: Optional["miner_pb2.SetTarget"] = None,
     session_sweeps: int = DEFAULT_NUM_SWEEPS,
+    session_defaults: SamplingDefaults = SamplingDefaults(),
 ) -> List[miner_pb2.MinerMsg]:
     """Validate and solve one job; return Result+JobRequest or Reject messages.
 
@@ -322,7 +332,7 @@ def handle_job(
         return _reject(job_id, exc.reason)
 
     num_reads, anneal_time_us, num_sweeps = _sampling_params(
-        ising, session_target, session_sweeps
+        ising, session_target, session_sweeps, session_defaults
     )
     try:
         result: SampleResult = sampler.sample(

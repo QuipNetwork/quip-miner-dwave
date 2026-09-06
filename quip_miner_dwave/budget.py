@@ -207,8 +207,17 @@ def budget_from_backend_toml(toml_text: str) -> Optional[BudgetPacer]:
         return None
     try:
         data = tomllib.loads(toml_text)
-    except Exception:
-        return None
+    except Exception as exc:
+        # A document that will not parse is not "no budget configured" — it is
+        # a budget nobody can read. Returning None here would mine unmetered on
+        # a typo, which is the exact failure this module exists to prevent.
+        # `budget = 250m` (a bare duration) is the common one: TOML needs
+        # `budget = "250m"`.
+        raise BudgetUnavailable(
+            f"cannot parse the coordinator's backend config: {exc}. "
+            "A duration must be quoted, as in budget = \"250m\"; the miner "
+            "will not mine while its budget is unreadable."
+        ) from exc
 
     raw = data.get("budget") or data.get("budget_seconds")
     if raw is None:

@@ -38,6 +38,7 @@ from quip_miner_dwave.budget import (
     budget_from_backend_toml,
     warn_unknown_backend_keys,
 )
+from quip_miner_dwave.config import SamplingDefaults, sampling_defaults_from_toml
 from quip_miner_dwave.job import handle_job
 from quip_solver_core.session import DEFAULT_NUM_SWEEPS, num_sweeps_from_toml
 from quip_miner_dwave.ocean import OceanSampler
@@ -442,6 +443,7 @@ def run_session(
     session_hash: Optional[bytes] = None
     session_target: Optional[miner_pb2.SetTarget] = None
     session_sweeps: int = DEFAULT_NUM_SWEEPS
+    session_defaults = SamplingDefaults()
     pending_budget = budget
     # None until a budget is configured. While it is None the miner is
     # unmetered and mines every round, as it did before budget pacing.
@@ -457,7 +459,7 @@ def run_session(
     best_energy_milli: Optional[int] = None
     PROGRESS_LOG_INTERVAL = 10
 
-    def process_job(job, s_nodes, s_edges, s_hash, s_target, s_sweeps):
+    def process_job(job, s_nodes, s_edges, s_hash, s_target, s_sweeps, s_defaults):
         # Runs on a pool thread: sample (blocking on the QPU), then enqueue
         # replies. Shared-state mutations are guarded by state_lock.
         nonlocal jobs_done, best_energy_milli
@@ -470,6 +472,7 @@ def run_session(
             session_hash=s_hash,
             session_target=s_target,
             session_sweeps=s_sweeps,
+            session_defaults=s_defaults,
         )
         wall_ms = int((time.monotonic() - started) * 1000)
         for reply in replies:
@@ -614,6 +617,18 @@ def run_session(
                 # Session-wide sweep budget: a top-level num_sweeps key, or
                 # the SDK default. Echoed per Result in SamplerMeta.sweeps.
                 session_sweeps = num_sweeps_from_toml(cm.configure.backend_toml)
+                # Operator-set sampling defaults for jobs the coordinator left
+                # blank. Lowest rung of the precedence ladder in job.py.
+                session_defaults = sampling_defaults_from_toml(
+                    cm.configure.backend_toml
+                )
+                if session_defaults != SamplingDefaults():
+                    logger.info(
+                        "[budget] sampling defaults from config: num_reads=%s "
+                        "anneal_time_us=%s (per-job and SetTarget values still win)",
+                        session_defaults.num_reads or "unset",
+                        session_defaults.anneal_time_us or "unset",
+                    )
                 if pending_budget is None and cm.configure.backend_toml:
                     try:
                         pending_budget = budget_from_backend_toml(
@@ -722,6 +737,7 @@ def run_session(
                     session_hash,
                     session_target,
                     session_sweeps,
+                    session_defaults,
                 )
                 if job_pool is not None:
                     job_pool.submit(process_job, *args).add_done_callback(
