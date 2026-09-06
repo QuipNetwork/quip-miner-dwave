@@ -279,3 +279,31 @@ def test_stats_report_the_period_and_the_headroom():
     assert stats["allowance_seconds"] == pytest.approx(1000.0, rel=1e-6)
     assert stats["headroom_seconds"] == pytest.approx(600.0, rel=1e-6)
     assert stats["jobs_this_period"] == 1
+
+
+def test_unquoted_duration_raises_rather_than_mining_unmetered():
+    """`budget = 250m` is a TOML error, not a missing budget.
+
+    Returning None here would mine unmetered on a typo — the exact failure the
+    budget exists to prevent — so the parse error must be fatal and must name
+    the fix.
+    """
+    with pytest.raises(BudgetUnavailable) as exc:
+        budget_from_backend_toml('budget = 250m\nbudget_reset_day = 9\n')
+    assert 'budget = "250m"' in str(exc.value)
+
+
+def test_a_section_header_hides_the_budget_and_is_reported():
+    """backend_toml is the flattened body of the miner entry, never a table.
+
+    A pasted `[dwave]` header nests every key one level down, so the top-level
+    lookups find nothing. That parses cleanly, so it cannot raise here; this
+    pins the behaviour so the surprise is documented rather than discovered in
+    production.
+    """
+    assert budget_from_backend_toml('[dwave]\nbudget = "250m"\n') is None
+
+
+def test_malformed_toml_is_fatal_even_with_no_budget_key():
+    with pytest.raises(BudgetUnavailable):
+        budget_from_backend_toml("anneal_time_us = 80\nnum_reads = 32m\n")
