@@ -111,6 +111,26 @@ Coming back, spins stay in the sampler's `(reads, qubits)` int8 array. The wire
 format is one signed byte per spin, so `row.tobytes()` is already the payload.
 `test_spin_encoding` pins that against `wire.encode_spins`.
 
+`answer.answer_view` reads the answer straight off the `Future`, never
+through `Future.sampleset`. That property turns the decoder's numpy arrays
+into Python lists. It then walks those lists with a nested comprehension over
+reads times variables. dimod converts the result back into numpy, to arrive
+at the arrays the decoder already had. `OceanSampler._submit_encoded` passes
+`return_matrix=True` for the same reason. That flag stays safe only because
+nothing here builds a SampleSet.
+
+`scripts/bench_receive.py` times the two configurations on the live QPU, one
+job each. The old configuration builds a `Future` with `return_matrix=False`
+and reads it through `.sampleset`. The new one builds a `Future` with
+`return_matrix=True` and reads it through `answer_view`. At production size,
+4577 qubits and 41514 couplers and 48 reads, the old configuration costs
+38.8 ms a job. The new one costs 1.6 ms, a factor of 24.
+
+One trap sits on this path. `Future.samples` returns a matrix padded out to
+the solver's full physical qubit count, while `Future.variables` returns only
+the active labels. The reader must pick the columns by label. That
+bug reached a live QPU before anyone caught it.
+
 Every Ocean internal lives in `OceanSampler._submit_encoded` (`Future`,
 `Present`, `client._submit`). Keep it that way: an SDK change should have a
 one-function blast radius. Polling, auth, retries and `Future.cancel` are still
