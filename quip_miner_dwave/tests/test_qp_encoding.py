@@ -237,3 +237,40 @@ def test_production_scale_holds_on_a_partial_subgraph():
     assert got["quad"] == ref["quad"]
     # The filter really fired: fewer couplers encoded than the chip has.
     assert len(str(got["quad"])) < len(solver._encoding_couplers) * 8
+
+
+# --- gapped qubit lists: real chips have dead qubits -----------------------
+
+
+def test_a_qubit_the_solver_does_not_have_is_rejected():
+    # Advantage2_system1 reports 4577 qubits with a maximum label of 4799, so
+    # the label space has holes. A label in a hole has no slot, and writing it
+    # anyway lands on lin[-1] and silently corrupts the last qubit's bias.
+    solver = _Solver([0, 2], [(0, 2)])
+    enc = QpEncoder(solver._encoding_qubits, solver._encoding_couplers)
+
+    with pytest.raises(ValueError, match="not on the solver"):
+        enc.plan(np.array([0, 1, 2]), np.array([(0, 2)]))
+
+
+def test_a_qubit_label_past_the_end_is_rejected_too():
+    solver = _Solver([0, 1, 2], [(0, 1)])
+    enc = QpEncoder(solver._encoding_qubits, solver._encoding_couplers)
+
+    with pytest.raises(ValueError, match="not on the solver"):
+        enc.plan(np.array([0, 1, 99]), np.array([(0, 1)]))
+
+
+def test_a_gapped_qubit_list_still_encodes_identically():
+    # The labels are sparse but every one of them is real, so this must work
+    # and must match the reference.
+    solver = _Solver([0, 2, 5], [(0, 2), (2, 5)])
+    _assert_same(solver, [0, 2, 5], [1.0, 2.0, 3.0], [(0, 2), (2, 5)], [1.0, 2.0])
+
+
+def test_an_edge_naming_a_missing_qubit_is_rejected():
+    solver = _Solver([0, 2], [(0, 2)])
+    enc = QpEncoder(solver._encoding_qubits, solver._encoding_couplers)
+
+    with pytest.raises(ValueError, match="not on the solver"):
+        enc.plan(np.array([0, 2]), np.array([(0, 1)]))

@@ -143,7 +143,7 @@ class RecordingSampler:
     def __init__(self):
         self.calls = []
 
-    def sample(self, h, j, **kwargs):
+    def sample(self, nodes, h, edges, j, **kwargs):
         from quip_miner_dwave.ocean import SampleResult
 
         self.calls.append(kwargs)
@@ -217,25 +217,61 @@ class CancelledFuture:
 
 
 def _real_mode_sampler(submit_result):
-    """A sampler on the real (non-mock) path whose submit returns `submit_result`."""
+    """A sampler on the real (non-mock) submit path, with the cloud stubbed.
+
+    Everything up to _submit_encoded runs for real: the arrays are encoded
+    against a solver ordering and wrapped in a submission body. Only the final
+    hand-off to the cloud client is replaced, which is the one method that
+    touches Ocean internals.
+    """
     s = OceanSampler(mock=False)
     s._connected = True
     s._is_mock = False
 
+    class _Identity:
+        def dict(self):
+            return {"name": "FakeSolver", "version": {"graph_id": "x"}}
+
     class _Solver:
-        def sample_ising(self, h, j, **kwargs):
-            if isinstance(submit_result, Exception):
-                raise submit_result
-            return submit_result
+        _encoding_qubits = [0, 1]
+        _encoding_couplers = [(0, 1)]
+        _params: dict = {}
+        parameters = {"num_reads": None, "annealing_time": None, "label": None}
+        return_matrix = False
+        identity = _Identity()
+
+        def _format_params(self, type_, params):
+            pass
 
     class _Sampler:
         solver = _Solver()
 
-        def sample_ising(self, h, j, **kwargs):  # reached only off the async path
-            raise AssertionError("async solver path should have been taken")
-
     s.sampler = _Sampler()
+    submitted = []
+
+    def _submit_encoded(solver, body, cancel_key):
+        submitted.append(body)
+        if isinstance(submit_result, Exception):
+            raise submit_result
+        if cancel_key is not None:
+            s._register_inflight(cancel_key, submit_result)
+        return submit_result
+
+    s._submit_encoded = _submit_encoded  # type: ignore[method-assign]
+    s.submitted = submitted  # type: ignore[attr-defined]
     return s
+
+
+def _one_qubit_job(s, cancel_key):
+    """The smallest problem the stub solver accepts."""
+    return s.sample(
+        np.array([0, 1]),
+        np.array([1.0, -1.0]),
+        np.array([(0, 1)]),
+        np.array([0.5]),
+        num_reads=1,
+        cancel_key=cancel_key,
+    )
 
 
 def test_a_cancelled_problem_is_billed_the_conservative_estimate():
@@ -245,7 +281,7 @@ def test_a_cancelled_problem_is_billed_the_conservative_estimate():
     s._observe_access_us(46_000)  # a prior job establishes the going rate
 
     with pytest.raises(_Boom):
-        s.sample({0: 1.0}, {}, num_reads=1, cancel_key=b"\x11")
+        _one_qubit_job(s, b"\x11")
 
     assert s.drain_unobserved_access_us() == 46_000
 
@@ -255,7 +291,7 @@ def test_draining_the_unobserved_charge_clears_it():
     s = _real_mode_sampler(CancelledFuture())
     s._observe_access_us(46_000)
     with pytest.raises(_Boom):
-        s.sample({0: 1.0}, {}, num_reads=1, cancel_key=b"\x12")
+        _one_qubit_job(s, b"\x12")
 
     s.drain_unobserved_access_us()
 
@@ -269,7 +305,7 @@ def test_a_submit_that_never_reached_sapi_is_billed_nothing():
     s._observe_access_us(46_000)
 
     with pytest.raises(_Boom):
-        s.sample({0: 1.0}, {}, num_reads=1, cancel_key=b"\x13")
+        _one_qubit_job(s, b"\x13")
 
     assert s.drain_unobserved_access_us() == 0
 
@@ -283,7 +319,7 @@ def test_the_estimate_uses_the_largest_access_time_seen_this_session():
     s._observe_access_us(46_000)
 
     with pytest.raises(_Boom):
-        s.sample({0: 1.0}, {}, num_reads=1, cancel_key=b"\x14")
+        _one_qubit_job(s, b"\x14")
 
     assert s.drain_unobserved_access_us() == 120_000
 
@@ -301,7 +337,7 @@ def test_a_cancelled_problem_is_registered_while_live_and_released_after():
 
     s = _real_mode_sampler(WatchingFuture())
     with pytest.raises(_Boom):
-        s.sample({0: 1.0}, {}, num_reads=1, cancel_key=b"\x15")
+        _one_qubit_job(s, b"\x15")
 
     assert seen["registered"] is True
     assert s._inflight == {}

@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
 
 import numpy as np
 
+from quip_miner_dwave.qp import QpEncoder, build_submission_body
 from quip_miner_dwave.defects import (
     DefectInfo,
     prepare_problem,
@@ -140,8 +141,10 @@ class SupportsSample(Protocol):
 
     def sample(
         self,
-        h: Dict[int, float],
-        j: Dict[Tuple[int, int], float],
+        nodes: "np.ndarray",
+        h: "np.ndarray",
+        edges: "np.ndarray",
+        j: "np.ndarray",
         *,
         num_reads: int = 1,
         anneal_time_us: Optional[int] = None,
@@ -240,6 +243,9 @@ class OceanSampler:
         # See _charge_unobserved for why this exists and why it over-counts.
         self._unobserved_access_us = 0
         self._max_access_us = 0
+        # Built on first submit, when the solver's ordering is known.
+        self._encoder: Optional[QpEncoder] = None
+        self._plan_cache = None
         self._defective_qubits: List[int] = list(defective_qubits or [])
         self._defective_edges: set = set(defective_edges or set())
         self._live_nodes: List[int] = []
@@ -410,6 +416,59 @@ class OceanSampler:
             edge_pct,
         )
 
+    def _graph_plan(self, solver, nodes, edges):
+        """The job graph's mapping into the solver's payload ordering.
+
+        Cached on the graph's identity because a session sends the same graph
+        every job: planning it costs ~10 ms, encoding against it ~0.6 ms.
+        """
+        key = (int(nodes.shape[0]), int(edges.shape[0]))
+        with self._inflight_lock:
+            cached = self._plan_cache
+        encoder = self._encoder
+        if encoder is None:
+            encoder = QpEncoder(
+                solver._encoding_qubits, solver._encoding_couplers
+            )
+            self._encoder = encoder
+        if cached is not None and cached[0] == key:
+            return encoder, cached[1]
+        plan = encoder.plan(nodes, edges)
+        with self._inflight_lock:
+            self._plan_cache = (key, plan)
+        return encoder, plan
+
+    def _clamp_defects(self, nodes, h, edges, j, nonce_seed):
+        """Apply defect clamping, which still speaks dicts.
+
+        The live graph matches the chip in the normal case, so this is a
+        no-op and the arrays pass straight through. When it is not a no-op the
+        conversion cost is paid on a path that only runs for a miner whose
+        chip has lost qubits or couplers.
+        """
+        if not (self._defective_qubits or self._defective_edges):
+            return nodes, h, edges, j, None
+        h_dict = {int(n): float(b) for n, b in zip(nodes, h)}
+        j_dict = {
+            (int(u), int(v)): float(b) for (u, v), b in zip(edges.tolist(), j)
+        }
+        h_eff, j_eff, defect_info = prepare_problem(
+            h_dict,
+            j_dict,
+            defective_qubits=self._defective_qubits,
+            defective_edges=self._defective_edges,
+            # Either kind of defect needs the reduction. Withholding the seed
+            # when only couplers are missing skipped it entirely and sent the
+            # QPU a graph it does not have.
+            nonce_seed=nonce_seed,
+        )
+        nodes_eff = np.fromiter(h_eff.keys(), dtype=np.int64, count=len(h_eff))
+        h_arr = np.fromiter(h_eff.values(), dtype=np.float64, count=len(h_eff))
+        edge_keys = list(j_eff.keys())
+        edges_eff = np.asarray(edge_keys, dtype=np.int64).reshape(-1, 2)
+        j_arr = np.fromiter(j_eff.values(), dtype=np.float64, count=len(j_eff))
+        return nodes_eff, h_arr, edges_eff, j_arr, defect_info
+
     def _register_inflight(self, key: bytes, future: Any) -> None:
         """Record a live cloud problem, or drop it if a Cancel beat it here."""
         with self._inflight_lock:
@@ -494,7 +553,9 @@ class OceanSampler:
 
     def _submit_sync(
         self,
+        nodes,
         h,
+        edges,
         j,
         num_reads: int,
         label: str,
@@ -502,34 +563,68 @@ class OceanSampler:
         cancel_key: Optional[bytes] = None,
     ):
         """Run on a pool thread: build/submit only; do NOT touch .sampleset."""
-        kwargs: Dict[str, Any] = {
-            "num_reads": num_reads,
-            "label": label,
-        }
+        params: Dict[str, Any] = {"num_reads": num_reads}
         # D-Wave's SAPI parameter is `annealing_time`, in microseconds — the
         # same unit as the proto's `anneal_time_us`, so no conversion needed.
         # Only set when the caller supplied an explicit override; otherwise
         # leave it out so the QPU's hardware-default anneal applies.
         if anneal_time_us:
-            kwargs["annealing_time"] = anneal_time_us
-        # Prefer sample_ising; mock ExactSolver also supports it.
-        sample_fn = getattr(self.sampler, "sample_ising", None)
-        if not callable(sample_fn):
-            raise RuntimeError("sampler has no sample_ising")
-        # For real cloud futures the SDK returns a Future when async is used;
-        # dimod/mock return a SampleSet. We normalize in _decode.
-        if hasattr(self.sampler, "sample_ising") and not self._is_mock:
-            # Async path via underlying solver when available.
-            solver = getattr(self.sampler, "solver", None)
-            if solver is not None and hasattr(solver, "sample_ising"):
-                future = solver.sample_ising(h, j, **kwargs)
-                # Registered here, on the pool thread, because this is the
-                # first moment the cloud Future exists. Anything earlier has
-                # no handle to cancel; anything later widens the blind window.
-                if cancel_key is not None:
-                    self._register_inflight(cancel_key, future)
-                return future
-        return sample_fn(h, j, **kwargs)
+            params["annealing_time"] = anneal_time_us
+
+        solver = getattr(self.sampler, "solver", None)
+        if self._is_mock or solver is None:
+            # dimod samplers and injected doubles take dicts, and the problems
+            # they see are tiny. Only the cloud path is worth encoding by hand.
+            sample_fn = getattr(self.sampler, "sample_ising", None)
+            if not callable(sample_fn):
+                raise RuntimeError("sampler has no sample_ising")
+            return sample_fn(
+                {int(n): float(b) for n, b in zip(nodes, h)},
+                {
+                    (int(u), int(v)): float(b)
+                    for (u, v), b in zip(edges.tolist(), j)
+                },
+                label=label,
+                **params,
+            )
+
+        # Encode straight from the arrays into the solver's own ordering. The
+        # Ocean path would build an h/J dict here and hand it to
+        # encode_problem_as_qp, which walks it back into these same two dense
+        # arrays: ~27 ms of GIL-bound work per job at production size, against
+        # ~0.6 ms here. quip_miner_dwave.qp pins byte equality with that
+        # function, so what reaches SAPI is unchanged.
+        encoder, plan = self._graph_plan(solver, nodes, edges)
+        data = encoder.encode(plan, h, j)
+        body = build_submission_body(solver, data, params, label=label)
+
+        computation = self._submit_encoded(solver, body, cancel_key)
+        return computation
+
+    def _submit_encoded(self, solver, body: bytes, cancel_key: Optional[bytes]):
+        """Hand an encoded problem to the cloud client.
+
+        Every Ocean internal this backend depends on lives in this method, so
+        the blast radius of an SDK change is one function: ``Future`` and
+        ``Present`` to build the computation, and ``client._submit`` to queue
+        it. Everything upstream is our own arrays and our own encoder.
+        """
+        # Imported here so an offline/mock run never needs the cloud client.
+        from dwave.cloud.computation import Future
+        from dwave.cloud.concurrency import Present
+
+        computation = Future(
+            solver=solver, id_=None, return_matrix=solver.return_matrix
+        )
+        # XXX carried on the Future until SAPI implements it, as Ocean does.
+        computation._offset = 0
+        # Registered before the submit, not after: _submit hands the problem to
+        # the client's own threads, so the id can come back before this line
+        # would otherwise run.
+        if cancel_key is not None:
+            self._register_inflight(cancel_key, computation)
+        solver.client._submit(Present(result=body), computation)
+        return computation
 
     @staticmethod
     def _decode_future(future_or_ss: Any):
@@ -540,8 +635,10 @@ class OceanSampler:
 
     def sample(
         self,
-        h: Dict[int, float],
-        j: Dict[Tuple[int, int], float],
+        nodes: "np.ndarray",
+        h: "np.ndarray",
+        edges: "np.ndarray",
+        j: "np.ndarray",
         *,
         num_reads: int = 1,
         anneal_time_us: Optional[int] = None,
@@ -563,25 +660,16 @@ class OceanSampler:
         wants: there is no Result to send for a generation the coordinator has
         already abandoned.
         """
-        h_eff, j_eff, defect_info = prepare_problem(
-            h,
-            j,
-            defective_qubits=self._defective_qubits,
-            defective_edges=self._defective_edges,
-            # Either kind of defect needs the reduction. Withholding the seed
-            # when only couplers are missing skipped it entirely and sent the
-            # QPU a graph it does not have.
-            nonce_seed=(
-                nonce_seed
-                if (self._defective_qubits or self._defective_edges)
-                else None
-            ),
+        nodes, h, edges, j, defect_info = self._clamp_defects(
+            nodes, h, edges, j, nonce_seed
         )
         # Thread-pooled submit
         fut = self._submit_pool.submit(
             self._submit_sync,
-            h_eff,
-            j_eff,
+            nodes,
+            h,
+            edges,
+            j,
             max(1, int(num_reads)),
             label,
             anneal_time_us,

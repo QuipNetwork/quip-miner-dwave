@@ -158,7 +158,7 @@ def _resolve_problem(
     session_edges: Sequence[Tuple[int, int]],
     *,
     job_id: bytes,
-) -> Tuple[List[int], Dict[int, float], Dict[Tuple[int, int], float]]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Resolve the job's graph and build the sampler's ``h``/``J`` mappings.
 
     ``h_milli_le32`` and ``j_milli_le32`` are dense positional arrays over the
@@ -172,7 +172,8 @@ def _resolve_problem(
     the node check; it catches a job desynced from the session ``Topology``.
 
     Returns:
-        The resolved node ordering and the ``h``/``J`` dicts keyed by qubit id.
+        ``(nodes, h, edges, j)`` as numpy arrays: the resolved node ordering,
+        its biases, the resolved edge list, and its couplings.
 
     Raises:
         _Rejected: ``MALFORMED`` when ``h`` or ``j`` disagrees with the graph.
@@ -199,11 +200,16 @@ def _resolve_problem(
         )
         raise _Rejected(miner_pb2.MALFORMED)
 
-    h_dict = {int(nodes[i]): float(h[i]) for i in range(len(nodes))}
-    j_dict: Dict[Tuple[int, int], float] = {
-        (int(u), int(v)): float(j_vals[k]) for k, (u, v) in enumerate(edges)
-    }
-    return nodes, h_dict, j_dict
+    # Arrays, not dicts. The submission payload is positional in the solver's
+    # own ordering, so a dict keyed by qubit label exists only to be walked
+    # once and thrown away — ~13 ms of GIL-bound work per job at production
+    # size. quip_miner_dwave.qp maps these straight into the payload.
+    return (
+        np.asarray(nodes, dtype=np.int64),
+        np.asarray(h, dtype=np.float64),
+        np.asarray(edges, dtype=np.int64).reshape(-1, 2),
+        np.asarray(j_vals, dtype=np.float64),
+    )
 
 
 def _sampling_params(
@@ -256,7 +262,7 @@ def _sampling_params(
 
 def _build_result(
     job_id: bytes,
-    nodes: Sequence[int],
+    nodes: "np.ndarray | Sequence[int]",
     result: SampleResult,
     num_sweeps: int,
 ) -> List[miner_pb2.MinerMsg]:
@@ -271,7 +277,7 @@ def _build_result(
     # order, then a raw copy per read. The wire format is one signed byte per
     # spin, which is exactly an int8 row, so nothing has to be packed by hand
     # (test_spin_encoding pins that equivalence against wire.encode_spins).
-    order = nodes if nodes else sorted(result.variables)
+    order = nodes if len(nodes) else sorted(result.variables)
     col_of = {v: i for i, v in enumerate(result.variables)}
     spins = result.spins
     n_cols = spins.shape[1]
@@ -338,7 +344,7 @@ def handle_job(
     job_id = job.job_id
     try:
         ising, h, j_vals = _validate_job(job, session_hash)
-        nodes, h_dict, j_dict = _resolve_problem(
+        nodes, h_arr, edges, j_arr = _resolve_problem(
             ising,
             h,
             j_vals,
@@ -354,8 +360,10 @@ def handle_job(
     )
     try:
         result: SampleResult = sampler.sample(
-            h_dict,
-            j_dict,
+            nodes,
+            h_arr,
+            edges,
+            j_arr,
             num_reads=num_reads,
             # 0 leaves annealing_time unset so the QPU default applies.
             anneal_time_us=anneal_time_us or None,

@@ -60,7 +60,7 @@ class BlockingSampler:
         owed, self._unobserved = self._unobserved, 0
         return owed
 
-    def sample(self, h, j, **kwargs) -> SampleResult:
+    def sample(self, nodes, h, edges, j, **kwargs) -> SampleResult:
         self.entered.set()
         self.release.wait(timeout=5)
         if self._outcome == "cancelled":

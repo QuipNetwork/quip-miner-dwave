@@ -27,6 +27,45 @@ import numpy as np
 EncodedQP = Dict[str, Union[str, float]]
 
 
+def build_submission_body(
+    solver, data: "EncodedQP", params: Dict[str, object], label: object = None
+) -> bytes:
+    """Wrap an encoded problem in the envelope SAPI expects.
+
+    Mirrors ``dwave.cloud.solver.StructuredSolver._sample`` for everything
+    except the encoding itself: the solver's own defaults sit under the
+    caller's parameters, the solver validates and formats them, and the result
+    is the JSON body its transport already knows how to submit.
+
+    Parameter validation stays here rather than being skipped for speed. An
+    unknown parameter costs a coordinator credit and a cloud round trip to
+    discover otherwise, and it is a dictionary lookup per key on a dict of 15.
+
+    Raises:
+        KeyError: a parameter the solver does not accept.
+    """
+    import orjson
+
+    combined = dict(solver._params)
+    combined.update(params)
+    for key in combined:
+        if key not in solver.parameters and not str(key).startswith("x_"):
+            raise KeyError(f"{key} is not a parameter of this solver")
+    # Ocean mutates the dict in place; deferring keeps one source of truth for
+    # per-type parameter transforms.
+    solver._format_params("ising", combined)
+
+    body = {
+        "solver": solver.identity.dict(),
+        "data": data,
+        "type": "ising",
+        "params": combined,
+    }
+    if label is not None:
+        body["label"] = label
+    return orjson.dumps(body, option=orjson.OPT_SERIALIZE_NUMPY)
+
+
 @dataclass(frozen=True)
 class GraphPlan:
     """Where one job graph's biases land in the solver's payload arrays.
@@ -83,6 +122,26 @@ class QpEncoder:
         """
         nodes = np.asarray(nodes, dtype=np.int64).reshape(-1)
         edges = np.asarray(edges, dtype=np.int64).reshape(-1, 2)
+
+        # A real chip's qubit labels have holes: Advantage2_system1 reports
+        # 4577 qubits with a maximum label of 4799. A label in a hole has no
+        # slot, and _slot_of_qubit answers -1 for it, which numpy would
+        # happily write to the *last* slot and silently corrupt that qubit's
+        # bias. Reject it here instead, where the label can be named.
+        mentioned = np.concatenate(
+            [a for a in (nodes, edges.reshape(-1)) if a.size]
+        ) if (nodes.size or edges.size) else np.empty(0, dtype=np.int64)
+        if mentioned.size:
+            out_of_range = (mentioned < 0) | (mentioned >= self._width)
+            unknown = out_of_range.copy()
+            in_range = ~out_of_range
+            unknown[in_range] = self._slot_of_qubit[mentioned[in_range]] < 0
+            if np.any(unknown):
+                bad = int(mentioned[np.nonzero(unknown)[0][0]])
+                raise ValueError(
+                    f"qubit {bad} is not on the solver; submitting it would "
+                    "make SAPI reject the whole problem"
+                )
 
         # Active means "carries a bias or a coupling", which decides whether
         # an unmentioned qubit encodes as 0 or as NaN.

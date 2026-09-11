@@ -2,7 +2,7 @@
 import time
 
 import numpy as np
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Optional
 
 from quip_solver_core import miner_pb2, scoring, wire
 
@@ -280,8 +280,10 @@ class _RecordingSampler:
 
     def sample(
         self,
-        h: Dict[int, float],
-        j: Dict[Tuple[int, int], float],
+        nodes,
+        h,
+        edges,
+        j,
         *,
         num_reads: int = 1,
         anneal_time_us: Optional[int] = None,
@@ -553,7 +555,13 @@ def test_reads_counts_aggregated_occurrences_not_record_rows():
     # Ten anneals that all land on the same state come back as one row; reads
     # must report the anneals performed, not the distinct solutions returned.
     sampler = OceanSampler(sampler=_AggregatingSampler(10), mock=False)
-    result = sampler.sample({0: 1.0, 1: -1.0}, {(0, 1): 0.5}, num_reads=10)
+    result = sampler.sample(
+        np.array([0, 1]),
+        np.array([1.0, -1.0]),
+        np.array([(0, 1)]),
+        np.array([0.5]),
+        num_reads=10,
+    )
     assert result.spins.shape[0] == 1
     assert result.num_reads == 10
     sampler.close()
