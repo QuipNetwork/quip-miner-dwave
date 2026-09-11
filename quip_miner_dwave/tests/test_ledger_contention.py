@@ -43,59 +43,56 @@ class SlowLedger(UsageLedger):
 
 
 def _dispatch_latency_under_billing(bill_under_state_lock: bool) -> float:
-    """Worst dispatch latency while workers bill, with and without the fix.
+    """How long a dispatch waits while exactly one result is billed.
 
-    Models the two lock users in session_loop: worker threads billing a result
-    and the session-loop thread deciding whether a job may be sampled. Both
-    take ``state_lock``; only one of them needs to.
+    Models the two lock users in session_loop: a worker thread billing a
+    result and the session-loop thread deciding whether a job may be sampled.
+    Both take ``state_lock``; only one of them needs to. One billing, one
+    measurement, no spinning, so the number means the same thing every run.
     """
-    ledger = SlowLedger(delay_s=0.01)
+    ledger = SlowLedger(delay_s=0.05)
     pacer = BudgetPacer(BudgetConfig(3000.0, 9), ledger)
     now = time.time()
     state_lock = threading.Lock()
-    stop = threading.Event()
+    billing = threading.Event()
 
     def worker():
-        while not stop.is_set():
-            if bill_under_state_lock:
-                with state_lock:  # what the code did before the fix
-                    pacer.record_access_time(43_200, now)
-            else:
+        if bill_under_state_lock:
+            with state_lock:  # what the code did before the fix
+                billing.set()
                 pacer.record_access_time(43_200, now)
-                with state_lock:  # bookkeeping only, no IO
-                    pass
+        else:
+            billing.set()
+            pacer.record_access_time(43_200, now)
+            with state_lock:  # bookkeeping only, no IO
+                pass
 
-    threads = [threading.Thread(target=worker, daemon=True) for _ in range(4)]
-    for t in threads:
-        t.start()
-    time.sleep(0.02)
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    assert billing.wait(timeout=2), "worker never started billing"
+    time.sleep(0.005)  # let the 50 ms write get under way
 
-    worst = 0.0
-    for _ in range(10):
-        t0 = time.perf_counter()
-        with state_lock:  # what the session loop does per dispatched job
-            pass
-        worst = max(worst, time.perf_counter() - t0)
-        time.sleep(0.001)
-    stop.set()
-    for t in threads:
-        t.join(timeout=3)
-    return worst
+    t0 = time.perf_counter()
+    with state_lock:  # what the session loop does per dispatched job
+        pass
+    waited = time.perf_counter() - t0
+    t.join(timeout=2)
+    return waited
 
 
 def test_billing_under_the_dispatch_lock_stalls_the_session_loop():
     # Characterises the bug so the fix below has something to be better than.
-    worst = _dispatch_latency_under_billing(bill_under_state_lock=True)
-    assert worst > 0.005, (
-        "expected billing to stall dispatch when it holds the same lock; "
-        f"worst was {worst * 1000:.1f} ms"
+    waited = _dispatch_latency_under_billing(bill_under_state_lock=True)
+    assert waited > 0.02, (
+        "expected dispatch to wait out the 50 ms write when billing holds the "
+        f"same lock; it waited {waited * 1000:.1f} ms"
     )
 
 
 def test_billing_outside_the_dispatch_lock_leaves_it_free():
     # The fix: the ledger has its own lock, so state_lock never needs to be
     # held across its IO.
-    worst = _dispatch_latency_under_billing(bill_under_state_lock=False)
-    assert worst < 0.01, (
-        f"dispatch still blocked {worst * 1000:.1f} ms behind billing"
+    waited = _dispatch_latency_under_billing(bill_under_state_lock=False)
+    assert waited < 0.01, (
+        f"dispatch still blocked {waited * 1000:.1f} ms behind billing"
     )
