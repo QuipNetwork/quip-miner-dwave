@@ -1,0 +1,304 @@
+"""In-flight SAPI cancellation: the sampler side.
+
+A coordinator Cancel abandons a whole generation. Every job of that generation
+still sitting on the QPU is access time being spent on a round the coordinator
+has already thrown away, so the miner asks D-Wave to drop it.
+"""
+
+from __future__ import annotations
+
+import threading
+
+import pytest
+
+pytest.importorskip("numpy")  # OceanSampler imports numpy at module load
+
+from quip_miner_dwave.ocean import OceanSampler  # noqa: E402
+
+
+class FakeCloudFuture:
+    """Stand-in for dwave.cloud.computation.Future.
+
+    Only the two calls the registry makes: ``done()`` to tell a live problem
+    from a finished one, and ``cancel()`` to ask SAPI to drop it.
+    """
+
+    def __init__(self, done: bool = False):
+        self._done = done
+        self.cancelled = False
+
+    def done(self) -> bool:
+        return self._done
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+
+def _sampler() -> OceanSampler:
+    # mock=False keeps the real submit path (and its registry) without
+    # contacting D-Wave; nothing here reaches ensure_connected.
+    return OceanSampler(mock=False)
+
+
+def test_cancel_drops_a_live_inflight_problem():
+    s = _sampler()
+    fut = FakeCloudFuture(done=False)
+    s._register_inflight(b"\x01\x02", fut)
+
+    live = s.cancel_inflight([b"\x01\x02"])
+
+    assert fut.cancelled is True
+    assert live == 1
+
+
+def test_cancel_reports_a_problem_that_already_finished_as_not_live():
+    # The anneal beat us. Asking SAPI to cancel is harmless but it did not
+    # save any access time, and the counter must not claim it did.
+    s = _sampler()
+    fut = FakeCloudFuture(done=True)
+    s._register_inflight(b"\x03", fut)
+
+    live = s.cancel_inflight([b"\x03"])
+
+    assert live == 0
+
+
+def test_cancel_ignores_keys_that_were_never_registered():
+    s = _sampler()
+    assert s.cancel_inflight([b"\xff"]) == 0
+
+
+def test_a_cancel_that_arrives_before_the_submit_lands_still_cancels():
+    # The cloud Future only exists once _submit_sync has run on a pool thread
+    # and SAPI has accepted the problem. A Cancel inside that window finds an
+    # empty registry, and that window is exactly when cancelling pays best.
+    s = _sampler()
+
+    s.cancel_inflight([b"\x04"])  # nothing registered yet
+    fut = FakeCloudFuture(done=False)
+    s._register_inflight(b"\x04", fut)
+
+    assert fut.cancelled is True
+
+
+def test_a_later_job_reusing_a_cancelled_key_is_not_cancelled():
+    # The pending-cancel note is consumed by the registration it applies to,
+    # or a key would stay poisoned for the rest of the session.
+    s = _sampler()
+    s.cancel_inflight([b"\x05"])
+    s._register_inflight(b"\x05", FakeCloudFuture())
+    s._release_inflight(b"\x05")
+
+    later = FakeCloudFuture(done=False)
+    s._register_inflight(b"\x05", later)
+
+    assert later.cancelled is False
+
+
+def test_releasing_an_inflight_key_stops_a_later_cancel_touching_it():
+    s = _sampler()
+    fut = FakeCloudFuture(done=False)
+    s._register_inflight(b"\x06", fut)
+    s._release_inflight(b"\x06")
+
+    assert s.cancel_inflight([b"\x06"]) == 0
+    assert fut.cancelled is False
+
+
+def test_registry_survives_concurrent_registration_and_cancellation():
+    # Submits run on the sampler's own pool while the session thread handles
+    # Cancel, so the registry is crossed by two threads by construction.
+    s = _sampler()
+    futures = [FakeCloudFuture(done=False) for _ in range(50)]
+    keys = [bytes([i]) for i in range(50)]
+    start = threading.Barrier(2)
+
+    def register():
+        start.wait()
+        for k, f in zip(keys, futures):
+            s._register_inflight(k, f)
+
+    def cancel():
+        start.wait()
+        for _ in range(10):
+            s.cancel_inflight(keys)
+
+    threads = [threading.Thread(target=register), threading.Thread(target=cancel)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # Every future is either cancelled outright or carries a pending note that
+    # the final sweep honours; no key escapes both.
+    s.cancel_inflight(keys)
+    assert all(f.cancelled for f in futures)
+
+
+class RecordingSampler:
+    """Captures the kwargs handle_job passes down to the sampler."""
+
+    def __init__(self):
+        self.calls = []
+
+    def sample(self, h, j, **kwargs):
+        from quip_miner_dwave.ocean import SampleResult
+
+        self.calls.append(kwargs)
+        return SampleResult(
+            samples=[{0: 1, 1: -1}],
+            energies=[-1.0],
+            device_access_time_us=46_000,
+            num_reads=1,
+        )
+
+
+def _job(job_id: bytes, generation: int = 7):
+    import time
+
+    from quip_solver_core import miner_pb2, wire
+
+    return miner_pb2.Job(
+        job_id=job_id,
+        kind=miner_pb2.ISING_SAMPLE,
+        generation=generation,
+        deadline_ms=int(time.time() * 1000) + 3_600_000,
+        ising=miner_pb2.IsingProblem(
+            h_milli_le32=wire.encode_i32_le([1000, -1000]),
+            j_milli_le32=wire.encode_i32_le([500]),
+            edges=miner_pb2.EdgeList(u=[0], v=[1]),
+            num_reads=1,
+        ),
+    )
+
+
+def test_handle_job_passes_the_job_id_as_the_cancel_key():
+    # The session loop cancels by job id, so that is what has to reach the
+    # sampler's registry; nonce_seed is the defect-clamp seed, not a handle.
+    from quip_miner_dwave.job import handle_job
+
+    rec = RecordingSampler()
+    handle_job(
+        _job(b"\xaa\xbb\xcc\xdd"),
+        rec,
+        session_nodes=[0, 1],
+        session_edges=[(0, 1)],
+    )
+
+    assert rec.calls[0]["cancel_key"] == b"\xaa\xbb\xcc\xdd"
+
+
+# --- Conservative accounting for submissions we cannot observe -------------
+#
+# A cancel that beats the anneal costs nothing; a cancel that loses is billed
+# by D-Wave in full. The raised path carries no timing to tell them apart, so
+# the ledger must assume the anneal ran rather than assume it did not.
+
+
+class _Boom(Exception):
+    pass
+
+
+class CancelledFuture:
+    """A cloud problem SAPI accepted and then cancelled: .sampleset raises."""
+
+    def done(self) -> bool:
+        return False
+
+    def cancel(self) -> None:
+        pass
+
+    @property
+    def sampleset(self):
+        raise _Boom("problem cancelled")
+
+
+def _real_mode_sampler(submit_result):
+    """A sampler on the real (non-mock) path whose submit returns `submit_result`."""
+    s = OceanSampler(mock=False)
+    s._connected = True
+    s._is_mock = False
+
+    class _Solver:
+        def sample_ising(self, h, j, **kwargs):
+            if isinstance(submit_result, Exception):
+                raise submit_result
+            return submit_result
+
+    class _Sampler:
+        solver = _Solver()
+
+        def sample_ising(self, h, j, **kwargs):  # reached only off the async path
+            raise AssertionError("async solver path should have been taken")
+
+    s.sampler = _Sampler()
+    return s
+
+
+def test_a_cancelled_problem_is_billed_the_conservative_estimate():
+    # SAPI accepted it, so D-Wave may have annealed and charged for it. We
+    # cannot see the timing, so the ledger assumes the worst.
+    s = _real_mode_sampler(CancelledFuture())
+    s._observe_access_us(46_000)  # a prior job establishes the going rate
+
+    with pytest.raises(_Boom):
+        s.sample({0: 1.0}, {}, num_reads=1, cancel_key=b"\x11")
+
+    assert s.drain_unobserved_access_us() == 46_000
+
+
+def test_draining_the_unobserved_charge_clears_it():
+    # The session loop records it into the pacer exactly once.
+    s = _real_mode_sampler(CancelledFuture())
+    s._observe_access_us(46_000)
+    with pytest.raises(_Boom):
+        s.sample({0: 1.0}, {}, num_reads=1, cancel_key=b"\x12")
+
+    s.drain_unobserved_access_us()
+
+    assert s.drain_unobserved_access_us() == 0
+
+
+def test_a_submit_that_never_reached_sapi_is_billed_nothing():
+    # The problem died in this process. D-Wave never saw it, so charging for
+    # it would burn quota the QPU never spent.
+    s = _real_mode_sampler(_Boom("network down"))
+    s._observe_access_us(46_000)
+
+    with pytest.raises(_Boom):
+        s.sample({0: 1.0}, {}, num_reads=1, cancel_key=b"\x13")
+
+    assert s.drain_unobserved_access_us() == 0
+
+
+def test_the_estimate_uses_the_largest_access_time_seen_this_session():
+    # Conservative among observations: a cancelled job is assumed to be at
+    # least as expensive as the priciest one we have actually measured.
+    s = _real_mode_sampler(CancelledFuture())
+    s._observe_access_us(46_000)
+    s._observe_access_us(120_000)
+    s._observe_access_us(46_000)
+
+    with pytest.raises(_Boom):
+        s.sample({0: 1.0}, {}, num_reads=1, cancel_key=b"\x14")
+
+    assert s.drain_unobserved_access_us() == 120_000
+
+
+def test_a_cancelled_problem_is_registered_while_live_and_released_after():
+    # Registered, or a Cancel has nothing to call. Released, or the next sweep
+    # reports a finished problem as live and inflates the hit counter.
+    seen = {}
+
+    class WatchingFuture(CancelledFuture):
+        @property
+        def sampleset(self):
+            seen["registered"] = b"\x15" in s._inflight
+            raise _Boom("problem cancelled")
+
+    s = _real_mode_sampler(WatchingFuture())
+    with pytest.raises(_Boom):
+        s.sample({0: 1.0}, {}, num_reads=1, cancel_key=b"\x15")
+
+    assert seen["registered"] is True
+    assert s._inflight == {}

@@ -78,19 +78,44 @@ def sampling_defaults_from_toml(toml_text: str) -> SamplingDefaults:
     except Exception:
         return SamplingDefaults()
 
-    def non_negative(key: str) -> int:
-        raw = data.get(key)
-        if not isinstance(raw, int) or isinstance(raw, bool) or raw < 0:
-            if raw is not None:
-                logger.warning(
-                    "ignoring %s=%r from config: expected a non-negative integer",
-                    key,
-                    raw,
-                )
-            return 0
-        return raw
-
     return SamplingDefaults(
-        num_reads=non_negative("num_reads"),
-        anneal_time_us=non_negative("anneal_time_us"),
+        num_reads=_non_negative(data, "num_reads"),
+        anneal_time_us=_non_negative(data, "anneal_time_us"),
     )
+
+
+def _non_negative(data: dict, key: str) -> int:
+    """Read a non-negative int key, or 0 when unset or nonsense.
+
+    ``bool`` is excluded on purpose: it is an ``int`` subclass in Python, so
+    ``queue_depth = true`` would otherwise resolve to a one-deep pipeline
+    instead of being reported as the misconfiguration it is.
+    """
+    raw = data.get(key)
+    if not isinstance(raw, int) or isinstance(raw, bool) or raw < 0:
+        if raw is not None:
+            logger.warning(
+                "ignoring %s=%r from config: expected a non-negative integer",
+                key,
+                raw,
+            )
+        return 0
+    return raw
+
+
+def queue_depth_from_toml(toml_text: str) -> int:
+    """Read ``queue_depth`` from ``backend_toml``; 0 when the operator is silent.
+
+    How many submissions this backend keeps in flight is a property of the
+    device and its cloud round trip, which the coordinator cannot know, so the
+    operator gets to override what it sends. Same lenient parse as the
+    sampling defaults: a document that will not parse is the budget parser's
+    problem to report, not this one's.
+    """
+    if not toml_text or not toml_text.strip():
+        return 0
+    try:
+        data = tomllib.loads(toml_text)
+    except Exception:
+        return 0
+    return _non_negative(data, "queue_depth")

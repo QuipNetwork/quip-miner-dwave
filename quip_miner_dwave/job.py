@@ -344,6 +344,10 @@ def handle_job(
             # Use job_id bytes as the defect-clamp seed when present.
             nonce_seed=bytes(job_id) if job_id else None,
             label=f"quip-{job_id.hex()[:8] if job_id else 'job'}",
+            # The handle a coordinator Cancel reaches this submission by. The
+            # session loop cancels by job id, so the seed cannot double as it:
+            # a job with no defects is given no seed at all.
+            cancel_key=bytes(job_id) if job_id else None,
         )
     except Exception:
         # Ocean raises many exception types (Leap auth, network, solver

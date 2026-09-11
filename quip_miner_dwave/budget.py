@@ -52,6 +52,7 @@ DWAVE_CONFIG_KEYS = frozenset(
         "usage_db",
         "anneal_time_us",
         "num_reads",
+        "queue_depth",
     }
 )
 

@@ -285,6 +285,7 @@ class _RecordingSampler:
         anneal_time_us: Optional[int] = None,
         nonce_seed: Optional[bytes] = None,
         label: str = "",
+        cancel_key: Optional[bytes] = None,
     ) -> SampleResult:
         self.calls.append({"num_reads": num_reads, "anneal_time_us": anneal_time_us})
         return SampleResult(

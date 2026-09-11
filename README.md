@@ -85,6 +85,51 @@ quip-dwave-qa --capabilities
 quip-dwave-qa --check
 ```
 
+## Pipeline depth
+
+The miner keeps up to `queue_depth` submissions on the QPU at once. A
+cloud-attached QPU spends most of each job's wall time on the round trip, so a
+shallow pipeline leaves the device idle between jobs.
+
+The default is 96. It comes from Little's Law:
+
+    depth = chip throughput * round trip
+
+Measured on `Advantage2_system1` with a production-sized problem (4577 nodes,
+41514 couplers, `num_reads=48`): 43.2 ms of access time per job gives a chip
+ceiling of 23.2 jobs/s, and an uncontended round trip is 1.57 s. That needs 36
+in flight. A round trip of 3.05 s, which session logs show under load, needs
+71. The default covers a round trip of 4.14 s, so a connectivity blip reduces
+throughput instead of stalling the QPU.
+
+Set `queue_depth` in the coordinator's `[dwave]` backend config to override
+it:
+
+```toml
+queue_depth = 64
+```
+
+The operator value wins. If unset, the miner uses the depth the coordinator
+sent. If that is also unset, the miner uses 96.
+
+Depth does not raise jobs per hour under a budget. The budget paces spend
+across the quota period, and it funds fewer jobs per second than even a
+shallow pipeline delivers. Depth sets the burst rate and the duty cycle.
+
+Depth does set how much work a reseed can strand. When the coordinator cancels
+a generation, the miner asks D-Wave to drop every job of that generation still
+on the QPU. D-Wave refunds only the jobs it has not started annealing, so the
+quota pays for the rest. Each session log reports the measured hit rate:
+
+```
+[QPU] cancel gen<=339: asked D-Wave to drop 3 in-flight job(s), 3 still
+running | session: 12 cancelled, 4 annealed anyway (33% missed)
+```
+
+The same config holds other `[dwave]` keys: `budget`, `budget_reset_day`,
+`usage_db`, `num_reads`, and `anneal_time_us`. This README does not document
+them yet.
+
 ## Tests
 
 ```sh

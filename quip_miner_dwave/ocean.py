@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -135,6 +136,7 @@ class SupportsSample(Protocol):
         anneal_time_us: Optional[int] = None,
         nonce_seed: Optional[bytes] = None,
         label: str = "quip-dwave-qa",
+        cancel_key: Optional[bytes] = None,
     ) -> SampleResult: ...
 
 
@@ -213,6 +215,20 @@ class OceanSampler:
             max_workers=max(1, submit_workers),
             thread_name_prefix="dwave-submit",
         )
+        # Live cloud problems, keyed by the caller's cancel key, so a
+        # coordinator Cancel can reach a problem still sitting on the QPU.
+        # Crossed by the submit pool and the session thread -> guard it.
+        self._inflight: Dict[bytes, Any] = {}
+        # Keys cancelled before their submit landed. The cloud Future only
+        # exists once _submit_sync has run and SAPI has accepted the problem;
+        # a Cancel inside that window has nothing to call yet, and that window
+        # is exactly when cancelling saves the most access time.
+        self._cancel_pending: set = set()
+        self._inflight_lock = threading.Lock()
+        # Access time D-Wave charged for problems whose timing we never saw.
+        # See _charge_unobserved for why this exists and why it over-counts.
+        self._unobserved_access_us = 0
+        self._max_access_us = 0
         self._defective_qubits: List[int] = list(defective_qubits or [])
         self._defective_edges: set = set(defective_edges or set())
         self._live_nodes: List[int] = []
@@ -383,6 +399,80 @@ class OceanSampler:
             edge_pct,
         )
 
+    def _register_inflight(self, key: bytes, future: Any) -> None:
+        """Record a live cloud problem, or drop it if a Cancel beat it here."""
+        with self._inflight_lock:
+            if key in self._cancel_pending:
+                # The note is consumed by the registration it applies to; a
+                # key left poisoned would kill the next job that reuses it.
+                self._cancel_pending.discard(key)
+                doomed = future
+            else:
+                self._inflight[key] = future
+                doomed = None
+        if doomed is not None:
+            doomed.cancel()
+
+    def _release_inflight(self, key: bytes) -> None:
+        """Forget a problem that has finished, cancelled or not."""
+        with self._inflight_lock:
+            self._inflight.pop(key, None)
+            self._cancel_pending.discard(key)
+
+    def cancel_inflight(self, keys: Sequence[bytes]) -> int:
+        """Ask SAPI to drop these problems; return how many were still live.
+
+        Best-effort by construction: D-Wave only refunds a problem it has not
+        started annealing, so the return value counts the ones that had not
+        finished when we asked, which is the ceiling on what was saved — not a
+        confirmed refund. Keys whose submit has not landed are noted so
+        :meth:`_register_inflight` cancels them the moment it does.
+        """
+        with self._inflight_lock:
+            found = []
+            for key in keys:
+                future = self._inflight.pop(key, None)
+                if future is None:
+                    self._cancel_pending.add(key)
+                else:
+                    found.append(future)
+        live = 0
+        for future in found:
+            if future.done():
+                continue
+            future.cancel()
+            live += 1
+        return live
+
+    def _observe_access_us(self, access_us: int) -> None:
+        """Note a measured charge, so an unmeasurable one can be estimated."""
+        with self._inflight_lock:
+            self._max_access_us = max(self._max_access_us, int(access_us))
+
+    def _charge_unobserved(self) -> None:
+        """Bill a problem SAPI accepted but whose timing we never saw.
+
+        A cancel that beat the anneal costs nothing; a cancel that lost is
+        charged by D-Wave in full. The raised path carries no timing to tell
+        those apart, so the ledger assumes the anneal ran. That over-counts
+        every successful cancel, which is the safe direction to be wrong:
+        under-counting lets the pacer hand out headroom D-Wave has already
+        spent, and the drift compounds across the period.
+
+        The estimate is the largest charge measured this session, which is
+        exact on a fleet whose jobs all carry the same num_reads. It is 0
+        until the first job completes, so a cancel in the opening seconds of a
+        session is under-billed; that window is bounded and does not recur.
+        """
+        with self._inflight_lock:
+            self._unobserved_access_us += self._max_access_us
+
+    def drain_unobserved_access_us(self) -> int:
+        """Take the estimated charges accrued since the last call."""
+        with self._inflight_lock:
+            owed, self._unobserved_access_us = self._unobserved_access_us, 0
+        return owed
+
     def close(self) -> None:
         self._submit_pool.shutdown(wait=False)
         if self._qpu_solver is not None:
@@ -398,6 +488,7 @@ class OceanSampler:
         num_reads: int,
         label: str,
         anneal_time_us: Optional[int] = None,
+        cancel_key: Optional[bytes] = None,
     ):
         """Run on a pool thread: build/submit only; do NOT touch .sampleset."""
         kwargs: Dict[str, Any] = {
@@ -420,7 +511,13 @@ class OceanSampler:
             # Async path via underlying solver when available.
             solver = getattr(self.sampler, "solver", None)
             if solver is not None and hasattr(solver, "sample_ising"):
-                return solver.sample_ising(h, j, **kwargs)
+                future = solver.sample_ising(h, j, **kwargs)
+                # Registered here, on the pool thread, because this is the
+                # first moment the cloud Future exists. Anything earlier has
+                # no handle to cancel; anything later widens the blind window.
+                if cancel_key is not None:
+                    self._register_inflight(cancel_key, future)
+                return future
         return sample_fn(h, j, **kwargs)
 
     @staticmethod
@@ -439,6 +536,7 @@ class OceanSampler:
         anneal_time_us: Optional[int] = None,
         nonce_seed: Optional[bytes] = None,
         label: str = "quip-dwave-qa",
+        cancel_key: Optional[bytes] = None,
     ) -> SampleResult:
         """Submit one Ising problem and return decoded, reconstructed samples.
 
@@ -447,6 +545,12 @@ class OceanSampler:
         ``anneal_time_us`` (microseconds) maps directly to D-Wave's
         ``annealing_time`` SAPI parameter; ``None``/``0`` leaves it unset so
         the QPU's hardware-default anneal applies.
+
+        ``cancel_key`` makes the submission reachable by
+        :meth:`cancel_inflight` until it finishes. A cancelled problem raises
+        out of here rather than returning samples, which is what the caller
+        wants: there is no Result to send for a generation the coordinator has
+        already abandoned.
         """
         h_eff, j_eff, defect_info = prepare_problem(
             h,
@@ -470,11 +574,29 @@ class OceanSampler:
             max(1, int(num_reads)),
             label,
             anneal_time_us,
+            cancel_key,
         )
-        raw = fut.result()
-        # Decode off the submit path
-        ss = self._decode_future(raw)
+        # Two failure boundaries, billed differently. A failure here is the
+        # submit itself dying in this process: D-Wave never saw the problem,
+        # so charging for it would burn quota the QPU never spent.
+        try:
+            raw = fut.result()
+        except BaseException:
+            if cancel_key is not None:
+                self._release_inflight(cancel_key)
+            raise
+        # Decode off the submit path. A failure here is a problem SAPI already
+        # accepted — a cancelled one, most often — and it may have annealed.
+        try:
+            ss = self._decode_future(raw)
+        except BaseException:
+            self._charge_unobserved()
+            raise
+        finally:
+            if cancel_key is not None:
+                self._release_inflight(cancel_key)
         access_us = qpu_access_time_us(ss)
+        self._observe_access_us(access_us)
 
         samples: List[Dict[int, int]] = []
         energies: List[float] = []
