@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
 
 import numpy as np
 
+from quip_miner_dwave.answer import AnswerView, answer_view
 from quip_miner_dwave.qp import QpEncoder, build_submission_body
 from quip_miner_dwave.defects import (
     DefectInfo,
@@ -98,15 +99,6 @@ def ocean_importable() -> bool:
         return True
     except ImportError:
         return False
-
-
-def qpu_access_time_us(sampleset: Any) -> int:
-    """Sum qpu_programming_time + qpu_sampling_time (µs); 0 if missing."""
-    info = getattr(sampleset, "info", None) or {}
-    timing = info.get("timing") or {}
-    prog = timing.get("qpu_programming_time") or 0
-    sample = timing.get("qpu_sampling_time") or 0
-    return int(prog) + int(sample)
 
 
 @dataclass
@@ -614,7 +606,14 @@ class OceanSampler:
         from dwave.cloud.concurrency import Present
 
         computation = Future(
-            solver=solver, id_=None, return_matrix=solver.return_matrix
+            solver=solver,
+            id_=None,
+            # numpy, not lists. With return_matrix=False the decoder calls
+            # .tolist() on a (reads x qubits) array, which is 220k Python
+            # objects a job at production size. Safe only because nothing on
+            # this path builds a SampleSet: the same flag makes
+            # wait_sampleset's comprehension 4.4x slower.
+            return_matrix=True,
         )
         # XXX carried on the Future until SAPI implements it, as Ocean does.
         computation._offset = 0
@@ -627,11 +626,16 @@ class OceanSampler:
         return computation
 
     @staticmethod
-    def _decode_future(future_or_ss: Any):
-        """Decode sampleset OFF the submit path (main/consumer thread)."""
-        if hasattr(future_or_ss, "sampleset"):
-            return future_or_ss.sampleset
-        return future_or_ss
+    def _decode_and_view(future_or_ss: Any) -> AnswerView:
+        """Read the answer OFF the submit path (v0.2 lesson: never on it).
+
+        Deliberately not ``.sampleset``. That property turns the decoded numpy
+        arrays into Python lists, walks them with a nested comprehension over
+        reads times variables, and hands them to dimod to convert back into
+        numpy: about 28 ms per job at production size, to arrive at the arrays
+        the decoder already had.
+        """
+        return answer_view(future_or_ss)
 
     def sample(
         self,
@@ -687,34 +691,20 @@ class OceanSampler:
         # Decode off the submit path. A failure here is a problem SAPI already
         # accepted — a cancelled one, most often — and it may have annealed.
         try:
-            ss = self._decode_future(raw)
+            view = self._decode_and_view(raw)
         except BaseException:
             self._charge_unobserved()
             raise
         finally:
             if cancel_key is not None:
                 self._release_inflight(cancel_key)
-        access_us = qpu_access_time_us(ss)
+        access_us = view.access_time_us
         self._observe_access_us(access_us)
 
-        variables = [int(v) for v in ss.variables]
-        # ExactSolver / SA use ±1; coerce zeros just in case. One vectorised
-        # pass, not a dict comprehension per read.
-        spins = np.where(np.asarray(ss.record.sample) >= 0, 1, -1).astype(np.int8)
-        energies = [float(e) for e in ss.record.energy]
         spins, variables, energies = reconstruct_samples(
-            spins, variables, energies, defect_info
+            view.spins, view.variables, view.energies, defect_info
         )
-
-        # The cloud client aggregates identical reads into one record row
-        # carrying num_occurrences, so the row count is distinct solutions, not
-        # anneals performed. Sum the occurrences to report reads actually run;
-        # the offline samplers do not aggregate, where the sum degrades to the
-        # row count anyway.
-        occurrences = getattr(ss.record, "num_occurrences", None)
-        reads_done = (
-            int(sum(occurrences)) if occurrences is not None else len(energies)
-        )
+        reads_done = view.reads
 
         return SampleResult(
             spins=spins,

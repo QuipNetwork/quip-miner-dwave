@@ -113,3 +113,58 @@ def test_an_empty_answer_does_not_crash():
 
     assert view.spins.shape == (0, 2)
     assert view.reads == 0
+
+
+def test_the_sampler_never_asks_the_future_for_a_sampleset():
+    # The regression this plan exists to prevent. FakeFuture.sampleset raises,
+    # so any path that reaches for it fails loudly rather than quietly costing
+    # 28 ms a job again.
+    from quip_miner_dwave.ocean import OceanSampler
+
+    s = OceanSampler(mock=False)
+    s._connected = True
+    s._is_mock = False
+
+    fut = _future()
+    result = s._decode_and_view(fut)
+
+    assert fut.sampleset_touched is False
+    assert result.spins.tolist() == [[1, -1], [-1, -1]]
+    assert result.access_time_us == 43_200
+
+
+def test_the_cloud_future_is_asked_for_numpy_not_lists():
+    # return_matrix=False makes the decoder call .tolist() on a
+    # (reads x qubits) array, which is 220k Python objects per job at
+    # production size.
+    from quip_miner_dwave.ocean import OceanSampler
+
+    captured = {}
+
+    class _Solver:
+        return_matrix = False  # what the SDK defaults to
+
+        class client:
+            @staticmethod
+            def _submit(body, computation):
+                captured["computation"] = computation
+
+    s = OceanSampler(mock=False)
+    s._connected = True
+    s._is_mock = False
+
+    import dwave.cloud.computation as comp
+
+    real_future = comp.Future
+
+    def spy(solver, id_, return_matrix=False):
+        captured["return_matrix"] = return_matrix
+        return real_future(solver, id_, return_matrix=return_matrix)
+
+    comp.Future = spy
+    try:
+        s._submit_encoded(_Solver(), b"{}", None)
+    finally:
+        comp.Future = real_future
+
+    assert captured["return_matrix"] is True

@@ -203,7 +203,7 @@ class _Boom(Exception):
 
 
 class CancelledFuture:
-    """A cloud problem SAPI accepted and then cancelled: .sampleset raises."""
+    """A cloud problem SAPI accepted and then cancelled: .samples raises."""
 
     def done(self) -> bool:
         return False
@@ -212,7 +212,7 @@ class CancelledFuture:
         pass
 
     @property
-    def sampleset(self):
+    def samples(self):
         raise _Boom("problem cancelled")
 
 
@@ -331,7 +331,7 @@ def test_a_cancelled_problem_is_registered_while_live_and_released_after():
 
     class WatchingFuture(CancelledFuture):
         @property
-        def sampleset(self):
+        def samples(self):
             seen["registered"] = b"\x15" in s._inflight
             raise _Boom("problem cancelled")
 
