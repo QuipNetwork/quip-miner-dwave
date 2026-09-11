@@ -608,19 +608,26 @@ def run_session(
         wall_ms = int((time.monotonic() - started) * 1000)
         for reply in replies:
             kind = reply.WhichOneof("msg")
+            if kind == "result" and pending_budget is not None:
+                meta = reply.result.meta
+                if meta is not None:
+                    # Billed before the abandoned check, not after. D-Wave
+                    # charged for this anneal whatever the coordinator decided
+                    # to do with the answer, and a ledger that under-counts
+                    # hands the pacer headroom the QPU has already spent.
+                    #
+                    # Billed outside state_lock, too. This commits to SQLite,
+                    # which fsyncs the deployment's mounted volume, and the
+                    # ledger already has its own lock. state_lock is what the
+                    # session-loop thread takes to dispatch the next job, so
+                    # holding it across this put every Cancel, Job and Ping
+                    # behind one worker's disk write — at a pipeline depth of
+                    # 96, behind all of them.
+                    pending_budget.record_access_time(
+                        meta.device_access_time_us, time.time()
+                    )
             with state_lock:
                 abandoned = _is_abandoned(job.generation, cancel_watermark)
-                if kind == "result" and pending_budget is not None:
-                    meta = reply.result.meta
-                    if meta is not None:
-                        # Billed before the abandoned check, not after. D-Wave
-                        # charged for this anneal whatever the coordinator
-                        # decided to do with the answer, and a ledger that
-                        # under-counts hands the pacer headroom the QPU has
-                        # already spent.
-                        pending_budget.record_access_time(
-                            meta.device_access_time_us, time.time()
-                        )
                 if kind in ("result", "reject") and abandoned:
                     # SPEC section 5: no Result for an abandoned generation.
                     # The Reject goes the same way — a cancelled submission
