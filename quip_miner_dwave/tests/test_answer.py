@@ -2,7 +2,7 @@
 
 OceanSampler needs five things off a finished job: spins, variable labels,
 energies, occurrence counts and timing. A cloud Future carries all five. Going
-through .sampleset instead costs 28 ms per job at production size, because it
+through .sampleset instead costs about 38.8 ms per job at production size, because it
 turns the decoded numpy arrays into Python lists, walks them with a nested
 comprehension, and hands them to dimod to turn back into numpy.
 """
@@ -165,7 +165,7 @@ def test_a_1d_empty_answer_is_reshaped_to_zero_rows():
 def test_the_sampler_never_asks_the_future_for_a_sampleset():
     # The regression this plan exists to prevent. FakeFuture.sampleset raises,
     # so any path that reaches for it fails loudly rather than quietly costing
-    # 28 ms a job again.
+    # 38.8 ms per job.
     from quip_miner_dwave.ocean import OceanSampler
 
     s = OceanSampler(mock=False)

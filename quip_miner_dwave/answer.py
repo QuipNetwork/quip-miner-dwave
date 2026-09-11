@@ -4,7 +4,7 @@
 energies, occurrence counts and timing. A ``dwave.cloud.computation.Future``
 carries all five already decoded.
 
-Asking for ``.sampleset`` instead costs about 28 ms per job at production
+Asking for ``.sampleset`` instead costs about 38.8 ms per job at production
 size, and every millisecond of it is spent undoing work. The decoder turns its
 numpy arrays into Python lists, ``wait_sampleset`` walks those with a nested
 comprehension over reads times variables, and dimod converts the result back

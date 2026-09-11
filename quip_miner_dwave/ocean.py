@@ -634,7 +634,7 @@ class OceanSampler:
         Deliberately not ``.sampleset``. That property turns the decoded numpy
         arrays into Python lists, walks them with a nested comprehension over
         reads times variables, and hands them to dimod to convert back into
-        numpy: about 28 ms per job at production size, to arrive at the arrays
+        numpy: about 38.8 ms per job at production size, to arrive at the arrays
         the decoder already had.
         """
         return answer_view(future_or_ss)
