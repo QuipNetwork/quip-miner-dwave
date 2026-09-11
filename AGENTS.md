@@ -1,51 +1,155 @@
-# Agent Instructions
+# AGENTS.md
 
-This project uses **bd** (beads) for issue tracking. Run `bd prime` for full workflow context.
+This file provides guidance to coding agents working in this repository.
 
-> **Architecture in one line:** Issues live in a local Dolt database
-> (`.beads/dolt/`); cross-machine sync uses `bd dolt push/pull` (a
-> git-compatible protocol), stored under `refs/dolt/data` on your git
-> remote — separate from `refs/heads/*` where your code lives.
-> `.beads/issues.jsonl` is a passive export, not the wire protocol.
->
-> See [SYNC_CONCEPTS.md](https://github.com/gastownhall/beads/blob/main/docs/SYNC_CONCEPTS.md)
-> for the one-screen overview and anti-patterns (don't treat JSONL as the
-> source of truth; don't `bd import` during normal operation; don't
-> reach for third-party Dolt hosting before trying the default).
+`quip-miner-dwave` is a D-Wave QPU Ising miner for the quip.network v0.3
+mining protocol. It speaks the miner gRPC protocol to a coordinator over a
+Unix socket and samples every job on a real QPU through the Ocean SDK.
 
-## Quick Reference
+## Commands
 
-```bash
-bd ready              # Find available work
-bd show <id>          # View issue details
-bd update <id> --claim  # Claim work atomically
-bd close <id>         # Complete work
-bd dolt push          # Push beads data to remote
+```sh
+pip install -e ".[dev]"                      # dev install
+
+pytest quip_miner_dwave/tests -q             # full suite (~2s, no QPU needed)
+pytest quip_miner_dwave/tests/test_qp_encoding.py -q          # one file
+pytest quip_miner_dwave/tests -q -k "cancel and not accounting"  # by name
+pytest quip_miner_dwave/tests -q --durations=10               # find slow tests
+
+ruff check quip_miner_dwave/                 # linter (CI does not run it; keep it clean anyway)
+pyright quip_miner_dwave/                    # type checker (same)
+
+QUIP_DWAVE_MOCK=1 quip-dwave-qa --check      # offline self-test
+quip-dwave-qa --capabilities                 # print the advertised Capabilities
+quip-dwave-qa --quip-coordinator unix:///run/quip/coord.sock
 ```
 
-## Non-Interactive Shell Commands
+CI (`.gitlab-ci.yml`) runs `pytest quip_miner_dwave/tests -v`, a wheel build,
+and a conformance job that needs the external `quip-solver-drive` harness:
 
-**ALWAYS use non-interactive flags** with file operations to avoid hanging on confirmation prompts.
-
-Shell commands like `cp`, `mv`, and `rm` may be aliased to include `-i` (interactive) mode on some systems, causing the agent to hang indefinitely waiting for y/n input.
-
-**Use these forms instead:**
-```bash
-# Force overwrite without prompting
-cp -f source dest           # NOT: cp source dest
-mv -f source dest           # NOT: mv source dest
-rm -f file                  # NOT: rm file
-
-# For recursive operations
-rm -rf directory            # NOT: rm -r directory
-cp -rf source dest          # NOT: cp -r source dest
+```sh
+QUIP_SOLVER_DRIVE=/path/to/quip-solver-drive pytest quip_miner_dwave/tests/test_conformance.py -v
 ```
 
-**Other commands that may prompt:**
-- `scp` - use `-o BatchMode=yes` for non-interactive
-- `ssh` - use `-o BatchMode=yes` to fail instead of prompting
-- `apt-get` - use `-y` flag
-- `brew` - use `HOMEBREW_NO_AUTO_UPDATE=1` env var
+`ruff format` is **not** this project's baseline — several files predate it and
+reformatting them is churn. Run `ruff check` and `pyright`, not the formatter.
+
+Tests must not touch a real QPU. `QUIP_DWAVE_MOCK=1` (or `--mock`) swaps in a
+dimod sampler; `QUIP_DWAVE_MOCK_BACKEND=sa` scales to realistic topologies,
+while the default `ExactSolver` enumerates every state and only handles tiny
+problems.
+
+## Architecture
+
+### The session is one thread, and credits are the throttle
+
+`session_loop.run_session` is the whole protocol: Hello → Welcome → Configure →
+a credit/job cycle, all on one thread reading the coordinator's gRPC stream.
+Jobs are handed to a `ThreadPoolExecutor` sized to the pipeline depth; every
+other message is handled inline.
+
+**The coordinator dispatches only against credits.** Granting them is how this
+miner says "I am participating" and withholding them is how it sits a round
+out. `Ready` says the session is established; credits say the QPU is working.
+They are deliberately separate messages.
+
+Because everything funnels through that one thread, **nothing on it may block**.
+Two bugs of exactly that shape have been fixed (see `test_ledger_contention`,
+`test_budget_cache`), and a sibling miner lost 4-87s per round to the same
+class of problem (`quip-miner#33`). Do not add IO under `state_lock`.
+
+### A Cancel is the only round boundary the miner can see
+
+`Cancel(max_generation=N)` is the only monotone round counter the coordinator
+sends, and it arrives every round even while the miner holds no credits. So it
+is where participation is decided, where the reseed watermark is raised, and
+where in-flight work is cancelled. Jobs at or below the watermark are
+"abandoned": `_is_abandoned` decides, generation 0 (mempool) never is.
+
+### The budget is a gate, not a rate limiter
+
+`BudgetPacer.decide` answers one question: is cumulative spend under the flat
+allowance line for this point in the quota period? If yes, the miner
+participates in the **whole next qblock** and spends as fast as the QPU
+allows. Nothing throttles inside a round. Long-run average spend is bounded by
+arithmetic (quota ÷ access time per job), not by pacing.
+
+Spend lives in `usage.UsageLedger`, a SQLite file that survives restarts.
+`usage_db` defaults to a shared path, so two miners on one D-Wave account may
+share it — the pacer caches the live period in memory but re-reads on a short
+interval so a sibling's spend is not invisible.
+
+**Two different ledgers, never conflate them:** coordinator *credits* are
+protocol flow control; D-Wave *access time* is money. A job the coordinator
+throws away still costs quota.
+
+### Billing rules that are easy to get wrong
+
+- Bill **before** the abandoned check. D-Wave charged for the anneal whatever
+  the coordinator decided to do with the answer.
+- A cancelled submission raises with no timing attached. The sampler books a
+  conservative estimate rather than nothing, because under-counting hands the
+  pacer headroom the QPU has already spent.
+- A submit that died in this process is billed nothing — D-Wave never saw it.
+  `OceanSampler.sample` distinguishes the two by *which* future failed.
+
+### Arrays from the wire to SAPI and back
+
+Jobs carry dense positional arrays, and so does the SAPI payload, so nothing
+in between becomes a dict:
+
+```
+Job proto -> _resolve_problem -> (nodes, h, edges, j) numpy arrays
+          -> QpEncoder.plan/encode -> base64 qp payload
+          -> build_submission_body -> client._submit
+```
+
+`dwave.cloud.coders.encode_problem_as_qp` is the **specification** for that
+payload, not a starting point. `test_qp_encoding` asserts byte equality against
+it, including at production scale (4577 qubits, 41514 couplers). If you change
+the encoder, that equality is the contract.
+
+Coming back, spins stay in the sampler's `(reads, qubits)` int8 array. The wire
+format is one signed byte per spin, so `row.tobytes()` *is* the payload —
+pinned against `wire.encode_spins`.
+
+Every Ocean internal lives in `OceanSampler._submit_encoded` (`Future`,
+`Present`, `client._submit`). Keep it that way: an SDK change should have a
+one-function blast radius. Polling, auth, retries and `Future.cancel` are still
+the SDK's job.
+
+### Precedence ladders
+
+Two settings resolve through the same shape — job, then session, then operator
+config, then a built-in default:
+
+- sampling (`job._sampling_params`): the job's `IsingProblem`, then `SetTarget`,
+  then `backend_toml`, then a hard-coded fallback.
+- pipeline depth (`session_loop.resolve_queue_depth`): `backend_toml`, then what
+  the coordinator sent, then `DEFAULT_QUEUE_DEPTH`. Read the coordinator's value
+  off the wire, not off `SessionConfig`, which substitutes the SDK's own default
+  for an unset field.
+
+Operator settings arrive in `Configure.backend_toml`; `budget.DWAVE_CONFIG_KEYS`
+is the accepted set and anything else gets warned about.
+
+### Defect clamping
+
+When the live chip is missing qubits or couplers the session topology names,
+`defects.prepare_problem` clamps them out before submit and
+`defects.reconstruct_samples` puts them back afterwards. Submitting a coupler
+the QPU does not have makes SAPI reject the whole problem. This path still
+speaks dicts; the normal case (live graph matches) passes arrays straight
+through.
+
+## Conventions
+
+- Comments explain *why*, especially why an obvious-looking simplification is
+  wrong. Match that density.
+- Tests are named as sentences describing the behaviour, not the function.
+- Changes to billing, cancellation, or the encoder should be mutation-tested:
+  revert the fix, confirm a specific test goes red, restore.
+- No LLM attribution trailers in commits.
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:970c3bf2 -->
 ## Beads Issue Tracker
