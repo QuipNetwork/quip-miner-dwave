@@ -83,6 +83,35 @@ def test_spins_are_normalised_to_plus_or_minus_one():
     assert view.spins.dtype == np.int8
 
 
+def test_padding_columns_are_dropped_and_labels_stay_aligned():
+    # dwave.cloud.coders.decode_qp_numpy pads the solution matrix out to the
+    # solver's full physical qubit count and writes the decoded bits into only
+    # the active columns: solutions[:, active_variables] = bits. Future.samples
+    # returns that padded matrix, while Future.variables returns the active
+    # labels alone. Pairing them 1:1 misattributes every real qubit at or after
+    # the first gap, and the padding value rides along as a reading.
+    padded = np.full((2, 6), 7, dtype=np.int8)  # 7 marks a padding column
+    active = [0, 2, 5]
+    padded[:, active] = np.array([[1, -1, 1], [-1, 1, -1]], dtype=np.int8)
+
+    view = answer_view(_future(samples=padded, variables=active))
+
+    assert view.variables == active
+    assert view.spins.shape == (2, len(view.variables))
+    # The values must be the ones belonging to those labels, not the first
+    # three columns of the padded matrix.
+    assert view.spins.tolist() == [[1, -1, 1], [-1, 1, -1]]
+
+
+def test_an_already_aligned_answer_is_left_alone():
+    # Fixtures and future SDK versions may hand back a matrix that is already
+    # restricted to the active columns.
+    view = answer_view(_future())
+
+    assert view.spins.tolist() == [[1, -1], [-1, -1]]
+    assert view.variables == [10, 20]
+
+
 def test_a_dimod_sampleset_reads_the_same_way():
     # The mock and injected-sampler paths still return a SampleSet.
     dimod = pytest.importorskip("dimod")

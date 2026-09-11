@@ -66,11 +66,19 @@ def answer_view(raw: Any) -> AnswerView:
         timing = (getattr(raw, "info", None) or {}).get("timing")
     else:
         # A cloud Future, read before anything builds a SampleSet.
-        samples = raw.samples
+        samples = np.asarray(raw.samples)
         energies = raw.energies
         occurrences = raw.num_occurrences
         variables = list(raw.variables)
         timing = raw.timing
+        # The decoder pads the solution matrix out to the solver's full
+        # physical qubit count and writes the decoded bits into only the
+        # active columns (``solutions[:, active_variables] = bits``), while
+        # ``variables`` carries the active labels alone. Those labels are the
+        # column indices into the padded matrix, so selecting by them both
+        # drops the padding and restores the 1:1 pairing this view promises.
+        if samples.ndim == 2 and samples.shape[1] != len(variables):
+            samples = samples[:, variables]
 
     spins = _normalise(samples)
     energy_list = [float(e) for e in energies]
