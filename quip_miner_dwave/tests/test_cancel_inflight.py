@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import threading
 
+import numpy as np
+
 import pytest
 
 pytest.importorskip("numpy")  # OceanSampler imports numpy at module load
@@ -146,7 +148,8 @@ class RecordingSampler:
 
         self.calls.append(kwargs)
         return SampleResult(
-            samples=[{0: 1, 1: -1}],
+            spins=np.array([[1, -1]], dtype=np.int8),
+            variables=[0, 1],
             energies=[-1.0],
             device_access_time_us=46_000,
             num_reads=1,

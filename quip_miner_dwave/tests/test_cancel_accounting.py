@@ -10,6 +10,8 @@ quota.
 from __future__ import annotations
 
 import threading
+
+import numpy as np
 import time
 from typing import List, cast
 
@@ -68,7 +70,8 @@ class BlockingSampler:
             self._unobserved += ACCESS_US
             raise RuntimeError("problem cancelled")
         return SampleResult(
-            samples=[{0: 1, 1: -1}],
+            spins=np.array([[1, -1]], dtype=np.int8),
+            variables=[0, 1],
             energies=[-1.0],
             device_access_time_us=ACCESS_US,
             num_reads=1,

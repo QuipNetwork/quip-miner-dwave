@@ -5,6 +5,8 @@ import logging
 import time
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
+
 from quip_solver_core import miner_pb2, wire
 from quip_solver_core.session import DEFAULT_NUM_SWEEPS
 
@@ -265,15 +267,31 @@ def _build_result(
     energy regardless, so it re-scores whatever it accepts. ``energy_milli`` is
     an integer field, so the only transform is quantizing to milli.
     """
-    solutions = []
-    for sample, qpu_e in zip(result.samples, result.energies):
-        spins = sample_dict_to_vector(sample, nodes if nodes else sorted(sample))
-        solutions.append(
-            miner_pb2.Solution(
-                spins_bytes=spins_to_bytes(spins),
-                energy_milli=int(round(qpu_e * 1000)),
-            )
+    # One vectorised reorder from the sampler's column order into session node
+    # order, then a raw copy per read. The wire format is one signed byte per
+    # spin, which is exactly an int8 row, so nothing has to be packed by hand
+    # (test_spin_encoding pins that equivalence against wire.encode_spins).
+    order = nodes if nodes else sorted(result.variables)
+    col_of = {v: i for i, v in enumerate(result.variables)}
+    spins = result.spins
+    n_cols = spins.shape[1]
+    # A node the sampler never reported reads as +1, matching the dict path's
+    # `sample.get(n, 1)`. Point those at one appended constant column so the
+    # reorder stays a single fancy-index.
+    idx = np.fromiter(
+        (col_of.get(int(n), n_cols) for n in order), dtype=np.intp, count=len(order)
+    )
+    if idx.size and idx.max() == n_cols:
+        spins = np.hstack([spins, np.ones((spins.shape[0], 1), dtype=np.int8)])
+    ordered = spins[:, idx] if idx.size else spins[:, :0]
+
+    solutions = [
+        miner_pb2.Solution(
+            spins_bytes=row.tobytes(),
+            energy_milli=int(round(qpu_e * 1000)),
         )
+        for row, qpu_e in zip(ordered, result.energies)
+    ]
 
     meta = miner_pb2.SamplerMeta(
         reads=result.num_reads,

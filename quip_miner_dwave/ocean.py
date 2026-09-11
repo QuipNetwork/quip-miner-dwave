@@ -20,11 +20,12 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
 
+import numpy as np
 
 from quip_miner_dwave.defects import (
     DefectInfo,
     prepare_problem,
-    reconstruct_sample,
+    reconstruct_samples,
 )
 from quip_miner_dwave.topology import native_topology_hash
 
@@ -109,9 +110,19 @@ def qpu_access_time_us(sampleset: Any) -> int:
 
 @dataclass
 class SampleResult:
-    """One decoded sample batch from the QPU/mock."""
+    """One decoded sample batch from the QPU/mock.
 
-    samples: List[Dict[int, int]]
+    Spins stay in the array the sampler produced. Materialising a dict per
+    read, keyed by qubit label, cost ~220k Python-level operations per job and
+    bought nothing: the only consumer wants a dense vector in session node
+    order, which is one vectorised reorder away from this form.
+
+    ``spins`` is ``(reads, len(variables))`` of int8, normalised to +1/-1, and
+    ``variables[i]`` is the qubit label of column ``i``.
+    """
+
+    spins: "np.ndarray"
+    variables: List[int]
     energies: List[float]
     device_access_time_us: int
     num_reads: int
@@ -598,27 +609,28 @@ class OceanSampler:
         access_us = qpu_access_time_us(ss)
         self._observe_access_us(access_us)
 
-        samples: List[Dict[int, int]] = []
-        energies: List[float] = []
-        variables = list(ss.variables)
-        for row, energy in zip(ss.record.sample, ss.record.energy):
-            reduced = {int(variables[i]): int(row[i]) for i in range(len(variables))}
-            # ExactSolver / SA use ±1; coerce zeros just in case
-            reduced = {k: (1 if v >= 0 else -1) for k, v in reduced.items()}
-            full, e_corr = reconstruct_sample(reduced, float(energy), defect_info)
-            samples.append(full)
-            energies.append(e_corr)
+        variables = [int(v) for v in ss.variables]
+        # ExactSolver / SA use ±1; coerce zeros just in case. One vectorised
+        # pass, not a dict comprehension per read.
+        spins = np.where(np.asarray(ss.record.sample) >= 0, 1, -1).astype(np.int8)
+        energies = [float(e) for e in ss.record.energy]
+        spins, variables, energies = reconstruct_samples(
+            spins, variables, energies, defect_info
+        )
 
         # The cloud client aggregates identical reads into one record row
-        # carrying num_occurrences, so len(samples) counts distinct solutions,
-        # not anneals performed. Sum the occurrences to report reads actually
-        # run; the offline samplers do not aggregate, where the sum degrades to
-        # the row count anyway.
+        # carrying num_occurrences, so the row count is distinct solutions, not
+        # anneals performed. Sum the occurrences to report reads actually run;
+        # the offline samplers do not aggregate, where the sum degrades to the
+        # row count anyway.
         occurrences = getattr(ss.record, "num_occurrences", None)
-        reads_done = int(sum(occurrences)) if occurrences is not None else len(samples)
+        reads_done = (
+            int(sum(occurrences)) if occurrences is not None else len(energies)
+        )
 
         return SampleResult(
-            samples=samples,
+            spins=spins,
+            variables=variables,
             energies=energies,
             device_access_time_us=access_us,
             num_reads=reads_done,

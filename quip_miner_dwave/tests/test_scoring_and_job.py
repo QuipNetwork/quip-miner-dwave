@@ -1,5 +1,7 @@
 """Energy reporting + job reject paths (offline mock sampler)."""
 import time
+
+import numpy as np
 from typing import Any, Dict, Optional, Tuple
 
 from quip_solver_core import miner_pb2, scoring, wire
@@ -289,7 +291,8 @@ class _RecordingSampler:
     ) -> SampleResult:
         self.calls.append({"num_reads": num_reads, "anneal_time_us": anneal_time_us})
         return SampleResult(
-            samples=[{0: 1, 1: -1}],
+            spins=np.array([[1, -1]], dtype=np.int8),
+            variables=[0, 1],
             energies=[0.0],
             device_access_time_us=1,
             num_reads=1,
@@ -551,7 +554,7 @@ def test_reads_counts_aggregated_occurrences_not_record_rows():
     # must report the anneals performed, not the distinct solutions returned.
     sampler = OceanSampler(sampler=_AggregatingSampler(10), mock=False)
     result = sampler.sample({0: 1.0, 1: -1.0}, {(0, 1): 0.5}, num_reads=10)
-    assert len(result.samples) == 1
+    assert result.spins.shape[0] == 1
     assert result.num_reads == 10
     sampler.close()
 

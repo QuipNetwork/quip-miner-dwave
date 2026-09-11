@@ -139,3 +139,42 @@ def reconstruct_sample(
     for (u, v), j_val in defect_info.removed_edges.items():
         energy += j_val * full[u] * full[v]
     return full, energy
+
+
+def reconstruct_samples(
+    spins: np.ndarray,
+    variables: List[int],
+    energies: List[float],
+    defect_info: Optional[DefectInfo],
+) -> Tuple[np.ndarray, List[int], List[float]]:
+    """Reinsert clamped spins for a whole batch of reads at once.
+
+    The batch form of :func:`reconstruct_sample`, over the array the sampler
+    returned rather than a dict per read. A clamped qubit holds one spin for
+    every read, so it becomes a constant column appended to the array, and the
+    energy correction for each removed edge is one vectorised term.
+    """
+    if defect_info is None:
+        return spins, variables, energies
+    # No shortcut on empty fixed_spins/removed_edges: energy_offset still
+    # applies, and skipping it here silently drops the clamped contribution.
+
+    n_reads = spins.shape[0]
+    fixed = list(defect_info.fixed_spins.items())
+    if fixed:
+        block = np.empty((n_reads, len(fixed)), dtype=np.int8)
+        for col, (_, spin) in enumerate(fixed):
+            block[:, col] = 1 if spin >= 0 else -1
+        spins = np.hstack([spins, block])
+        variables = list(variables) + [int(q) for q, _ in fixed]
+
+    corrected = np.asarray(energies, dtype=np.float64) + defect_info.energy_offset
+    if defect_info.removed_edges:
+        col_of = {v: i for i, v in enumerate(variables)}
+        for (u, v), j_val in defect_info.removed_edges.items():
+            corrected += (
+                j_val
+                * spins[:, col_of[u]].astype(np.float64)
+                * spins[:, col_of[v]].astype(np.float64)
+            )
+    return spins, variables, [float(e) for e in corrected]
