@@ -79,6 +79,10 @@ def answer_view(raw: Any) -> AnswerView:
         # drops the padding and restores the 1:1 pairing this view promises.
         if samples.ndim == 2 and samples.shape[1] != len(variables):
             samples = samples[:, variables]
+        elif samples.ndim == 1 and samples.size == 0:
+            # Zero solutions: np.asarray([]) is 1-D and skips the guard above,
+            # but every downstream consumer expects (reads, len(variables)).
+            samples = samples.reshape(0, len(variables))
 
     spins = _normalise(samples)
     energy_list = [float(e) for e in energies]

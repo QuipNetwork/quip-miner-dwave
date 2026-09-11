@@ -144,6 +144,24 @@ def test_an_empty_answer_does_not_crash():
     assert view.reads == 0
 
 
+def test_a_1d_empty_answer_is_reshaped_to_zero_rows():
+    # With return_matrix=False and zero solutions, result['solutions'] is [],
+    # so np.asarray gives a 1-D (0,) array. The ndim == 2 alignment guard
+    # skips a 1-D array, so this must be reshaped separately or the caller
+    # sees a rank-1 empty array where it expects (reads, len(variables)).
+    view = answer_view(
+        _future(
+            samples=np.array([], dtype=np.int8),
+            variables=[10, 20],
+            energies=[],
+            num_occurrences=[],
+        )
+    )
+
+    assert view.spins.shape == (0, 2)
+    assert view.reads == 0
+
+
 def test_the_sampler_never_asks_the_future_for_a_sampleset():
     # The regression this plan exists to prevent. FakeFuture.sampleset raises,
     # so any path that reaches for it fails loudly rather than quietly costing
@@ -171,7 +189,11 @@ def test_the_cloud_future_is_asked_for_numpy_not_lists():
     captured = {}
 
     class _Solver:
-        return_matrix = False  # what the SDK defaults to
+        # What the SDK defaults to. _submit_encoded never reads this — it
+        # pins return_matrix=True unconditionally — so this is a deliberate
+        # trap: the assertion below fails if that pin is ever wired back to
+        # read this attribute instead.
+        return_matrix = False
 
         class client:
             @staticmethod

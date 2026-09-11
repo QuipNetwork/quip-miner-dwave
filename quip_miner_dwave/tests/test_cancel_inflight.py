@@ -202,8 +202,16 @@ class _Boom(Exception):
     pass
 
 
+# The result-bearing attributes a real dwave.cloud.computation.Future exposes.
+# All of them funnel through Future._load_result, which re-raises whatever
+# exception SAPI reported for the problem, so a faithful double must raise on
+# any of these, not just whichever one answer_view happens to read first.
+_RESULT_ATTRS = {"samples", "energies", "num_occurrences", "variables", "timing"}
+
+
 class CancelledFuture:
-    """A cloud problem SAPI accepted and then cancelled: .samples raises."""
+    """A cloud problem SAPI accepted and then cancelled: every result-bearing
+    attribute raises."""
 
     def done(self) -> bool:
         return False
@@ -211,9 +219,13 @@ class CancelledFuture:
     def cancel(self) -> None:
         pass
 
-    @property
-    def samples(self):
-        raise _Boom("problem cancelled")
+    def __getattr__(self, name):
+        # __getattr__ only runs for attributes not already found, so `record`
+        # still raises AttributeError and answer_view's
+        # getattr(raw, "record", None) probe still returns None cleanly.
+        if name in _RESULT_ATTRS:
+            raise _Boom("problem cancelled")
+        raise AttributeError(name)
 
 
 def _real_mode_sampler(submit_result):
@@ -237,7 +249,6 @@ def _real_mode_sampler(submit_result):
         _encoding_couplers = [(0, 1)]
         _params: dict = {}
         parameters = {"num_reads": None, "annealing_time": None, "label": None}
-        return_matrix = False
         identity = _Identity()
 
         def _format_params(self, type_, params):
@@ -330,10 +341,11 @@ def test_a_cancelled_problem_is_registered_while_live_and_released_after():
     seen = {}
 
     class WatchingFuture(CancelledFuture):
-        @property
-        def samples(self):
-            seen["registered"] = b"\x15" in s._inflight
-            raise _Boom("problem cancelled")
+        def __getattr__(self, name):
+            if name in _RESULT_ATTRS:
+                seen["registered"] = b"\x15" in s._inflight
+                raise _Boom("problem cancelled")
+            raise AttributeError(name)
 
     s = _real_mode_sampler(WatchingFuture())
     with pytest.raises(_Boom):

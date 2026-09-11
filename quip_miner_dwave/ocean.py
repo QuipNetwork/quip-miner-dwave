@@ -2,9 +2,11 @@
 
 Design points carried from ``QPU/dwave_sampler.py``:
 - Thread-pooled async submits (GIL-bound encode/submit off the main path)
-- SampleSet decode happens only after the cloud future completes (not on submit)
+- The answer is read off the cloud future once it completes, never decoded
+  into a SampleSet on the submit path
 - Defect-qubit clamping before submit; reconstruction after decode
-- Real ``device_access_time_us`` extracted from sampleset timing info
+- Real ``device_access_time_us`` comes from the timing info already carried
+  on the future
 
 Offline mode (``QUIP_DWAVE_MOCK=1`` or an injected sampler) uses a dimod
 sampler so unit/conformance tests never hit a real QPU.
@@ -652,8 +654,9 @@ class OceanSampler:
     ) -> SampleResult:
         """Submit one Ising problem and return decoded, reconstructed samples.
 
-        Submit work runs on the thread pool; sampleset decode runs here after
-        the future completes (v0.2 lesson: never decode on the submit path).
+        Submit work runs on the thread pool. The answer is read off the future
+        here, after it completes (v0.2 lesson: never decode on the submit
+        path).
         ``anneal_time_us`` (microseconds) maps directly to D-Wave's
         ``annealing_time`` SAPI parameter; ``None``/``0`` leaves it unset so
         the QPU's hardware-default anneal applies.
