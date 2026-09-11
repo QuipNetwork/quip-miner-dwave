@@ -1,7 +1,5 @@
 # AGENTS.md
 
-This file provides guidance to coding agents working in this repository.
-
 `quip-miner-dwave` is a D-Wave QPU Ising miner for the quip.network v0.3
 mining protocol. It speaks the miner gRPC protocol to a coordinator over a
 Unix socket and samples every job on a real QPU through the Ocean SDK.
@@ -31,7 +29,7 @@ and a conformance job that needs the external `quip-solver-drive` harness:
 QUIP_SOLVER_DRIVE=/path/to/quip-solver-drive pytest quip_miner_dwave/tests/test_conformance.py -v
 ```
 
-`ruff format` is **not** this project's baseline — several files predate it and
+`ruff format` is not this project's baseline — several files predate it and
 reformatting them is churn. Run `ruff check` and `pyright`, not the formatter.
 
 Tests must not touch a real QPU. `QUIP_DWAVE_MOCK=1` (or `--mock`) swaps in a
@@ -43,44 +41,44 @@ problems.
 
 ### The session is one thread, and credits are the throttle
 
-`session_loop.run_session` is the whole protocol: Hello → Welcome → Configure →
-a credit/job cycle, all on one thread reading the coordinator's gRPC stream.
+`session_loop.run_session` is the whole protocol. Hello, then Welcome, then
+Configure, then a credit/job cycle, all on one thread reading the coordinator's gRPC stream.
 Jobs are handed to a `ThreadPoolExecutor` sized to the pipeline depth; every
 other message is handled inline.
 
 **The coordinator dispatches only against credits.** Granting them is how this
 miner says "I am participating" and withholding them is how it sits a round
-out. `Ready` says the session is established; credits say the QPU is working.
+out. `Ready` says the session is established. Credits say the QPU is working.
 They are deliberately separate messages.
 
 Because everything funnels through that one thread, **nothing on it may block**.
 Two bugs of exactly that shape have been fixed (see `test_ledger_contention`,
-`test_budget_cache`), and a sibling miner lost 4-87s per round to the same
+`test_budget_cache`), and a sibling miner lost up to 87 seconds per round to the same
 class of problem (`quip-miner#33`). Do not add IO under `state_lock`.
 
 ### A Cancel is the only round boundary the miner can see
 
 `Cancel(max_generation=N)` is the only monotone round counter the coordinator
-sends, and it arrives every round even while the miner holds no credits. So it
-is where participation is decided, where the reseed watermark is raised, and
-where in-flight work is cancelled. Jobs at or below the watermark are
+sends, and it arrives every round even while the miner holds no credits. That
+makes it the point where participation is decided, where the reseed watermark
+is raised, and where in-flight work is cancelled. Jobs at or below the watermark are
 "abandoned": `_is_abandoned` decides, generation 0 (mempool) never is.
 
 ### The budget is a gate, not a rate limiter
 
-`BudgetPacer.decide` answers one question: is cumulative spend under the flat
-allowance line for this point in the quota period? If yes, the miner
-participates in the **whole next qblock** and spends as fast as the QPU
-allows. Nothing throttles inside a round. Long-run average spend is bounded by
-arithmetic (quota ÷ access time per job), not by pacing.
+`BudgetPacer.decide` answers one question. Is cumulative spend under the flat
+allowance line for this point in the quota period? If it is, the miner
+participates in the **whole next qblock** at full speed. Nothing throttles
+inside a round. The long-run average is bounded by arithmetic, quota divided
+by access time per job, rather than by pacing.
 
 Spend lives in `usage.UsageLedger`, a SQLite file that survives restarts.
 `usage_db` defaults to a shared path, so two miners on one D-Wave account may
 share it — the pacer caches the live period in memory but re-reads on a short
 interval so a sibling's spend is not invisible.
 
-**Two different ledgers, never conflate them:** coordinator *credits* are
-protocol flow control; D-Wave *access time* is money. A job the coordinator
+**Two different ledgers, never conflate them.** Coordinator credits are
+protocol flow control. D-Wave access time is money. A job the coordinator
 throws away still costs quota.
 
 ### Billing rules that are easy to get wrong
@@ -105,13 +103,13 @@ Job proto -> _resolve_problem -> (nodes, h, edges, j) numpy arrays
 ```
 
 `dwave.cloud.coders.encode_problem_as_qp` is the **specification** for that
-payload, not a starting point. `test_qp_encoding` asserts byte equality against
+payload, rather than a starting point. `test_qp_encoding` asserts byte equality against
 it, including at production scale (4577 qubits, 41514 couplers). If you change
 the encoder, that equality is the contract.
 
 Coming back, spins stay in the sampler's `(reads, qubits)` int8 array. The wire
-format is one signed byte per spin, so `row.tobytes()` *is* the payload —
-pinned against `wire.encode_spins`.
+format is one signed byte per spin, so `row.tobytes()` is already the payload.
+`test_spin_encoding` pins that against `wire.encode_spins`.
 
 Every Ocean internal lives in `OceanSampler._submit_encoded` (`Future`,
 `Present`, `client._submit`). Keep it that way: an SDK change should have a
@@ -144,7 +142,7 @@ through.
 
 ## Conventions
 
-- Comments explain *why*, especially why an obvious-looking simplification is
+- Comments explain why, especially why an obvious-looking simplification is
   wrong. Match that density.
 - Tests are named as sentences describing the behaviour, not the function.
 - Changes to billing, cancellation, or the encoder should be mutation-tested:
