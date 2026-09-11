@@ -129,7 +129,7 @@ config, then a built-in default:
   for an unset field.
 
 Operator settings arrive in `Configure.backend_toml`; `budget.DWAVE_CONFIG_KEYS`
-is the accepted set and anything else gets warned about.
+is the accepted set. Anything else gets warned about.
 
 ### Defect clamping
 
@@ -144,7 +144,7 @@ through.
 
 - Comments explain why, especially why an obvious-looking simplification is
   wrong. Match that density.
-- Tests are named as sentences describing the behaviour, not the function.
+- Tests are named as sentences describing the behaviour under test.
 - Changes to billing, cancellation, or the encoder should be mutation-tested:
   revert the fix, confirm a specific test goes red, restore.
 - No LLM attribution trailers in commits.
