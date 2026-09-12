@@ -63,6 +63,9 @@ DWAVE_CONFIG_KEYS = frozenset(
         "anneal_time_us",
         "num_reads",
         "queue_depth",
+        "min_win_probability",
+        "slot_advantage",
+        "explore_fraction",
     }
 )
 
