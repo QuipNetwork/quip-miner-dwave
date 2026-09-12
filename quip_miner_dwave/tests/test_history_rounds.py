@@ -153,7 +153,20 @@ def test_seeded_hourly_rows_never_overwrite_live_ones():
     store.seed_hourly(T0 + 3600, jobs=99, busy_ms=1, access_us=1)
     rows = {r["hour_start_s"]: r for r in store.hourly_rows(T0)}
     assert rows[T0]["source"] == "attempts" and rows[T0]["jobs"] == 40
+    # The live row is unchanged: the seed is silently dropped, not merged.
     assert rows[T0 + 3600]["source"] == "live" and rows[T0 + 3600]["jobs"] == 1
+
+
+def test_seed_hourly_adds_every_directory_in_the_hour_instead_of_only_the_first():
+    # Qblock rounds run about ten minutes, so several attempts directories
+    # share one hour; each must add to the row, not lose to INSERT OR IGNORE.
+    store = HistoryStore(":memory:")
+    store.seed_hourly(T0, jobs=10, busy_ms=9000, access_us=460_000)
+    store.seed_hourly(T0, jobs=10, busy_ms=9000, access_us=460_000)
+    store.seed_hourly(T0, jobs=10, busy_ms=9000, access_us=460_000)
+    (row,) = store.hourly_rows(T0)
+    assert row["source"] == "attempts"
+    assert (row["jobs"], row["busy_ms"], row["access_us_sum"]) == (30, 27_000, 1_380_000)
 
 
 def test_a_recorder_write_failure_is_logged_and_swallowed(caplog):

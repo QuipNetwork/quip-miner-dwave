@@ -424,11 +424,21 @@ class HistoryStore:
             self._db.commit()
 
     def seed_hourly(self, hour_start_s: int, *, jobs: int, busy_ms: int, access_us: int) -> None:
-        """An approximate hour from the attempts file. Never touches a live hour."""
+        """An approximate hour from the attempts file.
+
+        Adds to an existing row seeded by an earlier directory in the same
+        hour; leaves a live row alone. Qblock rounds run about ten minutes,
+        so several directories routinely share one hour.
+        """
         with self._lock:
             self._db.execute(
-                "INSERT OR IGNORE INTO qpu_throughput_hourly (hour_start_s, source, jobs, "
-                "busy_ms, access_us_sum) VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO qpu_throughput_hourly (hour_start_s, source, jobs, "
+                "busy_ms, access_us_sum) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(hour_start_s) DO UPDATE SET "
+                "jobs = jobs + excluded.jobs, "
+                "busy_ms = busy_ms + excluded.busy_ms, "
+                "access_us_sum = access_us_sum + excluded.access_us_sum "
+                "WHERE qpu_throughput_hourly.source = 'attempts'",
                 (hour_start_s, SOURCE_ATTEMPTS, jobs, busy_ms, access_us),
             )
             self._db.commit()
