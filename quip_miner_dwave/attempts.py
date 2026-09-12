@@ -19,7 +19,7 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 from quip_miner_dwave.history import (
     AttemptRoundSummary,
@@ -181,12 +181,27 @@ class SeedReport:
     dirs_skipped: int = 0
 
 
-def seed_from_attempts(store: HistoryStore, attempts_dir: str, now: float) -> SeedReport:
-    """Seed every complete, not-yet-seeded directory. Safe on every start."""
+def seed_from_attempts(
+    store: HistoryStore,
+    attempts_dir: str,
+    now: float,
+    *,
+    stop: Optional[Callable[[], bool]] = None,
+) -> SeedReport:
+    """Seed every complete, not-yet-seeded directory. Safe on every start.
+
+    A node with a thousand-plus attempt directories can take tens of seconds
+    to seed; ``stop`` is checked once per directory, before that directory's
+    writes begin, so a shutdown mid-seed never leaves a directory with its
+    margins written but not marked seeded — that would double-count them on
+    the next start, since ``seed_margin`` is additive.
+    """
     report = SeedReport()
     dirs = _numbered_dirs(Path(attempts_dir))
     # The newest directory is the round in progress; it is picked up later.
     for d in dirs[:-1]:
+        if stop is not None and stop():
+            break
         if store.is_seeded(d.name):
             continue
         path = d / ATTEMPTS_FILE

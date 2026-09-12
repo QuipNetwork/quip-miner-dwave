@@ -8,6 +8,7 @@ made before the chain assigned a qblock id; it is not a round.
 from __future__ import annotations
 
 import dataclasses
+import json
 from pathlib import Path
 
 from quip_miner_dwave.attempts import (
@@ -173,6 +174,49 @@ def test_pickup_outcomes_marks_a_live_round_won():
 def test_default_attempts_dir_sits_beside_the_usage_db():
     assert default_attempts_dir("/data/qpu-usage.db") == "/data/attempts"
     assert default_attempts_dir("/srv/node/data/qpu-usage.db") == "/srv/node/data/attempts"
+
+
+def test_a_stopped_seed_leaves_the_unreached_directory_unmarked(tmp_path):
+    # Seeding over a thousand attempt directories can take tens of seconds; a
+    # shutdown mid-seed must not leave a directory with its margins written
+    # but not marked seeded (they would double-count on the next start).
+    root = tmp_path / "attempts"
+    for name, generation in (("100", 10), ("200", 20), ("300", 30)):
+        d = root / name
+        d.mkdir(parents=True)
+        line = json.dumps(
+            {
+                "ts_ms": 1_000_000 + generation * 1000,
+                "generation": generation,
+                "miner_type": "QPU-DWAVE",
+                "raw_best_energy_milli": -100,
+                "threshold_milli": -50,
+                "accepted": True,
+                "device_access_time_us": 1000,
+            }
+        )
+        (d / "attempts.jsonl").write_text(line + "\n")
+
+    store = HistoryStore(":memory:")
+    calls = 0
+
+    def stop() -> bool:
+        nonlocal calls
+        calls += 1
+        return calls > 1  # let the first directory (100) finish, stop before 200
+
+    report = seed_from_attempts(store, str(root), now=2_000_000, stop=stop)
+
+    assert report.dirs_seeded == 1
+    assert store.is_seeded("100")
+    assert not store.is_seeded("200")  # never reached: unmarked
+    assert not store.is_seeded("300")  # the live round, excluded either way
+    rows = store.rounds(since_ts=0, limit=10)
+    assert [r["generation"] for r in rows] == [10]
+    # 200's margins and hours were never written: a jobs count of 2 here
+    # would mean 200 was seeded despite the stop, and would double on retry.
+    assert sum(store.margin_counts(0).values()) == 1
+    assert sum(r["jobs"] for r in store.hourly_rows(0)) == 1
 
 
 def test_a_missing_directory_seeds_nothing(tmp_path):

@@ -308,10 +308,19 @@ def _bill_unobserved(sampler, pacer: Optional[BudgetPacer]) -> None:
         pacer.record_access_time(owed, time.time())
 
 
-def _seed_history(recorder: HistoryRecorder, attempts_path: str) -> None:
-    """Seed past rounds off the session thread. Best effort by design."""
+def _seed_history(
+    recorder: HistoryRecorder, attempts_path: str, stop: threading.Event
+) -> None:
+    """Seed past rounds off the session thread. Best effort by design.
+
+    A node with a thousand-plus attempt directories can take tens of seconds
+    to seed, so shutdown cannot just wait it out: ``stop`` lets shutdown ask
+    the seed to give up between directories, checked once per directory
+    before that directory's writes begin, so it never leaves margins written
+    for a directory it does not also mark seeded.
+    """
     try:
-        seed_from_attempts(recorder.store, attempts_path, time.time())
+        seed_from_attempts(recorder.store, attempts_path, time.time(), stop=stop.is_set)
     except Exception:  # noqa: BLE001 - history is optional, mining is not
         logger.warning("history: seeding from %s failed", attempts_path, exc_info=True)
 
@@ -624,6 +633,8 @@ def run_session(
     # strict sense: nothing about mining depends on it.
     recorder: Optional[HistoryRecorder] = None
     attempts_path: Optional[str] = None
+    seed_thread: Optional[threading.Thread] = None
+    seed_stop = threading.Event()
     outcome_thread: Optional[threading.Thread] = None
     session_start = time.monotonic()
     best_energy_milli: Optional[int] = None
@@ -784,6 +795,18 @@ def run_session(
                 continue
             out_q.put(reply)
 
+    def _stop_history_threads() -> None:
+        # The seed can take tens of seconds on a node with a thousand-plus
+        # attempt directories, so shutdown asks it to give up between
+        # directories rather than block on it; a bounded join is the
+        # backstop if it is already past that check. Outcome pickup only
+        # ever reads two short directories, so a short join is enough there.
+        if seed_thread is not None:
+            seed_stop.set()
+            seed_thread.join(timeout=5.0)
+        if outcome_thread is not None:
+            outcome_thread.join(timeout=2.0)
+
     exit_code = EXIT_CLEAN
 
     # tonic (Rust) rejects UDS streams whose :authority is the socket path;
@@ -919,13 +942,16 @@ def run_session(
                         attempts_path = attempts_dir or default_attempts_dir(history_path)
                         # Past rounds come from the coordinator's attempts
                         # files, hundreds of megabytes on a long-lived node:
-                        # not work for the session thread.
-                        threading.Thread(
+                        # not work for the session thread. seed_stop lets
+                        # shutdown cut it short between directories rather
+                        # than block on it.
+                        seed_thread = threading.Thread(
                             target=_seed_history,
-                            args=(recorder, attempts_path),
+                            args=(recorder, attempts_path, seed_stop),
                             name="dwave-history-seed",
                             daemon=True,
-                        ).start()
+                        )
+                        seed_thread.start()
             elif which == "topology":
                 topo = cm.topology
                 session_nodes = list(topo.nodes)
@@ -1120,6 +1146,7 @@ def run_session(
         # Last sweep: a charge estimated after the final job's own drain would
         # otherwise die with the process and under-count the period.
         _bill_unobserved(sampler, pending_budget)
+        _stop_history_threads()
         if recorder is not None:
             recorder.close()
         # Signal end-of-outbound so the server can finish draining Results.
@@ -1143,6 +1170,7 @@ def run_session(
             out_q.put(_STOP)
         except Exception:  # noqa: BLE001
             pass
+        _stop_history_threads()
         if recorder is not None:
             recorder.close()
         channel.close()
