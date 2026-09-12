@@ -20,6 +20,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
 
 import numpy as np
@@ -123,6 +124,14 @@ class SampleResult:
     num_reads: int
     defect_info: Optional[DefectInfo] = None
     extra: Dict[str, str] = field(default_factory=dict)
+    # SAPI's own clock: when the problem was accepted and when it was solved.
+    # Their difference is D-Wave's service time, queues included. None when the
+    # answer did not come from the cloud (mock, injected sampler).
+    submitted_on_s: Optional[float] = None
+    solved_on_s: Optional[float] = None
+    # Problems this sampler already had on the QPU when this one was handed
+    # over. With the round trip, Little's law turns it into throughput.
+    inflight_at_submit: int = 0
 
 
 class SupportsSample(Protocol):
@@ -197,6 +206,33 @@ class MockSampler:
             "qpu_sampling_time": elapsed_us,
         }
         return dimod.SampleSet(ss.record, ss.variables, info, ss.vartype)
+
+
+def _parse_sapi_time(raw: Any) -> Optional[float]:
+    """SAPI's ISO-8601 with a trailing Z, as a unix timestamp."""
+    if not isinstance(raw, str):
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def server_timestamps(raw: Any) -> tuple[Optional[float], Optional[float]]:
+    """``(submitted_on, solved_on)`` off a cloud Future, or ``(None, None)``.
+
+    The SDK parks the SAPI problem JSON on ``Future._message`` and never
+    parses these two fields (``time_received`` and ``time_solved`` exist on
+    the class but nothing assigns them). Reading the private attribute is
+    the only way to get D-Wave's service time per job; it is an SDK internal
+    in the same sense as ``_submit_encoded``'s.
+    """
+    message = getattr(raw, "_message", None)
+    if not isinstance(message, dict):
+        return None, None
+    return _parse_sapi_time(message.get("submitted_on")), _parse_sapi_time(
+        message.get("solved_on")
+    )
 
 
 class OceanSampler:
@@ -670,6 +706,10 @@ class OceanSampler:
         nodes, h, edges, j, defect_info = self._clamp_defects(
             nodes, h, edges, j, nonce_seed
         )
+        # Counted before the hand-off rather than inside _submit_encoded, so
+        # the number needs no SDK object to carry it back.
+        with self._inflight_lock:
+            inflight_before = len(self._inflight)
         # Thread-pooled submit
         fut = self._submit_pool.submit(
             self._submit_sync,
@@ -703,11 +743,19 @@ class OceanSampler:
                 self._release_inflight(cancel_key)
         access_us = view.access_time_us
         self._observe_access_us(access_us)
+        submitted_on_s, solved_on_s = server_timestamps(raw)
 
         spins, variables, energies = reconstruct_samples(
             view.spins, view.variables, view.energies, defect_info
         )
         reads_done = view.reads
+
+        # SamplerMeta.extra is the one channel that crosses handle_job into
+        # the session loop, which is where the history is written. The
+        # coordinator ignores keys it does not know.
+        extra = {"mock": "1" if self._is_mock else "0", "inflight": str(inflight_before)}
+        if submitted_on_s is not None and solved_on_s is not None:
+            extra["sapi_ms"] = str(int(round((solved_on_s - submitted_on_s) * 1000)))
 
         return SampleResult(
             spins=spins,
@@ -716,5 +764,8 @@ class OceanSampler:
             device_access_time_us=access_us,
             num_reads=reads_done,
             defect_info=defect_info,
-            extra={"mock": "1" if self._is_mock else "0"},
+            extra=extra,
+            submitted_on_s=submitted_on_s,
+            solved_on_s=solved_on_s,
+            inflight_at_submit=inflight_before,
         )
