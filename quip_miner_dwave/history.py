@@ -18,9 +18,12 @@ a busy day is up to ~150k jobs and the estimator only ever wants aggregates.
 
 from __future__ import annotations
 
+import functools
 import logging
 import sqlite3
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -161,6 +164,29 @@ class JobSample:
     sapi_ms: Optional[int] = None
 
 
+@dataclass(frozen=True)
+class AttemptRoundSummary:
+    """One round as the coordinator's attempts file describes it."""
+
+    generation: int
+    first_ts_s: int
+    last_ts_s: int
+    jobs: int
+    hits_coord: int
+    won: bool
+    best_energy_milli: Optional[int]
+    threshold_milli: Optional[int]
+    access_us: int
+    # (day_start_s, margin_unit) -> jobs, for the histogram seed.
+    margins: Dict[Tuple[int, int], int]
+
+
+# How far before the first attempt a live round may have opened. A Cancel
+# precedes its first result by the pipeline's fill time, never by hours; a
+# later coordinator run reusing the same generation number is outside this.
+_ROUND_MATCH_WINDOW_S = 2 * SECONDS_PER_HOUR
+
+
 class HistoryStore:
     """SQLite record of throughput, rounds and margins. One lock, one file."""
 
@@ -289,6 +315,284 @@ class HistoryStore:
             ).fetchall()
         return {int(r["margin_unit"]): int(r["jobs"]) for r in rows}
 
+    # -- rounds ---------------------------------------------------------
+
+    def open_round(
+        self,
+        start_ts: float,
+        generation: int,
+        *,
+        joined: bool,
+        reason: str,
+        p_win: Optional[float],
+        expected_jobs: Optional[float],
+    ) -> None:
+        with self._lock:
+            self._db.execute(
+                "INSERT OR REPLACE INTO miner_rounds (start_ts_s, generation, source, "
+                "joined, reason, p_win, expected_jobs) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (int(start_ts), generation, SOURCE_LIVE, int(joined), reason, p_win, expected_jobs),
+            )
+            self._db.commit()
+
+    def close_round(self, start_ts: float, end_ts: float) -> None:
+        with self._lock:
+            self._db.execute(
+                "UPDATE miner_rounds SET end_ts_s = ? WHERE start_ts_s = ? AND end_ts_s IS NULL",
+                (int(end_ts), int(start_ts)),
+            )
+            self._db.commit()
+
+    def set_round_target(self, start_ts: float, target_milli: int) -> None:
+        with self._lock:
+            self._db.execute(
+                "UPDATE miner_rounds SET target_milli = ? WHERE start_ts_s = ?",
+                (target_milli, int(start_ts)),
+            )
+            self._db.commit()
+
+    def find_live_round(self, generation: int, near_ts: float) -> Optional[int]:
+        """The live round of ``generation`` that opened shortly before ``near_ts``."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT start_ts_s FROM miner_rounds WHERE generation = ? AND source = ? "
+                "AND start_ts_s BETWEEN ? AND ? ORDER BY start_ts_s DESC LIMIT 1",
+                (generation, SOURCE_LIVE, int(near_ts) - _ROUND_MATCH_WINDOW_S, int(near_ts)),
+            ).fetchone()
+        return int(row["start_ts_s"]) if row is not None else None
+
+    def apply_attempt_round(
+        self, summary: AttemptRoundSummary, *, insert_missing: bool
+    ) -> str:
+        """Fold an attempts-file round in: outcomes onto a live row, or a new row.
+
+        Returns ``"updated"``, ``"inserted"`` or ``"skipped"``.
+        """
+        live = self.find_live_round(summary.generation, summary.first_ts_s)
+        with self._lock:
+            if live is not None:
+                self._db.execute(
+                    "UPDATE miner_rounds SET hits_coord = ?, won = MAX(won, ?) "
+                    "WHERE start_ts_s = ?",
+                    (summary.hits_coord, int(summary.won), live),
+                )
+                self._db.commit()
+                return "updated"
+            if not insert_missing:
+                return "skipped"
+            self._db.execute(
+                "INSERT OR IGNORE INTO miner_rounds (start_ts_s, generation, source, "
+                "end_ts_s, target_milli, joined, reason, jobs, hits, hits_coord, "
+                "best_energy_milli, access_us, won) "
+                "VALUES (?, ?, ?, ?, ?, 1, 'attempts', ?, ?, ?, ?, ?, ?)",
+                (
+                    summary.first_ts_s,
+                    summary.generation,
+                    SOURCE_ATTEMPTS,
+                    summary.last_ts_s,
+                    summary.threshold_milli,
+                    summary.jobs,
+                    summary.hits_coord,
+                    summary.hits_coord,
+                    summary.best_energy_milli,
+                    summary.access_us,
+                    int(summary.won),
+                ),
+            )
+            self._db.commit()
+            return "inserted"
+
+    def rounds(self, since_ts: float, limit: Optional[int] = None) -> List[sqlite3.Row]:
+        sql = "SELECT * FROM miner_rounds WHERE start_ts_s >= ? ORDER BY start_ts_s DESC"
+        params: Tuple[object, ...] = (int(since_ts),)
+        if limit is not None:
+            sql += " LIMIT ?"
+            params = (int(since_ts), int(limit))
+        with self._lock:
+            return self._db.execute(sql, params).fetchall()
+
+    # -- seeding --------------------------------------------------------
+
+    def seed_margin(self, day_start_s: int, margin: int, jobs: int) -> None:
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO energy_margin_daily (day_start_s, margin_unit, jobs) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(day_start_s, margin_unit) DO UPDATE SET jobs = jobs + excluded.jobs",
+                (day_start_s, margin, jobs),
+            )
+            self._db.commit()
+
+    def seed_hourly(self, hour_start_s: int, *, jobs: int, busy_ms: int, access_us: int) -> None:
+        """An approximate hour from the attempts file. Never touches a live hour."""
+        with self._lock:
+            self._db.execute(
+                "INSERT OR IGNORE INTO qpu_throughput_hourly (hour_start_s, source, jobs, "
+                "busy_ms, access_us_sum) VALUES (?, ?, ?, ?, ?)",
+                (hour_start_s, SOURCE_ATTEMPTS, jobs, busy_ms, access_us),
+            )
+            self._db.commit()
+
+    def is_seeded(self, dir_name: str) -> bool:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT 1 FROM seeded_dirs WHERE dir_name = ?", (dir_name,)
+            ).fetchone()
+        return row is not None
+
+    def mark_seeded(self, dir_name: str, lines: int) -> None:
+        with self._lock:
+            self._db.execute(
+                "INSERT OR REPLACE INTO seeded_dirs (dir_name, lines_seen) VALUES (?, ?)",
+                (dir_name, lines),
+            )
+            self._db.commit()
+
     def close(self) -> None:
         with self._lock:
             self._db.close()
+
+
+# How long a recorder stays quiet after logging a failure. Every job would
+# otherwise repeat the same warning at pipeline speed.
+_WARN_INTERVAL_S = 60.0
+
+
+class HistoryRecorder:
+    """The session loop's view of the history: never raises, never blocks it.
+
+    Every store write is queued to one worker thread. Job workers call in
+    after billing, and the session thread calls in at Cancel and SetTarget;
+    neither waits on SQLite, and the single thread keeps writes in order, so
+    a round is opened before its jobs are folded in. A failure costs a row of
+    history and nothing else. The busy clock and the generation-to-round map
+    live here because the store has no notion of "the current round".
+    """
+
+    def __init__(self, store: HistoryStore):
+        self.store = store
+        self._lock = threading.Lock()
+        self._clock = BusyClock()
+        self._last_cancel_generation = 0
+        self._open_start: Optional[int] = None
+        # Job generation -> round start, kept for the last few rounds so a
+        # result that lands after its boundary still finds its row.
+        self._round_starts: Dict[int, int] = {}
+        self._warned_at = 0.0
+        self._closed = False
+        self._io = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dwave-history")
+
+    @classmethod
+    def open(cls, path: str) -> Optional["HistoryRecorder"]:
+        try:
+            return cls(HistoryStore(path))
+        except Exception as exc:  # noqa: BLE001 - history is optional, mining is not
+            logger.warning("history disabled: cannot open %s: %s", path, exc)
+            return None
+
+    def _submit(self, what: str, fn) -> None:
+        if self._closed:
+            return
+        try:
+            self._io.submit(self._run, what, fn)
+        except RuntimeError:
+            # The executor is shut down: the session is ending.
+            pass
+
+    def _run(self, what: str, fn) -> None:
+        try:
+            fn()
+        except Exception as exc:  # noqa: BLE001 - see class docstring
+            now = time.monotonic()
+            if now - self._warned_at >= _WARN_INTERVAL_S:
+                self._warned_at = now
+                logger.warning("history: %s failed: %s", what, exc)
+
+    def flush(self) -> None:
+        """Wait for every queued write. Tests and shutdown use it."""
+        if self._closed:
+            return
+        self._io.submit(lambda: None).result()
+
+    def job_started(self, now: float) -> None:
+        with self._lock:
+            self._clock.start(now)
+
+    def job_finished(self, now: float) -> None:
+        with self._lock:
+            pieces = self._clock.stop(now)
+        if pieces:
+            self._submit("busy time", functools.partial(self.store.add_busy, pieces))
+
+    def record_job(self, sample: JobSample) -> None:
+        with self._lock:
+            start = self._round_starts.get(sample.generation)
+        self._submit("job sample", functools.partial(self.store.record_job, sample, start))
+
+    def record_wasted(self, now: float) -> None:
+        self._submit("wasted job", functools.partial(self.store.record_wasted, now))
+
+    def round_boundary(
+        self,
+        cancel_generation: int,
+        now: float,
+        *,
+        joined: bool,
+        reason: str,
+        p_win: Optional[float],
+        expected_jobs: Optional[float],
+    ) -> bool:
+        """Close the open round and open the next. False when not a fresh boundary.
+
+        ``Cancel(max_generation=N)`` names the generation the coordinator has
+        just abandoned. The jobs of the round it opens carry ``N + 1``, which
+        is also the generation the coordinator writes to attempts.jsonl, so
+        the row is keyed by that and not by the watermark.
+        """
+        generation = cancel_generation + 1
+        with self._lock:
+            if cancel_generation <= self._last_cancel_generation:
+                return False
+            self._last_cancel_generation = cancel_generation
+            previous = self._open_start
+            start = int(now)
+            self._open_start = start
+            self._round_starts[generation] = start
+            for old in [g for g in self._round_starts if g < generation - 4]:
+                del self._round_starts[old]
+        if previous is not None:
+            self._submit("round close", functools.partial(self.store.close_round, previous, now))
+        self._submit(
+            "round open",
+            functools.partial(
+                self.store.open_round,
+                start,
+                generation,
+                joined=joined,
+                reason=reason,
+                p_win=p_win,
+                expected_jobs=expected_jobs,
+            ),
+        )
+        return True
+
+    def round_target(self, target_milli: int) -> None:
+        with self._lock:
+            start = self._open_start
+        if start is not None:
+            self._submit(
+                "round target",
+                functools.partial(self.store.set_round_target, start, target_milli),
+            )
+
+    def close(self) -> None:
+        """Drain the queue and close the store. Safe to call twice."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        self._io.shutdown(wait=True)
+        try:
+            self.store.close()
+        except Exception as exc:  # noqa: BLE001 - nothing left to protect
+            logger.warning("history: close failed: %s", exc)
