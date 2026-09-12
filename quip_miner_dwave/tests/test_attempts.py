@@ -1,0 +1,181 @@
+"""Seeding history from the coordinator's attempts files.
+
+Fixture directories are real rounds cut from qpu-1 on 2026-09-11: 1335 (no
+win) and 813 (one win). ``pending`` is the coordinator's name for attempts
+made before the chain assigned a qblock id; it is not a round.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+from pathlib import Path
+
+from quip_miner_dwave.attempts import (
+    Attempt,
+    default_attempts_dir,
+    hourly_from_attempts,
+    parse_attempt,
+    pickup_outcomes,
+    read_attempts,
+    seed_from_attempts,
+    summarise_rounds,
+)
+from quip_miner_dwave.history import HistoryStore
+
+FIXTURES = Path(__file__).parent / "fixtures" / "attempts"
+NOW = 1789178400  # after the newest fixture round
+DAY_813 = 1788825600
+HOUR_813 = 1788890400
+
+
+def _win_line() -> str:
+    return (FIXTURES / "813" / "attempts.jsonl").read_text().splitlines()[3]
+
+
+def _attempt(ts_s: float, generation: int = 1) -> Attempt:
+    return Attempt(
+        ts_ms=int(ts_s * 1000),
+        generation=generation,
+        miner_type="QPU-DWAVE",
+        raw_best_energy_milli=-14_400_000,
+        threshold_milli=-14_500_000,
+        accepted=False,
+        won=False,
+        device_access_time_us=46_000,
+    )
+
+
+def test_parse_attempt_reads_the_coordinator_fields():
+    assert parse_attempt(_win_line()) == Attempt(
+        ts_ms=1788893124504,
+        generation=382,
+        miner_type="QPU-DWAVE",
+        raw_best_energy_milli=-14_550_000,
+        threshold_milli=-14_546_432,
+        accepted=True,
+        won=True,
+        device_access_time_us=46_055,
+    )
+
+
+def test_malformed_and_incomplete_lines_are_skipped():
+    assert parse_attempt("not json") is None
+    assert parse_attempt("[]") is None
+    assert parse_attempt('{"ts_ms": 1}') is None
+    assert parse_attempt("") is None
+
+
+def test_only_qpu_attempts_count():
+    att = parse_attempt(_win_line())
+    assert att is not None and att.is_qpu
+    assert not dataclasses.replace(att, miner_type="CPU").is_qpu
+    assert not dataclasses.replace(att, miner_type="").is_qpu
+
+
+def test_attempts_group_into_rounds_by_generation():
+    attempts, lines = read_attempts(FIXTURES / "813" / "attempts.jsonl")
+    assert lines == 6
+    (r,) = summarise_rounds(attempts)
+    assert (r.generation, r.first_ts_s, r.last_ts_s) == (382, 1788893117, 1788893124)
+    assert (r.jobs, r.hits_coord, r.won) == (6, 1, True)
+    assert r.best_energy_milli == -14_550_000
+    assert r.threshold_milli == -14_546_432
+    assert r.access_us == 276_359
+    assert r.margins == {
+        (DAY_813, -3): 1,
+        (DAY_813, 173): 1,
+        (DAY_813, 181): 1,
+        (DAY_813, 237): 1,
+        (DAY_813, 243): 1,
+        (DAY_813, 299): 1,
+    }
+
+
+def test_two_generations_in_one_file_are_two_rounds():
+    attempts, _ = read_attempts(FIXTURES / "813" / "attempts.jsonl")
+    later = [dataclasses.replace(a, generation=383, ts_ms=a.ts_ms + 600_000) for a in attempts]
+    rounds = summarise_rounds(attempts + later)
+    assert [r.generation for r in rounds] == [382, 383]
+    assert rounds[1].first_ts_s == rounds[0].first_ts_s + 600
+
+
+def test_busy_time_from_attempts_ends_a_segment_at_a_long_gap():
+    base = HOUR_813
+    rows = hourly_from_attempts(
+        [_attempt(base + 1), _attempt(base + 3), _attempt(base + 100), _attempt(base + 3599), _attempt(base + 3601)],
+        before_hour=base + 7200,
+    )
+    # 1->3 counts (2 s). 3->100 and 100->3599 are parks. 3599->3601 straddles
+    # the hour: one second lands in each.
+    assert rows[base] == (4, 3000, 4 * 46_000)
+    assert rows[base + 3600] == (1, 1000, 46_000)
+
+
+def test_hours_from_the_current_hour_on_are_left_to_the_live_recorder():
+    base = HOUR_813
+    assert hourly_from_attempts([_attempt(base + 1), _attempt(base + 2)], before_hour=base) == {}
+
+
+def test_seed_inserts_only_complete_directories():
+    store = HistoryStore(":memory:")
+    report = seed_from_attempts(store, str(FIXTURES), now=NOW)
+    assert (report.dirs_seeded, report.rounds_inserted, report.rounds_updated) == (1, 1, 0)
+    # 1335 is the newest numeric directory: the live round, not history yet.
+    # ``pending`` is not a round at all.
+    rows = store.rounds(since_ts=0, limit=10)
+    assert [r["generation"] for r in rows] == [382]
+    row = rows[0]
+    assert row["source"] == "attempts" and row["joined"] == 1
+    assert (row["jobs"], row["hits"], row["hits_coord"], row["won"]) == (6, 1, 1, 1)
+    assert row["target_milli"] == -14_546_432 and row["end_ts_s"] == 1788893124
+    assert store.margin_counts(0) == {-3: 1, 173: 1, 181: 1, 237: 1, 243: 1, 299: 1}
+    (hour,) = store.hourly_rows(0)
+    assert hour["hour_start_s"] == HOUR_813 and hour["source"] == "attempts"
+    assert hour["jobs"] == 6 and hour["access_us_sum"] == 276_359
+    assert 6000 <= hour["busy_ms"] <= 8000  # six completions over ~7 s
+    assert store.is_seeded("813") and not store.is_seeded("1335")
+
+
+def test_seed_is_idempotent():
+    store = HistoryStore(":memory:")
+    seed_from_attempts(store, str(FIXTURES), now=NOW)
+    again = seed_from_attempts(store, str(FIXTURES), now=NOW)
+    assert (again.dirs_seeded, again.rounds_inserted, again.rounds_updated) == (0, 0, 0)
+    assert len(store.rounds(since_ts=0, limit=10)) == 1
+    assert store.margin_counts(0)[-3] == 1
+    assert store.hourly_rows(0)[0]["jobs"] == 6
+
+
+def test_seed_skips_a_directory_the_live_recorder_covered():
+    store = HistoryStore(":memory:")
+    store.open_round(1788893110, 382, joined=True, reason="budget", p_win=None, expected_jobs=None)
+    report = seed_from_attempts(store, str(FIXTURES), now=NOW)
+    assert (report.rounds_inserted, report.rounds_updated) == (0, 1)
+    (row,) = store.rounds(since_ts=0, limit=10)
+    assert row["source"] == "live" and row["won"] == 1 and row["hits_coord"] == 1
+    # The live recorder already wrote this round's margins and hours.
+    assert store.margin_counts(0) == {}
+    assert store.hourly_rows(0) == []
+
+
+def test_pickup_outcomes_marks_a_live_round_won():
+    store = HistoryStore(":memory:")
+    store.open_round(1789178290, 58, joined=True, reason="budget", p_win=None, expected_jobs=None)
+    store.open_round(1788893110, 382, joined=True, reason="budget", p_win=None, expected_jobs=None)
+    assert pickup_outcomes(store, str(FIXTURES)) == 2
+    rows = {r["generation"]: r for r in store.rounds(since_ts=0, limit=10)}
+    assert rows[382]["won"] == 1 and rows[382]["hits_coord"] == 1
+    assert rows[58]["won"] == 0 and rows[58]["hits_coord"] == 0
+    # Outcomes only: nothing is inserted for a round the miner never saw.
+    assert len(rows) == 2
+
+
+def test_default_attempts_dir_sits_beside_the_usage_db():
+    assert default_attempts_dir("/data/qpu-usage.db") == "/data/attempts"
+    assert default_attempts_dir("/srv/node/data/qpu-usage.db") == "/srv/node/data/attempts"
+
+
+def test_a_missing_directory_seeds_nothing(tmp_path):
+    report = seed_from_attempts(HistoryStore(":memory:"), str(tmp_path / "nope"), now=NOW)
+    assert (report.dirs_seeded, report.rounds_inserted) == (0, 0)
+    assert pickup_outcomes(HistoryStore(":memory:"), str(tmp_path / "nope")) == 0
