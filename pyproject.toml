@@ -27,7 +27,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "pytest-asyncio"]
+dev = ["pytest", "pytest-asyncio", "hypothesis"]
 
 # Console entry point matches the code's prog name and the coordinator's
 # default binary for the dwave backend.
