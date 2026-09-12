@@ -180,6 +180,10 @@ that comparison. The verdict order is explore, saturated, below minimum,
 better slot, good shot, and it is pinned by mutation tests in
 `test_decide_round.py`.
 
+`scripts/probe_timestamps.py` runs one two-qubit job on the live QPU and
+prints the SAPI timestamps that the history's queue-wait split depends on.
+It exits 1 when they are missing.
+
 ### Precedence ladders
 
 Two settings resolve through the same shape — job, then session, then operator
