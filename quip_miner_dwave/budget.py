@@ -15,9 +15,11 @@ Mining is allowed while cumulative spend sits under that line. Spend comes from
 D-Wave's own quota semantics: a fixed day of the month, UTC, clamped to the
 month's length.
 
-Because spend only ever runs a fraction of a qblock past the line before the
-gate shuts, and the line keeps rising, the miner idles for one qblock at a time
-rather than one night at a time.
+The line is consulted at qblock boundaries only: a joined round runs to its
+end, and the miner then sits out boundaries until the rising line has covered
+what that round cost. So the miner idles for a handful of qblocks at a time
+rather than one night at a time. Mid-round, the one thing that stops it is the
+period's whole allotment being spent.
 """
 
 from __future__ import annotations
@@ -63,9 +65,8 @@ DWAVE_CONFIG_KEYS = frozenset(
         "anneal_time_us",
         "num_reads",
         "queue_depth",
-        "min_win_probability",
-        "slot_advantage",
-        "explore_fraction",
+        "min_throughput_advantage",
+        "participation_chance",
     }
 )
 
@@ -153,6 +154,11 @@ class ParticipationDecision:
     seconds_until_headroom: float
     # Allowance earned per wall second: the budget spread flat over the period.
     accrual_us_per_s: float = 0.0
+    # The whole period's allotment, and whether spend has reached it. Past
+    # that point every submission would come back rejected, so it is the
+    # one thing that stops a round the miner already joined.
+    budget_us: float = 0.0
+    exhausted: bool = False
 
 
 class BudgetPacer:
@@ -246,6 +252,8 @@ class BudgetPacer:
             period_end=end,
             seconds_until_headroom=until,
             accrual_us_per_s=rate_us_per_s,
+            budget_us=budget_us,
+            exhausted=spent_us >= budget_us,
         )
 
     def record_access_time(self, qpu_access_time_us: float, now: float) -> None:

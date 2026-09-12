@@ -26,3 +26,4 @@ qpu-1-logs/
 .dolt/
 *.db
 .beads/
+.beads-credential-key

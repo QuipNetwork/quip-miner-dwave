@@ -150,47 +150,64 @@ manager renders it. `--attempts-dir PATH` overrides it. Seeding and outcome
 pickup keep only the lines for `--miner-id`, so a node running more than
 one QPU miner does not absorb a sibling miner's history.
 
-`quip-dwave-qa --profile [--usage-db PATH]` prints the hour-of-week grid of
-jobs per second, the grid of D-Wave queue wait, the win summary for
-weekdays and weekends, the win model, and the last 20 rounds with the
-strategy's predicted win probability beside what happened. It needs no QPU
-and no token. `--usage-db` applies to `--profile` only. A session reads the
-coordinator's `usage_db` key instead.
+`quip-dwave-qa --profile [--usage-db PATH]` prints a grid of jobs per
+second by day of the month and hour of the day, the hour factors and the
+day factors behind it, a grid of D-Wave queue wait, the round totals, and the last 20
+rounds with the jobs the strategy expected beside what happened. It needs
+no QPU and no token. `--usage-db` applies to `--profile` only. A session
+reads the coordinator's `usage_db` key instead.
 
 ## The round strategy
 
 At every qblock boundary the budget decides first whether the miner can
 afford the round. When it can, one function decides whether this round is
-worth the headroom or whether a better hour of the week is worth waiting
-for. It reads a snapshot of the history: throughput per hour of the week,
-the round length, the QPU time per job, and a per-job win rate learned
-from the margin histogram and the rounds the miner won.
+worth joining or whether the funds should wait for a faster hour. It reads
+a snapshot of the history: throughput per slot, the round length, and the
+QPU time per job. A joined round runs to its end. The budget line is a
+target for the month and is consulted at boundaries only. The one thing
+that stops a round in progress is the period's whole allotment being spent.
 
-Banking headroom pays only when it buys more at a later round than it buys
-now, and only while banking is still possible. Once the headroom exceeds
-what any round can spend, or the period is about to reset, waiting throws
-QPU time away, so the miner joins. The verdict and its numbers are one log
-line per boundary.
+Winning a round depends on the round's difficulty, which the protocol sets
+and the miner cannot see ahead, and on how many models the QPU evaluates
+while the round is open. Only the second varies with time, so the strategy
+compares slots by deliverable jobs and nothing else. More jobs per round is
+more of the search space covered.
 
-Three `[dwave]` keys tune it. The defaults change nothing until history
+A slot is an hour of the day on a day of the month. D-Wave accounts run on
+monthly contracts, so the shared queue follows the month as well as the
+working day. Months of 28 to 31 days map onto 28 bins, so every month fills
+every bin. The estimate for each of the 672 cells is the global rate times
+an hour-of-day factor times a day-of-month factor. A cell with enough jobs
+of its own shrinks toward that prediction instead of replacing it. This is
+the multiplicative main-effects model that call-center forecasting uses for
+arrival rates by day and time of day.
+
+A join costs a whole round at this slot's rate, and the funds the rest of
+the period will have, the headroom now plus the accrual until the reset,
+cover only some of the rounds left in it. The best use of a fixed allotment
+across hours of varying rate is to spend it in the fastest ones. The
+decision ranks the remaining rounds by the jobs each would deliver, walks
+down until their cost exhausts the funds, and calls that slot's jobs the
+bar. It joins when this round's jobs clear the bar, within a tolerance. The
+verdict and its numbers are one log line per boundary.
+
+Two `[dwave]` keys tune it. The defaults change nothing until history
 exists.
 
 ```toml
-min_win_probability = 0.0   # skip a round below this P(win) while banking is possible
-slot_advantage = 0.25       # defer when a later slot buys 25% more P(win) from the same headroom
-explore_fraction = 0.10     # join this share of rounds regardless, so every slot stays measured
+min_throughput_advantage = 0.25  # skip a round only when the bar sits more than 25% above its jobs
+participation_chance = 0.10      # join this share of rounds regardless, so every slot keeps getting measured
 ```
 
 The `reason` column in `--profile` and the strategy's log line name the verdict with one of these strings:
 
 - `no-data`: no history yet, so every round the budget allows is joined.
-- `explore`: the explore share drew this round regardless of the verdict below.
-- `saturated`: banking is no longer possible, so the round is joined.
-- `below-min-p`: this round's P(win) is below `min_win_probability`, so it is skipped.
-- `better-slot`: a later slot buys more P(win) from the same headroom, so this round is skipped.
-- `good-shot`: none of the above applies, so the round is joined.
+- `explore`: the participation chance drew this round regardless of the verdict below.
+- `saturated`: the funds cover every round left in the period, so the round is joined.
+- `fast-slot`: this round clears the bar, so it is joined.
+- `slow-slot`: this round is under the bar, so it is skipped and the funds wait for a faster hour.
 
-Three reasons predate the strategy and still appear where it plays no part: `budget` (the budget allowed the round and no strategy is attached yet), `budget-sat-out` (the budget line was crossed, before any strategy is consulted), and `unbudgeted` (no budget is configured, so every round is joined).
+Three reasons predate the strategy and still appear where it plays no part: `budget` (the budget allowed the round and no strategy is attached yet), `budget-sat-out` (spend is past the budget line, so the miner sits the round out before any strategy is consulted), and `unbudgeted` (no budget is configured, so every round is joined).
 
 ## Tests
 

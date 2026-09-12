@@ -154,7 +154,7 @@ def test_seed_is_idempotent():
 
 def test_seed_skips_a_directory_the_live_recorder_covered():
     store = HistoryStore(":memory:")
-    store.open_round(1788893110, 382, joined=True, reason="budget", p_win=None, expected_jobs=None)
+    store.open_round(1788893110, 382, joined=True, reason="budget", expected_jobs=None)
     report = seed_from_attempts(store, str(FIXTURES), now=NOW)
     assert (report.rounds_inserted, report.rounds_updated) == (0, 1)
     (row,) = store.rounds(since_ts=0, limit=10)
@@ -166,8 +166,8 @@ def test_seed_skips_a_directory_the_live_recorder_covered():
 
 def test_pickup_outcomes_marks_a_live_round_won():
     store = HistoryStore(":memory:")
-    store.open_round(1789178290, 58, joined=True, reason="budget", p_win=None, expected_jobs=None)
-    store.open_round(1788893110, 382, joined=True, reason="budget", p_win=None, expected_jobs=None)
+    store.open_round(1789178290, 58, joined=True, reason="budget", expected_jobs=None)
+    store.open_round(1788893110, 382, joined=True, reason="budget", expected_jobs=None)
     assert pickup_outcomes(store, str(FIXTURES)) == 2
     rows = {r["generation"]: r for r in store.rounds(since_ts=0, limit=10)}
     assert rows[382]["won"] == 1 and rows[382]["hits_coord"] == 1

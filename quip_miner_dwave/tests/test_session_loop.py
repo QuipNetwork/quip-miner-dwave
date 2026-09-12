@@ -108,7 +108,7 @@ def test_progress_line_matches_the_shared_format(caplog):
     assert caplog.records[0].levelno == logging.INFO
 
 
-def _decision(headroom_s, until_s=0.0, spent_s=0.0, allowance_s=0.0):
+def _decision(headroom_s, until_s=0.0, spent_s=0.0, allowance_s=0.0, budget_s=3000.0):
     from quip_miner_dwave.budget import ParticipationDecision
 
     return ParticipationDecision(
@@ -119,6 +119,8 @@ def _decision(headroom_s, until_s=0.0, spent_s=0.0, allowance_s=0.0):
         period_start=0.0,
         period_end=0.0,
         seconds_until_headroom=until_s,
+        budget_us=budget_s * 1_000_000,
+        exhausted=spent_s >= budget_s,
     )
 
 
@@ -144,15 +146,14 @@ def test_sitting_out_a_qblock_reports_the_next_window(caplog):
     assert [r.levelname for r in caplog.records] == ["INFO"]
 
 
-def test_crossing_the_line_mid_qblock_logs_the_overshoot_and_the_wait(caplog):
-    from quip_miner_dwave.session_loop import _log_line_crossed
+def test_spending_the_allotment_mid_qblock_logs_the_spend_and_the_reset(caplog):
+    from quip_miner_dwave.session_loop import _log_allotment_spent
 
     caplog.set_level(logging.DEBUG)
-    _log_line_crossed(_decision(-12.0, until_s=300.0))
-    assert "budget line crossed mid-qblock" in caplog.text
-    assert "12s over" in caplog.text
-    assert "next window in 5m 0s" in caplog.text
-    assert "rejoins at the qblock after that" in caplog.text
+    _log_allotment_spent(_decision(-2000.0, until_s=300.0, spent_s=3000.0, budget_s=3000.0))
+    assert "period allotment spent mid-qblock" in caplog.text
+    assert "3000s of 3000s" in caplog.text
+    assert "after the reset in 5m 0s" in caplog.text
     assert [r.levelname for r in caplog.records] == ["INFO"]
 
 

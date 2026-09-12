@@ -49,23 +49,23 @@ def _summary(generation: int, first: int, **kw) -> AttemptRoundSummary:
 
 def test_a_boundary_closes_the_previous_round_and_opens_the_next():
     store = HistoryStore(":memory:")
-    store.open_round(T0, 5, joined=True, reason="budget", p_win=None, expected_jobs=None)
+    store.open_round(T0, 5, joined=True, reason="budget", expected_jobs=None)
     store.close_round(T0, T0 + 600)
-    store.open_round(T0 + 600, 6, joined=False, reason="budget-sat-out", p_win=0.02, expected_jobs=0.0)
+    store.open_round(T0 + 600, 6, joined=False, reason="budget-sat-out", expected_jobs=0.0)
     rows = store.rounds(since_ts=0, limit=10)
     assert [(r["generation"], r["end_ts_s"], r["joined"]) for r in rows] == [
         (6, None, 0),
         (5, T0 + 600, 1),
     ]
-    assert rows[0]["p_win"] == 0.02
+    assert rows[0]["expected_jobs"] == 0.0
 
 
 def test_jobs_attribute_to_their_generation_s_round():
     # Cancel(5) abandons generation 5 and opens the round whose jobs carry 6,
     # which is the generation the coordinator writes to attempts.jsonl.
     rec = HistoryRecorder(HistoryStore(":memory:"))
-    rec.round_boundary(5, T0, joined=True, reason="budget", p_win=None, expected_jobs=None)
-    rec.round_boundary(6, T0 + 600, joined=True, reason="budget", p_win=None, expected_jobs=None)
+    rec.round_boundary(5, T0, joined=True, reason="budget", expected_jobs=None)
+    rec.round_boundary(6, T0 + 600, joined=True, reason="budget", expected_jobs=None)
     # A generation-6 result landing after Cancel(6) still belongs to round 6.
     rec.record_job(_sample(6, T0 + 601, best=-14_560_000, hits=2))
     rec.record_job(_sample(7, T0 + 602))
@@ -80,9 +80,9 @@ def test_jobs_attribute_to_their_generation_s_round():
 
 def test_a_repeated_watermark_is_not_a_new_round():
     rec = HistoryRecorder(HistoryStore(":memory:"))
-    assert rec.round_boundary(5, T0, joined=True, reason="budget", p_win=None, expected_jobs=None)
-    assert not rec.round_boundary(5, T0 + 1, joined=True, reason="budget", p_win=None, expected_jobs=None)
-    assert not rec.round_boundary(4, T0 + 2, joined=True, reason="budget", p_win=None, expected_jobs=None)
+    assert rec.round_boundary(5, T0, joined=True, reason="budget", expected_jobs=None)
+    assert not rec.round_boundary(5, T0 + 1, joined=True, reason="budget", expected_jobs=None)
+    assert not rec.round_boundary(4, T0 + 2, joined=True, reason="budget", expected_jobs=None)
     rec.flush()
     assert len(rec.store.rounds(since_ts=0, limit=10)) == 1
 
@@ -93,8 +93,8 @@ def test_two_boundaries_in_the_same_second_open_two_rounds():
     # start_ts_s is the primary key: two rounds sharing one would collide and
     # "INSERT OR REPLACE" would silently drop the first round's row.
     rec = HistoryRecorder(HistoryStore(":memory:"))
-    rec.round_boundary(5, T0, joined=True, reason="budget", p_win=None, expected_jobs=None)
-    rec.round_boundary(6, T0, joined=True, reason="budget", p_win=None, expected_jobs=None)
+    rec.round_boundary(5, T0, joined=True, reason="budget", expected_jobs=None)
+    rec.round_boundary(6, T0, joined=True, reason="budget", expected_jobs=None)
     rec.flush()
     rows = {r["generation"]: r for r in rec.store.rounds(since_ts=0, limit=10)}
     assert set(rows) == {6, 7}
@@ -108,9 +108,9 @@ def test_three_boundaries_in_the_same_second_never_close_a_round_before_it_opens
     # so the middle round's own close (at the raw wall time, not the bumped
     # start) must not land before that bumped start.
     rec = HistoryRecorder(HistoryStore(":memory:"))
-    rec.round_boundary(5, T0, joined=True, reason="budget", p_win=None, expected_jobs=None)
-    rec.round_boundary(6, T0, joined=True, reason="budget", p_win=None, expected_jobs=None)
-    rec.round_boundary(7, T0, joined=True, reason="budget", p_win=None, expected_jobs=None)
+    rec.round_boundary(5, T0, joined=True, reason="budget", expected_jobs=None)
+    rec.round_boundary(6, T0, joined=True, reason="budget", expected_jobs=None)
+    rec.round_boundary(7, T0, joined=True, reason="budget", expected_jobs=None)
     rec.flush()
     rows = {r["generation"]: r for r in rec.store.rounds(since_ts=0, limit=10)}
     assert set(rows) == {6, 7, 8}
@@ -123,7 +123,7 @@ def test_three_boundaries_in_the_same_second_never_close_a_round_before_it_opens
 
 def test_set_target_fills_the_open_round():
     rec = HistoryRecorder(HistoryStore(":memory:"))
-    rec.round_boundary(5, T0, joined=True, reason="budget", p_win=None, expected_jobs=None)
+    rec.round_boundary(5, T0, joined=True, reason="budget", expected_jobs=None)
     rec.round_target(-14_554_000)
     rec.flush()
     assert rec.store.rounds(since_ts=0, limit=1)[0]["target_milli"] == -14_554_000
@@ -139,7 +139,7 @@ def test_busy_time_flows_from_the_recorder_s_clock():
 
 def test_apply_attempt_round_updates_a_live_row_and_inserts_a_missing_one():
     store = HistoryStore(":memory:")
-    store.open_round(T0, 5, joined=True, reason="budget", p_win=None, expected_jobs=None)
+    store.open_round(T0, 5, joined=True, reason="budget", expected_jobs=None)
     assert store.apply_attempt_round(_summary(5, T0 + 30, won=True), insert_missing=True) == "updated"
     assert store.apply_attempt_round(_summary(9, T0 + 9000), insert_missing=True) == "inserted"
     assert store.apply_attempt_round(_summary(10, T0 + 12000), insert_missing=False) == "skipped"
@@ -154,7 +154,7 @@ def test_apply_attempt_round_updates_a_live_row_and_inserts_a_missing_one():
 
 def test_a_live_round_is_only_matched_near_the_attempts_time():
     store = HistoryStore(":memory:")
-    store.open_round(T0, 5, joined=True, reason="budget", p_win=None, expected_jobs=None)
+    store.open_round(T0, 5, joined=True, reason="budget", expected_jobs=None)
     assert store.find_live_round(5, T0 + 30) == T0
     assert store.find_live_round(5, T0 + 3 * 3600) is None  # a later run's generation 5
     assert store.find_live_round(6, T0 + 30) is None
@@ -206,7 +206,7 @@ def test_a_recorder_write_failure_is_logged_and_swallowed(caplog):
 
 def test_close_is_idempotent_and_drains_queued_writes():
     rec = HistoryRecorder(HistoryStore(":memory:"))
-    rec.round_boundary(1, T0, joined=True, reason="budget", p_win=None, expected_jobs=None)
+    rec.round_boundary(1, T0, joined=True, reason="budget", expected_jobs=None)
     rec.close()
     rec.close()
     rec.record_wasted(T0)  # after close: dropped, never raises

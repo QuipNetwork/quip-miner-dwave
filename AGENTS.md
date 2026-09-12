@@ -19,7 +19,7 @@ pyright quip_miner_dwave/                    # type checker (same)
 
 QUIP_DWAVE_MOCK=1 quip-dwave-qa --check      # offline self-test
 quip-dwave-qa --capabilities                 # print the advertised Capabilities
-quip-dwave-qa --profile --usage-db /data/qpu-usage.db   # hour-of-week history, no QPU needed
+quip-dwave-qa --profile --usage-db /data/qpu-usage.db   # day-of-month by hour history, no QPU needed
 quip-dwave-qa --quip-coordinator unix:///run/quip/coord.sock
 ```
 
@@ -172,13 +172,21 @@ generation number alone.
 The round strategy (`strategy.decide_round`) runs inside
 `ParticipationGate.on_qblock_boundary`, after the budget said yes and from
 a memory snapshot only (`profile.SnapshotRefresher` rebuilds it on its own
-thread). It compares what the headroom buys now against the *marginal* gain
-the same headroom buys at each round within the banking horizon. Comparing
-totals would be wrong: banked headroom makes any later round look better,
-and the win probability is concave in jobs, so an identical slot never wins
-that comparison. The verdict order is explore, saturated, below minimum,
-better slot, good shot, and it is pinned by mutation tests in
-`test_decide_round.py`.
+thread). It compares deliverable jobs, never win rates: difficulty is the
+protocol's and unpredictable, throughput is the QPU's and varies with the
+hour of the day and the day of the month. `profile.slot_stats` estimates
+each (day bin, hour) cell as the global rate times an hour factor times a
+day factor, and shrinks the cell's own evidence toward that prediction.
+A joined round runs to its end, so a join costs a whole round at that
+slot's rate. The gate consults the pacing line at boundaries only, and
+the one mid-round stop is a spent allotment. The decision is a
+throughput bar: rank the rounds left in the period by the jobs each would
+deliver, walk down until their cost exhausts the funds the period will have
+(headroom plus accrual to the reset), and join when this round clears the
+slot where the funds ran out. `strategy.rounds_by_slot` counts rounds hour
+by hour, not round by round, because this runs under the dispatch lock.
+The verdict order is explore, saturated, fast slot, slow slot. Mutation
+tests in `test_decide_round.py` pin it.
 
 `scripts/probe_timestamps.py` runs one two-qubit job on the live QPU and
 prints the SAPI timestamps that the history's queue-wait split depends on.

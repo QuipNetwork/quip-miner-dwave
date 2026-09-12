@@ -222,9 +222,9 @@ def test_a_completed_job_lands_in_the_history_and_billing_is_unchanged(
     # from its verdict, not the old blanket "budget"; with no history yet
     # that verdict is "no-data" and it still joins every round.
     assert rows[2]["joined"] == 1 and rows[2]["reason"] == "no-data"
-    # A no-data round makes no prediction, so the calibration columns stay
+    # A no-data round makes no prediction, so the calibration column stays
     # NULL rather than recording a fabricated 0.0.
-    assert rows[2]["p_win"] is None and rows[2]["expected_jobs"] is None
+    assert rows[2]["expected_jobs"] is None
     assert rows[2]["target_milli"] == 0
     assert (rows[2]["jobs"], rows[2]["hits"], rows[2]["best_energy_milli"]) == (1, 1, -1000)
     assert rows[2]["end_ts_s"] is not None and rows[3]["end_ts_s"] is None

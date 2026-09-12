@@ -195,6 +195,35 @@ def test_a_seeded_dirs_table_from_the_first_build_is_repaired_on_open(tmp_path):
     store.close()
 
 
+def test_a_rounds_table_with_the_retired_p_win_column_is_repaired_on_open(tmp_path):
+    import sqlite3
+
+    path = str(tmp_path / "usage.db")
+    old = sqlite3.connect(path)
+    old.execute(
+        "CREATE TABLE miner_rounds (start_ts_s INTEGER PRIMARY KEY, generation INTEGER NOT NULL, "
+        "source TEXT NOT NULL, end_ts_s INTEGER, target_milli INTEGER, "
+        "joined INTEGER NOT NULL DEFAULT 0, reason TEXT NOT NULL DEFAULT '', p_win REAL, "
+        "expected_jobs REAL, jobs INTEGER NOT NULL DEFAULT 0, reads INTEGER NOT NULL DEFAULT 0, "
+        "hits INTEGER NOT NULL DEFAULT 0, hits_coord INTEGER NOT NULL DEFAULT 0, "
+        "best_energy_milli INTEGER, access_us INTEGER NOT NULL DEFAULT 0, "
+        "won INTEGER NOT NULL DEFAULT 0)"
+    )
+    old.execute(
+        "INSERT INTO miner_rounds (start_ts_s, generation, source, joined, reason, p_win) "
+        "VALUES (?, 5, 'live', 1, 'good-shot', 0.02)",
+        (HOUR,),
+    )
+    old.commit()
+    old.close()
+    store = HistoryStore(path)
+    store.open_round(HOUR + 600, 6, joined=True, reason="best-slot", expected_jobs=165.0)
+    rows = store.rounds(since_ts=0)
+    assert [r["generation"] for r in rows] == [6, 5]
+    assert "p_win" not in rows[0].keys()
+    store.close()
+
+
 def test_history_shares_a_file_with_the_usage_ledger(tmp_path):
     from quip_miner_dwave.usage import UsageLedger
 

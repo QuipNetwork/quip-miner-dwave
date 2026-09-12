@@ -68,7 +68,6 @@ CREATE TABLE IF NOT EXISTS miner_rounds (
     target_milli      INTEGER,
     joined            INTEGER NOT NULL DEFAULT 0,
     reason            TEXT    NOT NULL DEFAULT '',
-    p_win             REAL,
     expected_jobs     REAL,
     jobs              INTEGER NOT NULL DEFAULT 0,
     reads             INTEGER NOT NULL DEFAULT 0,
@@ -207,14 +206,17 @@ class HistoryStore:
         for pragma in _PRAGMAS:
             self._db.execute(pragma)
         self._db.executescript(_SCHEMA)
-        # The first build of this table carried a lines_seen column that
-        # nothing read. CREATE TABLE IF NOT EXISTS leaves an existing table
-        # alone, and its NOT NULL would then reject every mark_seeded.
-        columns = {
-            row["name"] for row in self._db.execute("PRAGMA table_info(seeded_dirs)")
-        }
-        if "lines_seen" in columns:
-            self._db.execute("ALTER TABLE seeded_dirs DROP COLUMN lines_seen")
+        # CREATE TABLE IF NOT EXISTS leaves an existing table alone, so
+        # columns earlier builds created outlive the code that wrote them:
+        # seeded_dirs.lines_seen, whose NOT NULL would reject every
+        # mark_seeded, and miner_rounds.p_win, the prediction of a win model
+        # that no longer exists.
+        for table, column in (("seeded_dirs", "lines_seen"), ("miner_rounds", "p_win")):
+            columns = {
+                row["name"] for row in self._db.execute(f"PRAGMA table_info({table})")
+            }
+            if column in columns:
+                self._db.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
         self._db.commit()
 
     def _commit(self) -> None:
@@ -363,14 +365,13 @@ class HistoryStore:
         *,
         joined: bool,
         reason: str,
-        p_win: Optional[float],
         expected_jobs: Optional[float],
     ) -> None:
         with self._lock:
             self._db.execute(
                 "INSERT OR REPLACE INTO miner_rounds (start_ts_s, generation, source, "
-                "joined, reason, p_win, expected_jobs) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (int(start_ts), generation, SOURCE_LIVE, int(joined), reason, p_win, expected_jobs),
+                "joined, reason, expected_jobs) VALUES (?, ?, ?, ?, ?, ?)",
+                (int(start_ts), generation, SOURCE_LIVE, int(joined), reason, expected_jobs),
             )
             self._commit()
 
@@ -612,7 +613,6 @@ class HistoryRecorder:
         *,
         joined: bool,
         reason: str,
-        p_win: Optional[float],
         expected_jobs: Optional[float],
     ) -> bool:
         """Close the open round and open the next. False when not a fresh boundary.
@@ -659,7 +659,6 @@ class HistoryRecorder:
                     generation,
                     joined=joined,
                     reason=reason,
-                    p_win=p_win,
                     expected_jobs=expected_jobs,
                 ),
             )
