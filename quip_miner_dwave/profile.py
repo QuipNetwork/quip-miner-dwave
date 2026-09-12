@@ -16,8 +16,15 @@ with no evidence never looks better or worse than the average.
 
 from __future__ import annotations
 
+import logging
+import threading
+import time
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Protocol, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Protocol, Tuple
+
+from quip_miner_dwave.history import HistoryStore
+
+logger = logging.getLogger(__name__)
 
 
 class Row(Protocol):
@@ -187,3 +194,187 @@ def slot_stats(
             )
         )
     return out
+
+
+# --- win model ---------------------------------------------------------
+
+# The chain's convergence target for a round, used until a live round has
+# closed. Live rounds are the real measure and take over immediately.
+DEFAULT_ROUND_LENGTH_S = 600.0
+# Measured on Advantage2_system1 at production size (num_reads=48).
+DEFAULT_ACCESS_S_PER_JOB = 0.046
+ROUND_LENGTH_SAMPLE = 100
+
+
+def prior_win_rate(margins: Mapping[int, int]) -> Optional[float]:
+    """The per-job probability of clearing the round target, Laplace-smoothed.
+
+    ``None`` without a histogram, so a caller can tell "no evidence" from
+    "never cleared". Half a pseudo-clear keeps a QPU that has never cleared
+    a target on a small non-zero rate instead of a certain zero.
+    """
+    total = sum(margins.values())
+    if total <= 0:
+        return None
+    cleared = sum(n for margin, n in margins.items() if margin <= 0)
+    return (cleared + 0.5) / (total + 1.0)
+
+
+def posterior_win_rate(prior: float, wins: float, jobs: float) -> float:
+    """Gamma-Poisson update of a per-job win rate: one pseudo-win at ``prior``.
+
+    Wins in a round are Poisson in the jobs delivered. A Gamma(1, 1/prior)
+    prior has mean ``prior`` and the weight of a single win, so observed wins
+    take over after about ``1/prior`` jobs and a QPU with real wins is judged
+    by them.
+    """
+    return (1.0 + wins) / (1.0 / prior + jobs)
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    """Everything the boundary decision reads. Built off the session thread."""
+
+    built_at: float
+    slots: List[SlotStats]
+    # Per-job win rate. None without any evidence at all.
+    lam_global: Optional[float]
+    lam_by_slot: List[float]
+    round_length_s: float
+    access_s_per_job: float
+    rounds_joined: int
+    wins: int
+    jobs_in_rounds: int
+    margin_jobs: int
+
+
+def _median(values: List[float]) -> float:
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+def build_snapshot(
+    store: HistoryStore,
+    now: float,
+    *,
+    weeks: int = DEFAULT_WEEKS,
+    half_life_weeks: float = DEFAULT_HALF_LIFE_WEEKS,
+    pseudo_jobs: float = DEFAULT_PSEUDO_JOBS,
+) -> Snapshot:
+    since = now - weeks * SECONDS_PER_WEEK
+    rows = store.hourly_rows(since)
+    slots = slot_stats(rows, now, weeks=weeks, half_life_weeks=half_life_weeks, pseudo_jobs=pseudo_jobs)
+
+    jobs = sum(int(r["jobs"]) for r in rows)
+    access_us = sum(int(r["access_us_sum"]) for r in rows)
+    access_s = access_us / jobs / 1_000_000.0 if jobs > 0 and access_us > 0 else DEFAULT_ACCESS_S_PER_JOB
+
+    rounds = store.rounds(since_ts=since)
+    lengths = [
+        float(r["end_ts_s"] - r["start_ts_s"])
+        for r in rounds
+        if r["source"] == "live" and r["end_ts_s"] is not None and r["end_ts_s"] > r["start_ts_s"]
+    ][:ROUND_LENGTH_SAMPLE]
+    round_length = _median(lengths) if lengths else DEFAULT_ROUND_LENGTH_S
+
+    joined = [r for r in rounds if r["joined"] and int(r["jobs"]) > 0]
+    wins = sum(int(r["won"]) for r in joined)
+    jobs_in_rounds = sum(int(r["jobs"]) for r in joined)
+    margins = store.margin_counts(since)
+    prior = prior_win_rate(margins)
+    if prior is None and jobs_in_rounds > 0:
+        # Rounds without a histogram: seeded history from before margins
+        # were recorded. The rounds themselves are the only prior there is.
+        prior = (wins + 0.5) / (jobs_in_rounds + 1.0)
+
+    if prior is None:
+        lam_global: Optional[float] = None
+        lam_by_slot = [0.0] * SLOTS
+    else:
+        lam_global = posterior_win_rate(prior, wins, jobs_in_rounds)
+        slot_wins = [0.0] * SLOTS
+        slot_jobs = [0.0] * SLOTS
+        for r in joined:
+            s = slot_of(float(r["start_ts_s"]))
+            slot_wins[s] += int(r["won"])
+            slot_jobs[s] += int(r["jobs"])
+        lam_by_slot = [
+            posterior_win_rate(lam_global, slot_wins[s], slot_jobs[s]) for s in range(SLOTS)
+        ]
+
+    return Snapshot(
+        built_at=now,
+        slots=slots,
+        lam_global=lam_global,
+        lam_by_slot=lam_by_slot,
+        round_length_s=round_length,
+        access_s_per_job=access_s,
+        rounds_joined=len(joined),
+        wins=wins,
+        jobs_in_rounds=jobs_in_rounds,
+        margin_jobs=sum(margins.values()),
+    )
+
+
+class SnapshotRefresher:
+    """Rebuilds the snapshot on its own thread; the boundary reads the latest.
+
+    A rebuild is a few aggregate queries over a few hundred rows, but it is
+    IO on the mounted volume, and the boundary decision runs on the session
+    thread under the dispatch lock. The decision therefore reads memory only
+    and this thread does the reading.
+    """
+
+    def __init__(self, store: HistoryStore, *, interval_s: float = 300.0):
+        self._store = store
+        self._interval = interval_s
+        self._lock = threading.Lock()
+        self._latest: Optional[Snapshot] = None
+        self._wake = threading.Event()
+        self._stopping = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="dwave-history-snapshot", daemon=True
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def latest(self) -> Optional[Snapshot]:
+        with self._lock:
+            return self._latest
+
+    def refresh_now(self) -> Optional[Snapshot]:
+        """Rebuild synchronously. Returns the snapshot now current."""
+        try:
+            snap = build_snapshot(self._store, time.time())
+        except Exception as exc:  # noqa: BLE001 - keep serving the last good one
+            logger.warning("history: snapshot refresh failed: %s", exc)
+            return self.latest()
+        with self._lock:
+            self._latest = snap
+        return snap
+
+    def request_refresh(self) -> None:
+        """Wake the thread early, after a seed or an outcome pickup."""
+        self._wake.set()
+
+    def stop(self) -> None:
+        """Signal the thread to stop and wait briefly for it to notice.
+
+        A refresh in flight reads the store; joining here with a bounded
+        timeout keeps that read from racing the store's close during
+        shutdown, without risking a hang if the thread was never started.
+        """
+        self._stopping.set()
+        self._wake.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+
+    def _run(self) -> None:
+        while not self._stopping.is_set():
+            self.refresh_now()
+            self._wake.wait(self._interval)
+            self._wake.clear()
