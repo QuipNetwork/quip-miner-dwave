@@ -8,7 +8,8 @@ from typing import Dict, Optional
 
 import pytest
 
-from quip_miner_dwave.profile import SLOTS, SlotStats, Snapshot, slot_of
+from quip_miner_dwave import strategy
+from quip_miner_dwave.profile import SECONDS_PER_WEEK, SLOTS, SlotStats, Snapshot, slot_of
 from quip_miner_dwave.strategy import (
     REASON_BELOW_MIN,
     REASON_BETTER_SLOT,
@@ -125,6 +126,43 @@ def test_a_better_slot_past_the_saturation_horizon_is_out_of_reach():
     d = _decide(_snapshot(lam_slots={NEXT_HOUR: 3 * LAM}))
     assert d.join and d.reason == REASON_GOOD_SHOT
     assert d.saturates_in_rounds == 3 and d.wait_rounds < 6
+
+
+def test_the_one_week_cap_bounds_the_banking_search(monkeypatch):
+    # A far better slot, an accrual rate small enough that headroom
+    # saturation (k_sat) sits tens of millions of rounds out, and a period
+    # end a month away: of the horizon's three terms, only the one-week cap
+    # is small enough to bind. The best slot is still found well inside it
+    # (concavity means a later repeat of the same slot never beats an
+    # earlier one), so wait_rounds and saturates_in_rounds hold either way;
+    # the loop's own call count is what actually pins the cap. Counting
+    # calls to slot_of and dropping the `_HORIZON_S // length` term from
+    # `horizon = min(...)` widens the count from 1010 to 4322 here, turning
+    # the assertion below red; restoring the term turns it back green.
+    snapshot = _snapshot({NEXT_HOUR: 50.0}, lam_slots={NEXT_HOUR: 20 * LAM}, default_rate=1.0)
+    week_cap = int(SECONDS_PER_WEEK // ROUND_S)
+    calls: list = []
+    real_slot_of = strategy.slot_of
+
+    def counting_slot_of(ts):
+        calls.append(ts)
+        return real_slot_of(ts)
+
+    monkeypatch.setattr(strategy, "slot_of", counting_slot_of)
+    d = decide_round(
+        now=NOW,
+        headroom_us=1e5,
+        accrual_us_per_s=0.01,
+        period_end=NOW + 30 * 86_400,
+        snapshot=snapshot,
+        config=StrategyConfig(),
+        explore_draw=0.99,
+    )
+    assert d.saturates_in_rounds is not None and d.saturates_in_rounds > week_cap
+    assert d.wait_rounds <= week_cap
+    # One slot_of call before the loop, at most one per round inside it, and
+    # one more to name the wait slot.
+    assert len(calls) <= week_cap + 2
 
 
 def test_a_lifted_rate_cap_defers_even_at_the_same_win_rate():

@@ -84,6 +84,12 @@ REASON_GOOD_SHOT = "good-shot"
 # The profile is weekly, so no deferral looks further ahead than that.
 _HORIZON_S = 7 * 86_400
 
+# The banking loop below runs under the session's dispatch lock, so its
+# iteration count needs a hard ceiling independent of the week cap: a
+# degenerate median round length (seconds, not minutes) could otherwise
+# turn one boundary decision into a long spin.
+_HORIZON_ROUNDS_MAX = 2000
+
 
 @dataclass(frozen=True)
 class RoundDecision:
@@ -177,7 +183,7 @@ def decide_round(
     else:
         k_sat = math.ceil((cap_us - headroom_us) / per_round_us)
     k_period = int(max(0.0, period_end - now) // length)
-    horizon = min(k_sat, k_period, int(_HORIZON_S // length))
+    horizon = min(k_sat, k_period, int(_HORIZON_S // length), _HORIZON_ROUNDS_MAX)
 
     p_best, k_best = 0.0, 0
     for k in range(1, horizon + 1):
