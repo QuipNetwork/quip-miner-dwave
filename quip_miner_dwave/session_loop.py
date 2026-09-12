@@ -50,7 +50,7 @@ from quip_miner_dwave.config import (
     sampling_defaults_from_toml,
 )
 from quip_miner_dwave.history import HistoryRecorder, JobSample
-from quip_miner_dwave.job import handle_job
+from quip_miner_dwave.job import SolverUnavailable, handle_job
 from quip_solver_core.session import DEFAULT_NUM_SWEEPS, num_sweeps_from_toml
 from quip_miner_dwave.ocean import OceanSampler
 from quip_miner_dwave.profile import SnapshotRefresher
@@ -695,6 +695,12 @@ def run_session(
     # What the QPU is chewing on right now, so a Cancel can reach it.
     inflight = InflightJobs()
     tally = CancelTally()
+    # Credits held back because the solver is offline. A reject normally
+    # refunds its credit and the coordinator dispatches the next staged job
+    # at once; against an offline solver that is a reject loop at SAPI
+    # round-trip speed for the whole qblock. The held credits go back out at
+    # the next qblock boundary, one probe per round.
+    parked_credits = 0
     job_pool: Optional[ThreadPoolExecutor] = None
     # History of throughput, rounds and margins. None until Configure names
     # the usage database, or forever if it cannot be opened. Optional in the
@@ -712,7 +718,7 @@ def run_session(
     def process_job(job, s_nodes, s_edges, s_hash, s_target, s_sweeps, s_defaults):
         # Runs on a pool thread: sample (blocking on the QPU), then enqueue
         # replies. Shared-state mutations are guarded by state_lock.
-        nonlocal jobs_done, best_energy_milli
+        nonlocal jobs_done, best_energy_milli, parked_credits
         started = time.monotonic()
         try:
             replies = handle_job(
@@ -725,6 +731,27 @@ def run_session(
                 session_sweeps=s_sweeps,
                 session_defaults=s_defaults,
             )
+        except SolverUnavailable as exc:
+            # The reject goes out without its refund: the credit is parked
+            # until the next qblock boundary. Parked before the reject is
+            # queued, so a boundary that sees the reject also sees the credit.
+            with state_lock:
+                parked_credits += 1
+                held = parked_credits
+            log = logger.warning if held == 1 else logger.debug
+            log(
+                "[QPU] solver offline (%s): parking the credit, %d held until "
+                "the next qblock boundary",
+                exc.__cause__,
+                held,
+            )
+            replies = [
+                miner_pb2.MinerMsg(
+                    reject=miner_pb2.Reject(
+                        job_id=job.job_id, reason=miner_pb2.OVERLOADED
+                    )
+                )
+            ]
         finally:
             # Off the QPU one way or another: a later Cancel must not try to
             # drop a problem that has already finished.
@@ -1195,6 +1222,30 @@ def run_session(
                                     )
                                 )
                             )
+                with state_lock:
+                    parked, parked_credits = parked_credits, 0
+                if parked:
+                    # A round that just rejoined was granted the full depth
+                    # above, and a round sat out gets the full depth when it
+                    # rejoins; only a round still mining needs its credits
+                    # back. Those are the probe: if the solver is still
+                    # offline they park again, one reject each, this round.
+                    regranted = (
+                        boundary is not None and boundary.allowed and boundary.changed
+                    )
+                    mining = gate is None or gate.participating
+                    if mining and not regranted:
+                        logger.info(
+                            "[QPU] qblock %d: re-granting %d parked credit(s) "
+                            "to probe the solver",
+                            cm.cancel.max_generation,
+                            parked,
+                        )
+                        out_q.put(
+                            miner_pb2.MinerMsg(
+                                job_request=miner_pb2.JobRequest(credits=parked)
+                            )
+                        )
                 if recorder is not None:
                     verdict = boundary.round if boundary is not None else None
                     if gate is None:

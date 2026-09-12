@@ -91,6 +91,11 @@ throws away still costs quota.
   pacer headroom the QPU has already spent.
 - A submit that died in this process is billed nothing — D-Wave never saw it.
   `OceanSampler.sample` distinguishes the two by *which* future failed.
+- An offline solver fails the problem after SAPI accepts it, and D-Wave
+  charges nothing. The sampler bills nothing for it, and `handle_job` raises
+  `SolverUnavailable` instead of a refunded reject. The session loop parks the
+  credit until the next qblock boundary, so the miner probes the solver once
+  per round rather than spinning on rejects at SAPI round-trip speed.
 
 ### Arrays from the wire to SAPI and back
 

@@ -2,11 +2,13 @@
 import time
 
 import numpy as np
+import pytest
+from dwave.cloud.exceptions import SolverOfflineError
 from typing import Any, Optional
 
 from quip_solver_core import miner_pb2, scoring, wire
 
-from quip_miner_dwave.job import handle_job
+from quip_miner_dwave.job import SolverUnavailable, handle_job
 from quip_miner_dwave.ocean import OceanSampler, SampleResult
 
 
@@ -426,6 +428,35 @@ def test_sampler_exception_rejects_overloaded_with_refund():
     assert [m.WhichOneof("msg") for m in msgs] == ["reject", "job_request"]
     assert msgs[0].reject.reason == miner_pb2.OVERLOADED
     assert msgs[1].job_request.credits == 1
+
+
+def test_solver_offline_raises_solver_unavailable_instead_of_a_refund():
+    """An offline solver is not a transient per-job fault: refunding the
+    credit re-dispatches the next job at once and the miner spins against
+    SAPI for the whole qblock. The session loop parks the credit instead, so
+    handle_job hands the case up rather than answering it."""
+
+    class OfflineSampler:
+        def sample(self, *args, **kwargs):
+            raise SolverOfflineError("Solver is offline.")
+
+    job = miner_pb2.Job(
+        job_id=b"down",
+        kind=miner_pb2.ISING_SAMPLE,
+        deadline_ms=int(time.time() * 1000) + 60_000,
+        ising=miner_pb2.IsingProblem(
+            h_milli_le32=wire.encode_i32_le([1000, -1000]),
+            j_milli_le32=wire.encode_i32_le([500]),
+            edges=miner_pb2.EdgeList(u=[0], v=[1]),
+            num_reads=1,
+        ),
+    )
+    with pytest.raises(SolverUnavailable) as info:
+        handle_job(
+            job, OfflineSampler(), session_nodes=[0, 1], session_edges=[(0, 1)]
+        )
+    assert info.value.job_id == b"down"
+    assert isinstance(info.value.__cause__, SolverOfflineError)
 
 
 def test_result_meta_echoes_the_resolved_sweep_budget():
