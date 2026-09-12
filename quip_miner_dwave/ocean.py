@@ -94,6 +94,15 @@ def mock_backend() -> str:
     return "sa" if b == "sa" else "exact"
 
 
+def is_solver_offline(exc: BaseException) -> bool:
+    """True for Ocean's ``SolverOfflineError``: SAPI refused to run the problem.
+
+    Matched by class name so the mock path keeps working without Ocean
+    installed; this module never imports the SDK at load time.
+    """
+    return any(cls.__name__ == "SolverOfflineError" for cls in type(exc).__mro__)
+
+
 def ocean_importable() -> bool:
     try:
         import dimod  # noqa: F401
@@ -733,10 +742,15 @@ class OceanSampler:
             raise
         # Decode off the submit path. A failure here is a problem SAPI already
         # accepted — a cancelled one, most often — and it may have annealed.
+        # The one exception is a solver that is offline: SAPI takes the
+        # problem and then fails it without running it, and D-Wave charges
+        # nothing. Booking the estimate there spent 342 s of budget on 7,623
+        # rejects in a single qblock during the Advantage2_system1 outage.
         try:
             view = self._decode_and_view(raw)
-        except BaseException:
-            self._charge_unobserved()
+        except BaseException as exc:
+            if not is_solver_offline(exc):
+                self._charge_unobserved()
             raise
         finally:
             if cancel_key is not None:

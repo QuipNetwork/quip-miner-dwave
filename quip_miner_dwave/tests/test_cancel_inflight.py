@@ -15,6 +15,8 @@ import pytest
 
 pytest.importorskip("numpy")  # OceanSampler imports numpy at module load
 
+from dwave.cloud.exceptions import SolverOfflineError  # noqa: E402
+
 from quip_miner_dwave.ocean import OceanSampler  # noqa: E402
 
 
@@ -305,6 +307,29 @@ def test_draining_the_unobserved_charge_clears_it():
         _one_qubit_job(s, b"\x12")
 
     s.drain_unobserved_access_us()
+
+    assert s.drain_unobserved_access_us() == 0
+
+
+class OfflineFuture(CancelledFuture):
+    """A cloud problem SAPI accepted while the solver was down: the status
+    comes back as failed with "Solver is offline" and nothing annealed."""
+
+    def __getattr__(self, name):
+        if name in _RESULT_ATTRS:
+            raise SolverOfflineError("Solver is offline.")
+        raise AttributeError(name)
+
+
+def test_a_problem_refused_by_an_offline_solver_is_billed_nothing():
+    # SAPI accepted the problem but the solver never ran it, so D-Wave charged
+    # nothing. Booking the estimate here spent 342 s of budget on 7,623
+    # rejects in one qblock during the Advantage2_system1 outage.
+    s = _real_mode_sampler(OfflineFuture())
+    s._observe_access_us(46_000)
+
+    with pytest.raises(SolverOfflineError):
+        _one_qubit_job(s, b"\x15")
 
     assert s.drain_unobserved_access_us() == 0
 

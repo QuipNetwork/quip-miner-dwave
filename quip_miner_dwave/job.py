@@ -12,7 +12,7 @@ from quip_solver_core.session import DEFAULT_NUM_SWEEPS
 
 from quip_miner_dwave import MAX_EDGES, MAX_NODES
 from quip_miner_dwave.config import SamplingDefaults
-from quip_miner_dwave.ocean import SampleResult, SupportsSample
+from quip_miner_dwave.ocean import SampleResult, SupportsSample, is_solver_offline
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +64,21 @@ def sample_dict_to_vector(
         s = sample.get(int(n), 1)
         out.append(1 if s >= 0 else -1)
     return out
+
+
+class SolverUnavailable(Exception):
+    """The solver is offline: SAPI refused the job before any anneal ran.
+
+    Not answered here like other sampler failures, because the answer is not
+    per-job. A reject with a refund re-dispatches the next staged job at once,
+    and against an offline solver that loop runs at SAPI round-trip speed for
+    the whole qblock. The session loop parks the credit instead and probes
+    again at the next qblock boundary.
+    """
+
+    def __init__(self, job_id: bytes):
+        super().__init__(job_id.hex())
+        self.job_id = job_id
 
 
 class _Rejected(Exception):
@@ -375,13 +390,15 @@ def handle_job(
             # a job with no defects is given no seed at all.
             cancel_key=bytes(job_id) if job_id else None,
         )
-    except Exception:
-        # Ocean raises many exception types (Leap auth, network, solver
-        # offline), and a job worker's exception would otherwise die inside a
-        # discarded pool Future: no Result, no Reject, a coordinator credit
-        # consumed forever, and nothing in the log. Answer the job instead:
-        # OVERLOADED marks the failure transient — the coordinator may resend
-        # elsewhere or later — and the traceback reaches the operator.
+    except Exception as exc:
+        if is_solver_offline(exc):
+            raise SolverUnavailable(job_id) from exc
+        # Ocean raises many exception types (Leap auth, network), and a job
+        # worker's exception would otherwise die inside a discarded pool
+        # Future: no Result, no Reject, a coordinator credit consumed forever,
+        # and nothing in the log. Answer the job instead: OVERLOADED marks the
+        # failure transient — the coordinator may resend elsewhere or later —
+        # and the traceback reaches the operator.
         logger.exception(
             "job %s: sampler raised; rejecting OVERLOADED", job_id.hex()
         )
