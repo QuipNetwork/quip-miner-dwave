@@ -79,3 +79,16 @@ def test_the_hits_column_is_wide_enough_for_a_joined_round_s_read_count():
     out = render_profile(store, now=MONDAY + 6 * 86_400)
     row = next(line for line in out.splitlines() if "Mon 13h" in line)
     assert "   12345" in row  # six-wide right-aligned: one pad space plus the two-space separator
+
+
+def test_the_report_states_the_win_model():
+    out = render_profile(_store(), now=MONDAY + 6 * 86_400)
+    assert "Win model:" in out
+    assert "/job" in out and "round length" in out
+
+
+def test_the_report_says_when_there_is_no_win_model():
+    from quip_miner_dwave.history import HistoryStore
+
+    out = render_profile(HistoryStore(":memory:"), now=MONDAY)
+    assert "Win model: no evidence yet" in out

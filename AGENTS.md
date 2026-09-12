@@ -169,6 +169,17 @@ double count. The coordinator's generations restart independently, so a
 round means one directory paired with one generation number, not a
 generation number alone.
 
+The round strategy (`strategy.decide_round`) runs inside
+`ParticipationGate.on_qblock_boundary`, after the budget said yes and from
+a memory snapshot only (`profile.SnapshotRefresher` rebuilds it on its own
+thread). It compares what the headroom buys now against the *marginal* gain
+the same headroom buys at each round within the banking horizon. Comparing
+totals would be wrong: banked headroom makes any later round look better,
+and the win probability is concave in jobs, so an identical slot never wins
+that comparison. The verdict order is explore, saturated, below minimum,
+better slot, good shot, and it is pinned by mutation tests in
+`test_decide_round.py`.
+
 ### Precedence ladders
 
 Two settings resolve through the same shape — job, then session, then operator

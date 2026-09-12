@@ -152,10 +152,34 @@ one QPU miner does not absorb a sibling miner's history.
 
 `quip-dwave-qa --profile [--usage-db PATH]` prints the hour-of-week grid of
 jobs per second, the grid of D-Wave queue wait, the win summary for
-weekdays and weekends, and the last 20 rounds with the strategy's predicted
-win probability beside what happened. It needs no QPU and no token.
-`--usage-db` applies to `--profile` only. A session reads the coordinator's
-`usage_db` key instead.
+weekdays and weekends, the win model, and the last 20 rounds with the
+strategy's predicted win probability beside what happened. It needs no QPU
+and no token. `--usage-db` applies to `--profile` only. A session reads the
+coordinator's `usage_db` key instead.
+
+## The round strategy
+
+At every qblock boundary the budget decides first whether the miner can
+afford the round. When it can, one function decides whether this round is
+worth the headroom or whether a better hour of the week is worth waiting
+for. It reads a snapshot of the history: throughput per hour of the week,
+the round length, the QPU time per job, and a per-job win rate learned
+from the margin histogram and the rounds the miner won.
+
+Banking headroom pays only when it buys more at a later round than it buys
+now, and only while banking is still possible. Once the headroom exceeds
+what any round can spend, or the period is about to reset, waiting throws
+QPU time away, so the miner joins. The verdict and its numbers are one log
+line per boundary.
+
+Three `[dwave]` keys tune it. The defaults change nothing until history
+exists.
+
+```toml
+min_win_probability = 0.0   # skip a round below this P(win) while banking is possible
+slot_advantage = 0.25       # defer when a later slot buys 25% more P(win) from the same headroom
+explore_fraction = 0.10     # join this share of rounds regardless, so every slot stays measured
+```
 
 ## Tests
 
