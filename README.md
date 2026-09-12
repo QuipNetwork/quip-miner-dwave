@@ -130,6 +130,27 @@ The same config holds other `[dwave]` keys: `budget`, `budget_reset_day`,
 `usage_db`, `num_reads`, and `anneal_time_us`. This README does not document
 them yet.
 
+## History and the profile report
+
+The miner keeps three tables in the usage database, beside the budget
+ledger. One tracks throughput per UTC hour, covering job completions, QPU
+busy time, round trips, and the D-Wave service time from SAPI's
+`submitted_on` and `solved_on`. Another holds one row per qblock round. The
+last holds a histogram of each job's best energy relative to the round's
+target. The round strategy reads them. Nothing about mining depends on
+them. A database that fails to open disables the history and logs one
+warning.
+
+At start the miner seeds past rounds from the coordinator's attempts files,
+`<data_dir>/<qblock_id>/attempts.jsonl`. The default location is the
+`attempts` directory beside the usage database, which is where the node
+manager renders it. `--attempts-dir PATH` overrides it.
+
+`quip-dwave-qa --profile [--usage-db PATH]` prints the hour-of-week grid of
+jobs per second, the grid of D-Wave queue wait, the win summary for
+weekdays and weekends, and the last 20 rounds with the strategy's predicted
+win probability beside what happened. It needs no QPU and no token.
+
 ## Tests
 
 ```sh

@@ -19,6 +19,7 @@ pyright quip_miner_dwave/                    # type checker (same)
 
 QUIP_DWAVE_MOCK=1 quip-dwave-qa --check      # offline self-test
 quip-dwave-qa --capabilities                 # print the advertised Capabilities
+quip-dwave-qa --profile --usage-db /data/qpu-usage.db   # hour-of-week history, no QPU needed
 quip-dwave-qa --quip-coordinator unix:///run/quip/coord.sock
 ```
 
@@ -135,6 +136,33 @@ Every Ocean internal lives in `OceanSampler._submit_encoded` (`Future`,
 `Present`, `client._submit`). Keep it that way: an SDK change should have a
 one-function blast radius. Polling, auth, retries and `Future.cancel` are still
 the SDK's job.
+
+### The history is a second ledger, and it never blocks the session
+
+`history.HistoryStore` keeps three tables beside `qpu_usage_hourly`:
+operational sums per UTC hour, one row per qblock round, and a histogram of
+job-best energy margins to the round target. Every throughput number is
+derived at query time (`profile.slot_stats`), so the estimator can change
+without a migration. The design and the queueing-theory background are in
+`docs/superpowers/specs/2026-09-11-qpu-time-of-week-strategy-design.md`.
+
+`HistoryRecorder` is the only thing the session loop talks to, and it never
+raises. Every write goes through one worker thread, so `Cancel` and
+`SetTarget` handling never touch SQLite. Job workers record after billing
+and outside `state_lock`, for the same reason billing does.
+
+Two rules are easy to get wrong. `Cancel(max_generation=N)` names the dead
+generation, so the round it opens is keyed as generation `N + 1`, which is
+what the coordinator writes to `attempts.jsonl`. And the per-job timings
+reach the session loop through `SamplerMeta.extra` (`inflight`, `sapi_ms`),
+because that map is the one channel that already crosses `handle_job`.
+
+Past rounds are seeded from the coordinator's attempts files
+(`attempts.seed_from_attempts`). A directory whose generation the live
+recorder already opened only contributes outcomes. Everything else in it
+would double count. The coordinator's generations restart independently, so
+a round means one directory paired with one generation number, not a
+generation number alone.
 
 ### Precedence ladders
 
