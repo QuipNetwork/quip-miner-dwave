@@ -158,10 +158,12 @@ reach the session loop through `SamplerMeta.extra` (`inflight`, `sapi_ms`),
 because that map is the one channel that already crosses `handle_job`.
 
 Past rounds are seeded from the coordinator's attempts files
-(`attempts.seed_from_attempts`). A directory whose generation the live
-recorder already opened only contributes outcomes. Everything else in it
-would double count. The coordinator's generations restart independently, so
-a round means one directory paired with one generation number, not a
+(`attempts.seed_from_attempts`). A directory the miner was live for — a
+generation the live recorder already opened, or an hour of the directory's
+own span that a live hourly row covers — only contributes outcomes and any
+round row a live Cancel never opened; its margins and hourly sums would
+double count. The coordinator's generations restart independently, so a
+round means one directory paired with one generation number, not a
 generation number alone.
 
 ### Precedence ladders

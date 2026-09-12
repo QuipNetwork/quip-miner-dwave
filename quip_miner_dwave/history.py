@@ -24,9 +24,10 @@ import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 from quip_miner_dwave.usage import SECONDS_PER_HOUR, hour_floor
 
@@ -84,8 +85,7 @@ CREATE TABLE IF NOT EXISTS energy_margin_daily (
     PRIMARY KEY (day_start_s, margin_unit)
 );
 CREATE TABLE IF NOT EXISTS seeded_dirs (
-    dir_name          TEXT PRIMARY KEY,
-    lines_seen        INTEGER NOT NULL
+    dir_name          TEXT PRIMARY KEY
 );
 """
 
@@ -197,14 +197,45 @@ class HistoryStore:
             if str(parent) not in ("", "."):
                 parent.mkdir(parents=True, exist_ok=True)
         # Worker threads write, the seed thread writes, the refresher reads:
-        # one connection behind a lock, as the usage ledger does.
-        self._lock = threading.Lock()
+        # one connection behind a lock, as the usage ledger does. Reentrant
+        # so a batch held by one thread can still call the store's own
+        # methods, which each take the lock themselves.
+        self._lock = threading.RLock()
+        self._batch_depth = 0
         self._db = sqlite3.connect(path, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
         for pragma in _PRAGMAS:
             self._db.execute(pragma)
         self._db.executescript(_SCHEMA)
         self._db.commit()
+
+    def _commit(self) -> None:
+        """Commit, unless a batch is open: it commits once, at its own end."""
+        if self._batch_depth == 0:
+            self._db.commit()
+
+    @contextmanager
+    def batch(self) -> Iterator[None]:
+        """Group several writes into one transaction.
+
+        Reentrant: a method called from inside an open batch still takes
+        the lock and calls ``_commit()``, which is a no-op until the
+        outermost batch exits. Commits once, at the end, if the body ran
+        clean; rolls back everything the batch wrote if it raised.
+        """
+        with self._lock:
+            self._batch_depth += 1
+            try:
+                yield
+            except Exception:
+                if self._batch_depth == 1:
+                    self._db.rollback()
+                raise
+            else:
+                if self._batch_depth == 1:
+                    self._db.commit()
+            finally:
+                self._batch_depth -= 1
 
     # -- hourly ---------------------------------------------------------
 
@@ -219,7 +250,7 @@ class HistoryStore:
                 "source = excluded.source, busy_ms = busy_ms + excluded.busy_ms",
                 [(hour, SOURCE_LIVE, ms) for hour, ms in pieces],
             )
-            self._db.commit()
+            self._commit()
 
     def record_job(self, sample: JobSample, round_start_ts: Optional[int]) -> None:
         """Fold one completed job into its hour, its round and the histogram."""
@@ -285,7 +316,7 @@ class HistoryStore:
                         round_start_ts,
                     ),
                 )
-            self._db.commit()
+            self._commit()
 
     def record_wasted(self, now: float) -> None:
         with self._lock:
@@ -296,7 +327,7 @@ class HistoryStore:
                 "source = excluded.source, wasted_jobs = wasted_jobs + 1",
                 (hour_floor(now), SOURCE_LIVE),
             )
-            self._db.commit()
+            self._commit()
 
     def hourly_rows(self, since_ts: float) -> List[sqlite3.Row]:
         with self._lock:
@@ -333,7 +364,7 @@ class HistoryStore:
                 "joined, reason, p_win, expected_jobs) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (int(start_ts), generation, SOURCE_LIVE, int(joined), reason, p_win, expected_jobs),
             )
-            self._db.commit()
+            self._commit()
 
     def close_round(self, start_ts: float, end_ts: float) -> None:
         with self._lock:
@@ -341,7 +372,7 @@ class HistoryStore:
                 "UPDATE miner_rounds SET end_ts_s = ? WHERE start_ts_s = ? AND end_ts_s IS NULL",
                 (int(end_ts), int(start_ts)),
             )
-            self._db.commit()
+            self._commit()
 
     def set_round_target(self, start_ts: float, target_milli: int) -> None:
         with self._lock:
@@ -349,7 +380,7 @@ class HistoryStore:
                 "UPDATE miner_rounds SET target_milli = ? WHERE start_ts_s = ?",
                 (target_milli, int(start_ts)),
             )
-            self._db.commit()
+            self._commit()
 
     def find_live_round(self, generation: int, near_ts: float) -> Optional[int]:
         """The live round of ``generation`` that opened shortly before ``near_ts``."""
@@ -376,7 +407,7 @@ class HistoryStore:
                     "WHERE start_ts_s = ?",
                     (summary.hits_coord, int(summary.won), live),
                 )
-                self._db.commit()
+                self._commit()
                 return "updated"
             if not insert_missing:
                 return "skipped"
@@ -399,7 +430,7 @@ class HistoryStore:
                     int(summary.won),
                 ),
             )
-            self._db.commit()
+            self._commit()
             return "inserted"
 
     def rounds(self, since_ts: float, limit: Optional[int] = None) -> List[sqlite3.Row]:
@@ -421,7 +452,7 @@ class HistoryStore:
                 "ON CONFLICT(day_start_s, margin_unit) DO UPDATE SET jobs = jobs + excluded.jobs",
                 (day_start_s, margin, jobs),
             )
-            self._db.commit()
+            self._commit()
 
     def seed_hourly(self, hour_start_s: int, *, jobs: int, busy_ms: int, access_us: int) -> None:
         """An approximate hour from the attempts file.
@@ -441,7 +472,7 @@ class HistoryStore:
                 "WHERE qpu_throughput_hourly.source = 'attempts'",
                 (hour_start_s, SOURCE_ATTEMPTS, jobs, busy_ms, access_us),
             )
-            self._db.commit()
+            self._commit()
 
     def is_seeded(self, dir_name: str) -> bool:
         with self._lock:
@@ -450,13 +481,28 @@ class HistoryStore:
             ).fetchone()
         return row is not None
 
-    def mark_seeded(self, dir_name: str, lines: int) -> None:
+    def has_live_hours(self, start_hour_s: int, end_hour_s: int) -> bool:
+        """Whether a live-source hourly row falls in ``[start_hour_s, end_hour_s]``.
+
+        Used to decide whether the miner was running during an attempts
+        directory's time span even when it never opened a round for one of
+        the generations in it (see ``attempts.seed_from_attempts``).
+        """
+        with self._lock:
+            row = self._db.execute(
+                "SELECT 1 FROM qpu_throughput_hourly WHERE source = ? "
+                "AND hour_start_s BETWEEN ? AND ? LIMIT 1",
+                (SOURCE_LIVE, start_hour_s, end_hour_s),
+            ).fetchone()
+        return row is not None
+
+    def mark_seeded(self, dir_name: str) -> None:
         with self._lock:
             self._db.execute(
-                "INSERT OR REPLACE INTO seeded_dirs (dir_name, lines_seen) VALUES (?, ?)",
-                (dir_name, lines),
+                "INSERT OR REPLACE INTO seeded_dirs (dir_name) VALUES (?)",
+                (dir_name,),
             )
-            self._db.commit()
+            self._commit()
 
     def close(self) -> None:
         with self._lock:

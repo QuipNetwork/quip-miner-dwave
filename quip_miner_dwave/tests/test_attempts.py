@@ -11,6 +11,8 @@ import dataclasses
 import json
 from pathlib import Path
 
+import pytest
+
 from quip_miner_dwave.attempts import (
     Attempt,
     default_attempts_dir,
@@ -21,7 +23,7 @@ from quip_miner_dwave.attempts import (
     seed_from_attempts,
     summarise_rounds,
 )
-from quip_miner_dwave.history import HistoryStore
+from quip_miner_dwave.history import HistoryStore, JobSample
 
 FIXTURES = Path(__file__).parent / "fixtures" / "attempts"
 NOW = 1789178400  # after the newest fixture round
@@ -223,3 +225,75 @@ def test_a_missing_directory_seeds_nothing(tmp_path):
     report = seed_from_attempts(HistoryStore(":memory:"), str(tmp_path / "nope"), now=NOW)
     assert (report.dirs_seeded, report.rounds_inserted) == (0, 0)
     assert pickup_outcomes(HistoryStore(":memory:"), str(tmp_path / "nope")) == 0
+
+
+def test_a_seed_that_fails_partway_through_a_directory_leaves_nothing_committed(monkeypatch):
+    # mark_seeded is the last write of a directory's seed. If it raises, the
+    # margins and hourly rows written just before it must not survive either,
+    # or the directory would double-count its margins on the next start.
+    store = HistoryStore(":memory:")
+
+    def boom(self, dir_name):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(HistoryStore, "mark_seeded", boom)
+    with pytest.raises(RuntimeError):
+        seed_from_attempts(store, str(FIXTURES), now=NOW)
+    assert not store.is_seeded("813")
+    assert store.margin_counts(0) == {}
+    assert store.hourly_rows(0) == []
+
+
+def test_seeding_a_directory_the_miner_was_live_for_skips_only_margins_and_hours(tmp_path):
+    # A miner that starts mid-qblock records live jobs for the generation in
+    # progress but has no live round row for it (the Cancel that would have
+    # opened one arrived before the recorder existed). Seeding that
+    # directory later must not add its margins a second time, but a round
+    # row for a generation the live recorder never opened is not double
+    # counting.
+    store = HistoryStore(":memory:")
+    generation = 50
+    base = HOUR_813
+    for i in range(5):
+        store.record_job(
+            JobSample(
+                completed_at=base + i,
+                generation=generation,
+                rtt_ms=3000,
+                access_us=46_000,
+                inflight_at_submit=1,
+                reads=1,
+                best_energy_milli=-100,
+                target_milli=-50,
+                hits=0,
+            ),
+            round_start_ts=None,
+        )
+    assert sum(store.margin_counts(0).values()) == 5
+
+    attempts_dir = tmp_path / "attempts"
+    d = attempts_dir / "500"
+    d.mkdir(parents=True)
+    lines = [
+        json.dumps(
+            {
+                "ts_ms": int((base + i) * 1000),
+                "generation": generation,
+                "miner_type": "QPU-DWAVE",
+                "raw_best_energy_milli": -100,
+                "threshold_milli": -50,
+                "accepted": True,
+                "device_access_time_us": 1000,
+            }
+        )
+        for i in range(5)
+    ]
+    (d / "attempts.jsonl").write_text("\n".join(lines) + "\n")
+    (attempts_dir / "600").mkdir(parents=True)  # the round in progress
+
+    report = seed_from_attempts(store, str(attempts_dir), now=base + 10_000)
+
+    assert report.dirs_seeded == 1
+    assert sum(store.margin_counts(0).values()) == 5  # not doubled
+    rows = [r for r in store.rounds(since_ts=0, limit=10) if r["generation"] == generation]
+    assert len(rows) == 1 and rows[0]["source"] == "attempts"

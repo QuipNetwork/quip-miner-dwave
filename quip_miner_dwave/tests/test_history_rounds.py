@@ -142,7 +142,7 @@ def test_a_live_round_is_only_matched_near_the_attempts_time():
 def test_seed_bookkeeping_is_per_directory():
     store = HistoryStore(":memory:")
     assert not store.is_seeded("1258")
-    store.mark_seeded("1258", 165)
+    store.mark_seeded("1258")
     assert store.is_seeded("1258")
 
 

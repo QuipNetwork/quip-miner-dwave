@@ -11,6 +11,12 @@ A directory is complete once a higher-numbered one exists. Complete
 directories seed once, tracked in ``seeded_dirs``. The two newest are
 re-read at every boundary for outcomes only, because a win confirms
 shortly after the Cancel it causes.
+
+A directory the miner was live for — a generation the live recorder
+opened, or an hour within the directory's own span that a live hourly row
+covers — only contributes outcomes and any round row a live Cancel never
+opened; its margins and hourly sums are already in the live tables and
+would double count if seeded again.
 """
 
 from __future__ import annotations
@@ -192,9 +198,12 @@ def seed_from_attempts(
 
     A node with a thousand-plus attempt directories can take tens of seconds
     to seed; ``stop`` is checked once per directory, before that directory's
-    writes begin, so a shutdown mid-seed never leaves a directory with its
-    margins written but not marked seeded — that would double-count them on
-    the next start, since ``seed_margin`` is additive.
+    writes begin. One directory's round applications, margin writes, hourly
+    writes and ``mark_seeded`` share one transaction (``store.batch()``), so
+    a shutdown mid-seed, a hard kill, or any other failure partway through a
+    directory never leaves it with margins written but not marked seeded —
+    that would double-count them on the next start, since ``seed_margin`` is
+    additive.
     """
     report = SeedReport()
     dirs = _numbered_dirs(Path(attempts_dir))
@@ -206,35 +215,48 @@ def seed_from_attempts(
             continue
         path = d / ATTEMPTS_FILE
         if not path.is_file():
-            store.mark_seeded(d.name, 0)
+            store.mark_seeded(d.name)
             continue
         try:
-            attempts, lines = read_attempts(path)
+            attempts, _ = read_attempts(path)
         except OSError as exc:
             logger.warning("attempts: cannot read %s: %s", path, exc)
             report.dirs_skipped += 1
             continue
         rounds = summarise_rounds(attempts)
         # A generation the live recorder already opened means this process
-        # (or a previous run of it) recorded the round as it happened. Only
-        # the outcomes are new; the rest would double count.
+        # (or a previous run of it) recorded the round as it happened. A
+        # live hourly row inside the directory's own span covers the case
+        # where the miner was running but never opened a round for one of
+        # its generations (a restart mid-qblock, before the recorder saw
+        # the Cancel that would have opened it). Either way, only the
+        # outcomes and any missing round row are new: margins and hourly
+        # sums are already in the live tables.
         covered = any(
             store.find_live_round(r.generation, r.first_ts_s) is not None for r in rounds
         )
-        for r in rounds:
-            outcome = store.apply_attempt_round(r, insert_missing=not covered)
-            if outcome == "inserted":
-                report.rounds_inserted += 1
-            elif outcome == "updated":
-                report.rounds_updated += 1
-        if not covered:
+        if not covered and attempts:
+            first_hour = hour_floor(min(a.ts_ms for a in attempts) / 1000.0)
+            last_hour = hour_floor(max(a.ts_ms for a in attempts) / 1000.0)
+            covered = store.has_live_hours(first_hour, last_hour)
+        with store.batch():
             for r in rounds:
-                for (day, margin), jobs in r.margins.items():
-                    store.seed_margin(day, margin, jobs)
-            hourly = hourly_from_attempts(attempts, before_hour=hour_floor(now))
-            for hour, (jobs, busy_ms, access_us) in hourly.items():
-                store.seed_hourly(hour, jobs=jobs, busy_ms=busy_ms, access_us=access_us)
-        store.mark_seeded(d.name, lines)
+                # A round row for a generation the live recorder never
+                # opened is not double counting even when the directory is
+                # otherwise covered; only margins and hourly rows are.
+                outcome = store.apply_attempt_round(r, insert_missing=True)
+                if outcome == "inserted":
+                    report.rounds_inserted += 1
+                elif outcome == "updated":
+                    report.rounds_updated += 1
+            if not covered:
+                for r in rounds:
+                    for (day, margin), jobs in r.margins.items():
+                        store.seed_margin(day, margin, jobs)
+                hourly = hourly_from_attempts(attempts, before_hour=hour_floor(now))
+                for hour, (jobs, busy_ms, access_us) in hourly.items():
+                    store.seed_hourly(hour, jobs=jobs, busy_ms=busy_ms, access_us=access_us)
+            store.mark_seeded(d.name)
         report.dirs_seeded += 1
     if report.dirs_seeded:
         logger.info(
