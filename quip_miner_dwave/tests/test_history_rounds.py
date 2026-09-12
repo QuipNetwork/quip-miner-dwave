@@ -87,6 +87,22 @@ def test_a_repeated_watermark_is_not_a_new_round():
     assert len(rec.store.rounds(since_ts=0, limit=10)) == 1
 
 
+def test_two_boundaries_in_the_same_second_open_two_rounds():
+    # A round can close and the next open within the same wall-clock second
+    # in a fast-moving test harness (and, in principle, in production too).
+    # start_ts_s is the primary key: two rounds sharing one would collide and
+    # "INSERT OR REPLACE" would silently drop the first round's row.
+    rec = HistoryRecorder(HistoryStore(":memory:"))
+    rec.round_boundary(5, T0, joined=True, reason="budget", p_win=None, expected_jobs=None)
+    rec.round_boundary(6, T0, joined=True, reason="budget", p_win=None, expected_jobs=None)
+    rec.flush()
+    rows = {r["generation"]: r for r in rec.store.rounds(since_ts=0, limit=10)}
+    assert set(rows) == {6, 7}
+    starts = {r["start_ts_s"] for r in rows.values()}
+    assert len(starts) == 2
+    assert rows[6]["end_ts_s"] is not None and rows[7]["end_ts_s"] is None
+
+
 def test_set_target_fills_the_open_round():
     rec = HistoryRecorder(HistoryStore(":memory:"))
     rec.round_boundary(5, T0, joined=True, reason="budget", p_win=None, expected_jobs=None)

@@ -548,6 +548,13 @@ class HistoryRecorder:
         just abandoned. The jobs of the round it opens carry ``N + 1``, which
         is also the generation the coordinator writes to attempts.jsonl, so
         the row is keyed by that and not by the watermark.
+
+        ``start_ts_s`` is the round's primary key, at whole-second resolution.
+        Two boundaries landing in the same wall-clock second (routine in a
+        fast test, possible in production too) would otherwise collide, and
+        ``open_round``'s ``INSERT OR REPLACE`` would silently drop the first
+        round's row. Bumping past the previous start keeps every round its
+        own row without needing sub-second precision in the schema.
         """
         generation = cancel_generation + 1
         with self._lock:
@@ -556,6 +563,8 @@ class HistoryRecorder:
             self._last_cancel_generation = cancel_generation
             previous = self._open_start
             start = int(now)
+            if previous is not None and start <= previous:
+                start = previous + 1
             self._open_start = start
             self._round_starts[generation] = start
             for old in [g for g in self._round_starts if g < generation - 4]:
