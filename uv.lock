@@ -7,7 +7,7 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "2026-09-05T06:23:46.30602273Z"
+exclude-newer = "2026-09-05T14:08:50.565893434Z"
 exclude-newer-span = "P1W"
 
 [[package]]
@@ -1525,7 +1525,7 @@ wheels = [
 
 [[package]]
 name = "quip-miner-dwave"
-version = "0.3.4rc1"
+version = "0.3.4rc2"
 source = { editable = "." }
 dependencies = [
     { name = "dwave-ocean-sdk" },
