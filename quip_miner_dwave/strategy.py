@@ -1,18 +1,22 @@
-"""The round strategy: is this qblock worth the headroom, or is a better hour coming?
+"""The round strategy: is this qblock worth the headroom, or is a faster hour coming?
 
 Runs after the budget said yes, once per qblock boundary, and answers from a
 memory snapshot only. The design and its reasoning are in
 docs/superpowers/specs/2026-09-11-qpu-time-of-week-strategy-design.md.
+
+Winning a round depends on the round's difficulty, which the protocol sets
+and the miner cannot see ahead, and on how many models the QPU evaluates
+while the round is open. Only the second varies with the hour, so the
+decision compares slots by deliverable jobs and nothing else.
 """
 
 from __future__ import annotations
 
 import logging
-import math
 import random
 import tomllib
 from dataclasses import dataclass
-from typing import Optional
+from typing import Dict, Optional
 
 from quip_miner_dwave.budget import ParticipationDecision
 from quip_miner_dwave.profile import Snapshot, SnapshotRefresher, slot_label, slot_of
@@ -25,21 +29,21 @@ class StrategyConfig:
     """Operator knobs from ``Configure.backend_toml``.
 
     With the defaults and no history the miner behaves as it does today:
-    every round the budget allows is joined. ``slot_advantage`` is what lets
-    a materially better hour of the week defer a round; ``explore_fraction``
-    keeps every slot measured even when the strategy would skip it.
+    every round the budget allows is joined. ``min_throughput_advantage``
+    is how far the bar must sit above this round's jobs before the round
+    is skipped for it, a tolerance against chasing noise in the profile.
+    ``participation_chance`` is the share of rounds joined regardless of
+    the verdict, so every slot keeps getting measured.
     """
 
-    min_win_probability: float = 0.0
-    slot_advantage: float = 0.25
-    explore_fraction: float = 0.10
+    min_throughput_advantage: float = 0.25
+    participation_chance: float = 0.10
 
 
 # key -> (lower bound, upper bound or None)
 STRATEGY_KEYS = {
-    "min_win_probability": (0.0, 1.0),
-    "slot_advantage": (0.0, None),
-    "explore_fraction": (0.0, 1.0),
+    "min_throughput_advantage": (0.0, None),
+    "participation_chance": (0.0, 1.0),
 }
 
 
@@ -77,18 +81,8 @@ def strategy_config_from_toml(toml_text: str) -> StrategyConfig:
 REASON_NO_DATA = "no-data"
 REASON_EXPLORE = "explore"
 REASON_SATURATED = "saturated"
-REASON_BELOW_MIN = "below-min-p"
-REASON_BETTER_SLOT = "better-slot"
-REASON_GOOD_SHOT = "good-shot"
-
-# The profile is weekly, so no deferral looks further ahead than that.
-_HORIZON_S = 7 * 86_400
-
-# The banking loop below runs under the session's dispatch lock, so its
-# iteration count needs a hard ceiling independent of the week cap: a
-# degenerate median round length (seconds, not minutes) could otherwise
-# turn one boundary decision into a long spin.
-_HORIZON_ROUNDS_MAX = 2000
+REASON_FAST_SLOT = "fast-slot"
+REASON_SLOW_SLOT = "slow-slot"
 
 
 @dataclass(frozen=True)
@@ -100,16 +94,13 @@ class RoundDecision:
     slot: int
     # None on a no-data verdict: no history means no prediction was made,
     # not a prediction of zero.
-    p_now: Optional[float]
     expected_jobs: Optional[float]
     jobs_per_s: Optional[float]
-    lam: Optional[float]
-    # The marginal win probability banking the headroom buys at the best
-    # later round within the horizon, and where that round is.
-    p_best: float
-    wait_slot: Optional[int]
-    wait_rounds: int
-    saturates_in_rounds: Optional[int]
+    # The throughput bar: jobs per round of the slowest round the rest of
+    # the period's funds still cover. Zero when they cover every round.
+    bar_jobs: float
+    rounds_funded: float
+    rounds_remaining: float
 
 
 def _no_data(slot: int) -> RoundDecision:
@@ -117,15 +108,29 @@ def _no_data(slot: int) -> RoundDecision:
         join=True,
         reason=REASON_NO_DATA,
         slot=slot,
-        p_now=None,
         expected_jobs=None,
         jobs_per_s=None,
-        lam=None,
-        p_best=0.0,
-        wait_slot=None,
-        wait_rounds=0,
-        saturates_in_rounds=None,
+        bar_jobs=0.0,
+        rounds_funded=0.0,
+        rounds_remaining=0.0,
     )
+
+
+def rounds_by_slot(now: float, period_end: float, round_length_s: float) -> Dict[int, float]:
+    """How many rounds of the rest of the period fall in each slot.
+
+    Walks hour by hour rather than round by round: a month of one-minute
+    rounds is forty thousand rounds but only seven hundred hours, and this
+    runs on the session thread under the dispatch lock.
+    """
+    counts: Dict[int, float] = {}
+    t = now
+    while t < period_end:
+        hour_end = min((int(t) // 3600 + 1) * 3600.0, period_end)
+        slot = slot_of(t)
+        counts[slot] = counts.get(slot, 0.0) + (hour_end - t) / round_length_s
+        t = hour_end
+    return counts
 
 
 def decide_round(
@@ -138,87 +143,70 @@ def decide_round(
     config: StrategyConfig,
     explore_draw: float,
 ) -> RoundDecision:
-    """Join this round, or bank the headroom for a better hour of the week.
+    """Join this round, or hold the funds for faster hours.
 
-    Runs after the budget said yes. The allotment is use-it-or-lose-it, so
-    skipping only pays when the banked headroom buys more at a later round
-    than it buys now, and only while banking is still possible: once the
-    headroom exceeds what any round can spend, or the period is about to
-    reset, waiting throws QPU time away.
+    Runs after the budget said yes. A joined round runs to its end, so a
+    join costs a whole round at this slot's rate, and the funds the rest of
+    the period will have (headroom now plus accrual to the reset) cover only
+    some of the rounds left in it. The best use of a fixed allotment across
+    hours of varying rate is to spend it in the fastest ones: rank the
+    remaining rounds by the jobs they would deliver, walk down until their
+    cost exhausts the funds, and join now when this round clears that bar.
     """
     slot = slot_of(now)
-    if snapshot is None or snapshot.lam_global is None:
-        return _no_data(slot)
-    if all(st.jobs_per_s is None for st in snapshot.slots):
+    if snapshot is None or all(st.jobs_per_s is None for st in snapshot.slots):
         return _no_data(slot)
 
     length = snapshot.round_length_s
-    access_s = snapshot.access_s_per_job
+    access_us = snapshot.access_s_per_job * 1_000_000.0
 
-    def deliverable(h_us: float, s: int) -> float:
+    def jobs_in(s: int) -> float:
         st = snapshot.slots[s]
-        by_budget = max(0.0, h_us) / 1_000_000.0 / access_s
         if st.jobs_per_s is None:
-            return by_budget
-        by_rate = st.jobs_per_s * max(0.0, length - (st.rtt_s or 0.0))
-        return min(by_budget, by_rate)
+            return 0.0
+        return st.jobs_per_s * max(0.0, length - (st.rtt_s or 0.0))
 
-    def p_win(s: int, jobs: float) -> float:
-        return 1.0 - math.exp(-snapshot.lam_by_slot[s] * jobs)
+    jobs_now = jobs_in(slot)
+    funds_us = headroom_us + accrual_us_per_s * max(0.0, period_end - now)
+    counts = rounds_by_slot(now, period_end, length)
+    remaining = sum(counts.values())
 
-    jobs_now = deliverable(headroom_us, slot)
-    p_now = p_win(slot, jobs_now)
-
-    # How much headroom one round can spend at best, across the week. Past
-    # that, accrual is lost: the guard that keeps a prepaid allotment spent.
-    cap_jobs = max(
-        st.jobs_per_s * max(0.0, length - (st.rtt_s or 0.0))
-        for st in snapshot.slots
-        if st.jobs_per_s is not None
-    )
-    cap_us = cap_jobs * access_s * 1_000_000.0
-    per_round_us = accrual_us_per_s * length
-    if headroom_us >= cap_us or per_round_us <= 0:
-        k_sat = 0
-    else:
-        k_sat = math.ceil((cap_us - headroom_us) / per_round_us)
-    k_period = int(max(0.0, period_end - now) // length)
-    horizon = min(k_sat, k_period, int(_HORIZON_S // length), _HORIZON_ROUNDS_MAX)
-
-    p_best, k_best = 0.0, 0
-    for k in range(1, horizon + 1):
-        s_k = slot_of(now + k * length)
-        banked = k * per_round_us
-        gain = p_win(s_k, deliverable(headroom_us + banked, s_k)) - p_win(
-            s_k, deliverable(banked, s_k)
-        )
-        if gain > p_best:
-            p_best, k_best = gain, k
+    bar, funded, spent_us = 0.0, 0.0, 0.0
+    for s in sorted(counts, key=jobs_in, reverse=True):
+        jobs = jobs_in(s)
+        cost_us = jobs * access_us
+        if cost_us <= 0.0:
+            # Free rounds cannot exhaust anything: everything from here on
+            # is covered.
+            funded = remaining
+            break
+        affordable = (funds_us - spent_us) / cost_us
+        if affordable < counts[s]:
+            bar = jobs
+            funded += max(0.0, affordable)
+            break
+        spent_us += counts[s] * cost_us
+        funded += counts[s]
 
     def verdict(join: bool, reason: str) -> RoundDecision:
         return RoundDecision(
             join=join,
             reason=reason,
             slot=slot,
-            p_now=p_now,
             expected_jobs=jobs_now,
             jobs_per_s=snapshot.slots[slot].jobs_per_s,
-            lam=snapshot.lam_by_slot[slot],
-            p_best=p_best,
-            wait_slot=slot_of(now + k_best * length) if k_best else None,
-            wait_rounds=k_best,
-            saturates_in_rounds=k_sat,
+            bar_jobs=bar,
+            rounds_funded=funded,
+            rounds_remaining=remaining,
         )
 
-    if explore_draw < config.explore_fraction:
+    if explore_draw < config.participation_chance:
         return verdict(True, REASON_EXPLORE)
-    if horizon == 0:
+    if bar <= 0.0:
         return verdict(True, REASON_SATURATED)
-    if p_now < config.min_win_probability:
-        return verdict(False, REASON_BELOW_MIN)
-    if k_best > 0 and p_best >= p_now * (1.0 + config.slot_advantage):
-        return verdict(False, REASON_BETTER_SLOT)
-    return verdict(True, REASON_GOOD_SHOT)
+    if jobs_now * (1.0 + config.min_throughput_advantage) >= bar:
+        return verdict(True, REASON_FAST_SLOT)
+    return verdict(False, REASON_SLOW_SLOT)
 
 
 def describe_round_decision(generation: int, d: RoundDecision, headroom_us: float) -> str:
@@ -227,22 +215,17 @@ def describe_round_decision(generation: int, d: RoundDecision, headroom_us: floa
     if d.reason == REASON_NO_DATA:
         return f"{head} | no history yet, mining every round the budget allows"
     # Every other reason comes from a snapshot with evidence, so decide_round
-    # always sets both to real floats here; narrow for the format calls below.
-    assert d.p_now is not None and d.expected_jobs is not None
+    # always sets this to a real float here; narrow for the format calls below.
+    assert d.expected_jobs is not None
     rate = f"{d.jobs_per_s:.2f}" if d.jobs_per_s is not None else "?"
-    lam = f"{d.lam:.1e}" if d.lam is not None else "?"
+    now = f"{d.expected_jobs:.0f} jobs at {rate} jobs/s in {slot_label(d.slot)}"
+    funds = f"funds cover {d.rounds_funded:.0f} of {d.rounds_remaining:.0f} rounds left"
     headroom = f"headroom {headroom_us / 1_000_000:.0f}s"
+    if d.reason == REASON_SATURATED:
+        return f"{head} | {now}; every round is covered | {headroom}"
     if d.join:
-        return (
-            f"{head} | P(win) {100 * d.p_now:.1f}% from {d.expected_jobs:.0f} jobs "
-            f"at {rate} jobs/s in {slot_label(d.slot)} | win rate {lam}/job | {headroom}"
-        )
-    wait = slot_label(d.wait_slot) if d.wait_slot is not None else "a later slot"
-    return (
-        f"{head} | P(win) {100 * d.p_now:.1f}% now; banking buys {100 * d.p_best:.1f}% "
-        f"at {wait} in {d.wait_rounds} round(s) | {headroom}, saturates in "
-        f"{d.saturates_in_rounds} round(s)"
-    )
+        return f"{head} | {now}, bar {d.bar_jobs:.0f} | {funds} | {headroom}"
+    return f"{head} | {now} is under the bar of {d.bar_jobs:.0f} | {funds} | {headroom}"
 
 
 class RoundStrategy:

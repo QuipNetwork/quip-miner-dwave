@@ -180,8 +180,11 @@ class ParticipationGate:
       share of a round the field started ahead of us, and the coordinator
       cancels whatever is still staged at the boundary anyway, so the access
       time it costs is spent for nothing.
-    * A stop can happen at any time. Crossing the line mid-round parks the
-      credits immediately; the next join still waits for a boundary.
+    * A joined round runs to its end. The pacing line is a target for the
+      month, not a limit, and stopping at it mid-round throws away the rest
+      of a round the miner committed to. The one mid-round stop is the
+      period's allotment itself being spent; the next join still waits for
+      a boundary.
     """
 
     def __init__(self, pacer: BudgetPacer, strategy: Optional[RoundStrategy] = None):
@@ -224,17 +227,18 @@ class ParticipationGate:
         )
 
     def on_job(self, now: float) -> GateResult:
-        """May this job be sampled? Shuts participation the moment it may not."""
+        """May this job be sampled? Yes while the round is joined and the
+        period's allotment is not spent."""
         if not self._participating:
             return GateResult(
                 allowed=False, changed=False, decision=self._pacer.decide(now)
             )
         decision = self._pacer.decide(now)
-        changed = not decision.participate
+        changed = decision.exhausted
         if changed:
             self._participating = False
         return GateResult(
-            allowed=decision.participate, changed=changed, decision=decision
+            allowed=not decision.exhausted, changed=changed, decision=decision
         )
 
 
@@ -418,11 +422,12 @@ def _log_qblock_sat_out(generation: int, decision: ParticipationDecision) -> Non
     )
 
 
-def _log_line_crossed(decision: ParticipationDecision) -> None:
+def _log_allotment_spent(decision: ParticipationDecision) -> None:
     logger.info(
-        "[QPU] budget line crossed mid-qblock (%.0fs over); parking credits, "
-        "next window in %s and the QPU rejoins at the qblock after that",
-        -decision.headroom_us / 1_000_000,
+        "[QPU] period allotment spent mid-qblock (%.0fs of %.0fs); parking "
+        "credits, the QPU rejoins at the first qblock after the reset in %s",
+        decision.spent_us / 1_000_000,
+        decision.budget_us / 1_000_000,
         _format_duration_ms(int(decision.seconds_until_headroom * 1000)),
     )
 
@@ -481,11 +486,10 @@ def _attach_round_strategy(
     config = strategy_config_from_toml(backend_toml)
     gate.use_strategy(RoundStrategy(config, refresher))
     logger.info(
-        "[QPU] round strategy attached: min_win_probability=%.2f "
-        "slot_advantage=%.2f explore_fraction=%.2f",
-        config.min_win_probability,
-        config.slot_advantage,
-        config.explore_fraction,
+        "[QPU] round strategy attached: min_throughput_advantage=%.2f "
+        "participation_chance=%.2f",
+        config.min_throughput_advantage,
+        config.participation_chance,
     )
 
 
@@ -824,11 +828,12 @@ def run_session(
                 if not skip and kind == "job_request" and gate is not None:
                     # A finished job refills its own credit to keep the pipeline
                     # full mid-qblock. Dropping the refill is what parks the
-                    # credits; the next grant waits for a qblock boundary.
+                    # credits once the allotment is spent; the next grant
+                    # waits for a qblock boundary after the reset.
                     result = gate.on_job(time.time())
                     if not result.allowed:
                         if result.changed:
-                            _log_line_crossed(result.decision)
+                            _log_allotment_spent(result.decision)
                         skip = True
             # History goes after the lock for the same reason billing does:
             # it ends in a SQLite commit, and state_lock is what dispatches
@@ -1082,7 +1087,7 @@ def run_session(
                         _short_job_id(cm.job.job_id),
                     )
                     if gate_result is not None and gate_result.changed:
-                        _log_line_crossed(gate_result.decision)
+                        _log_allotment_spent(gate_result.decision)
                     out_q.put(
                         miner_pb2.MinerMsg(
                             reject=miner_pb2.Reject(
@@ -1094,7 +1099,7 @@ def run_session(
                     # No replacement credit. The coordinator dispatches against
                     # credits alone, so refunding one here turns a shut gate into
                     # a reject/dispatch spin at memory speed — the credits come
-                    # back at the next qblock boundary, if the line allows it.
+                    # back at a qblock boundary, once the line allows it.
                     continue
                 # Submit for concurrent sampling; the pool bounds in-flight to
                 # queue_depth (credits keep the coordinator dispatching that many).
@@ -1213,7 +1218,6 @@ def run_session(
                         time.time(),
                         joined=joined,
                         reason=reason,
-                        p_win=verdict.p_now if verdict is not None else None,
                         expected_jobs=verdict.expected_jobs if verdict is not None else None,
                     )
                     # The coordinator's verdict on the round that just ended

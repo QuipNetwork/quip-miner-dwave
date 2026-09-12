@@ -116,7 +116,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--profile",
         action="store_true",
-        help="print the hour-of-week QPU history and round outcomes, then exit",
+        help="print the day-of-month by hour-of-day QPU history and round outcomes, then exit",
     )
     p.add_argument(
         "--usage-db",
@@ -220,7 +220,7 @@ def run_check(*, force_mock: bool = False) -> int:
 
 
 def run_profile(args: argparse.Namespace) -> int:
-    """``--profile``: print the hour-of-week history and exit. No QPU, no token."""
+    """``--profile``: print the day-of-month by hour-of-day history and exit. No QPU, no token."""
     if not os.path.exists(args.usage_db):
         print(
             f"FAIL: no usage database at {args.usage_db} (set --usage-db)",

@@ -1,8 +1,8 @@
 """Tests for the qblock participation gate.
 
 The gate is the rule that the QPU never half-joins a round: credits go out on a
-qblock boundary or not at all, and they come back the moment the budget line
-is crossed.
+qblock boundary or not at all, a joined round runs to its end, and the one
+thing that parks credits mid-round is the period's allotment being spent.
 """
 
 from __future__ import annotations
@@ -83,45 +83,59 @@ def test_staying_in_across_a_boundary_does_not_re_grant():
     assert second.changed is False  # no state flip -> caller grants nothing
 
 
-def test_crossing_the_line_mid_qblock_parks_credits_immediately():
+def test_crossing_the_pacing_line_mid_qblock_keeps_mining():
+    # The line is a target for the month, not a limit. A joined round runs
+    # to its end however far past the line it goes; the next boundary is
+    # where the overshoot is paid for.
     gate, pacer = gate_with()
     gate.on_qblock_boundary(100, MID_PERIOD)
+    pacer.record_access_time(1500 * 1_000_000, MID_PERIOD)  # 500s past the line
+    result = gate.on_job(MID_PERIOD)
+    assert result.allowed is True
+    assert result.changed is False
     assert gate.participating is True
+    # And that boundary sits the next round out.
+    nxt = gate.on_qblock_boundary(101, MID_PERIOD)
+    assert nxt is not None and nxt.allowed is False and nxt.changed is True
 
-    pacer.record_access_time(1500 * 1_000_000, MID_PERIOD)  # blow past the line mid-round
+
+def test_spending_the_whole_allotment_mid_qblock_parks_credits():
+    gate, pacer = gate_with()
+    gate.on_qblock_boundary(100, MID_PERIOD)
+    pacer.record_access_time(3000 * 1_000_000, MID_PERIOD)  # the whole month, gone
     result = gate.on_job(MID_PERIOD)
     assert result.allowed is False
     assert result.changed is True  # caller logs the stop once
+    assert result.decision.exhausted is True
     assert gate.participating is False
 
 
 def test_the_stop_is_logged_once_not_per_rejected_job():
     gate, pacer = gate_with()
     gate.on_qblock_boundary(100, MID_PERIOD)
-    pacer.record_access_time(1500 * 1_000_000, MID_PERIOD)
+    pacer.record_access_time(3000 * 1_000_000, MID_PERIOD)
     assert gate.on_job(MID_PERIOD).changed is True
     # Every later job in the same shut round is a silent refusal.
     assert gate.on_job(MID_PERIOD).changed is False
     assert gate.on_job(MID_PERIOD).changed is False
 
 
-def test_recovery_waits_for_a_boundary_not_for_the_line():
-    # The line recovers continuously, but rejoining mid-round is exactly what
-    # the gate exists to prevent.
+def test_recovery_waits_for_the_reset_and_a_boundary():
     gate, pacer = gate_with()
     gate.on_qblock_boundary(100, MID_PERIOD)
-    pacer.record_access_time(1500 * 1_000_000, MID_PERIOD)
+    pacer.record_access_time(3000 * 1_000_000, MID_PERIOD)
     gate.on_job(MID_PERIOD)
     assert gate.participating is False
 
-    # Six days later the line has climbed past the spend, but a job alone must
-    # not restart participation.
-    recovered = ts(2026, 9, 25)
-    assert gate.on_job(recovered).allowed is False
+    # Nothing in this period can restart it: the allotment is spent and the
+    # line cannot climb past it.
+    later = ts(2026, 9, 25)
+    assert gate.on_job(later).allowed is False
+    assert gate.on_qblock_boundary(101, later) is not None
     assert gate.participating is False
 
-    # The next boundary does.
-    result = gate.on_qblock_boundary(101, recovered)
+    # The first boundary after the reset does.
+    result = gate.on_qblock_boundary(102, ts(2026, 10, 10))
     assert result is not None and result.allowed is True
     assert gate.participating is True
 

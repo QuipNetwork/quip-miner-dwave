@@ -103,8 +103,8 @@ def test_profile_prints_the_grid(tmp_path, capsys):
     HistoryStore(path).close()
     assert main(["--profile", "--usage-db", path]) == EXIT_CLEAN
     out = capsys.readouterr().out
-    assert "QPU throughput by hour of week" in out
-    assert "Sun" in out
+    assert "QPU throughput by day of month" in out
+    assert "d28 " in out
 
 
 def test_profile_without_a_database_fails_clearly(tmp_path, capsys):
