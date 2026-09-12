@@ -103,6 +103,18 @@ def is_solver_offline(exc: BaseException) -> bool:
     return any(cls.__name__ == "SolverOfflineError" for cls in type(exc).__mro__)
 
 
+def is_solver_unavailable(exc: BaseException) -> bool:
+    """True when the solver cannot be connected to but may come back.
+
+    ``SolverOfflineError`` is D-Wave saying the solver is down. The SDK also
+    raises ``SolverNotFoundError`` for a solver that is listed but offline,
+    because its default filter drops offline solvers, so both mean "wait".
+    Matched by class name for the same reason as :func:`is_solver_offline`.
+    """
+    names = {cls.__name__ for cls in type(exc).__mro__}
+    return bool(names & {"SolverOfflineError", "SolverNotFoundError"})
+
+
 def ocean_importable() -> bool:
     try:
         import dimod  # noqa: F401

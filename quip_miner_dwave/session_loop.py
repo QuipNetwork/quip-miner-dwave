@@ -52,7 +52,7 @@ from quip_miner_dwave.config import (
 from quip_miner_dwave.history import HistoryRecorder, JobSample
 from quip_miner_dwave.job import SolverUnavailable, handle_job
 from quip_solver_core.session import DEFAULT_NUM_SWEEPS, num_sweeps_from_toml
-from quip_miner_dwave.ocean import OceanSampler
+from quip_miner_dwave.ocean import OceanSampler, is_solver_unavailable
 from quip_miner_dwave.profile import SnapshotRefresher
 from quip_miner_dwave.strategy import (
     RoundDecision,
@@ -395,6 +395,32 @@ def _extra_int(meta, key: str) -> Optional[int]:
         return None
 
 
+def _connect_solver(sampler, generation: Optional[int]) -> bool:
+    """Connect to the QPU, or say why not. False means "try again next qblock".
+
+    An offline solver is not fatal. The supervisor restarts a miner that
+    exits six times with a backoff of 0.5 s doubling to 8 s and then gives
+    up, so exiting here left the miner dead until an operator restarted it,
+    even after D-Wave brought the solver back. Sitting the round out instead
+    keeps the session alive and costs one SAPI probe per qblock. Any other
+    connect error (credentials, network) still propagates and is fatal.
+    """
+    try:
+        sampler.ensure_connected()
+        return True
+    except Exception as exc:
+        if not is_solver_unavailable(exc):
+            raise
+        where = "at Configure" if generation is None else f"sitting out qblock {generation}"
+        logger.warning(
+            "[QPU] %s: solver offline (%s); the connect is retried once per "
+            "qblock boundary and no credits go out until it succeeds",
+            where,
+            exc,
+        )
+        return False
+
+
 def _log_qblock_joined(generation: int, decision: ParticipationDecision) -> None:
     logger.info(
         "[QPU] joining qblock %d: %.0fs of headroom on the budget line "
@@ -701,6 +727,9 @@ def run_session(
     # round-trip speed for the whole qblock. The held credits go back out at
     # the next qblock boundary, one probe per round.
     parked_credits = 0
+    # True while the QPU connect fails with an offline solver. The connect is
+    # retried at each qblock boundary; until it succeeds no credits go out.
+    solver_down = False
     job_pool: Optional[ThreadPoolExecutor] = None
     # History of throughput, rounds and margins. None until Configure names
     # the usage database, or forever if it cannot be opened. Optional in the
@@ -965,7 +994,7 @@ def run_session(
                 )
                 # The coordinator has engaged us: connect to the QPU now (a
                 # no-op in mock mode / when already connected).
-                sampler.ensure_connected()
+                solver_down = not _connect_solver(sampler, None)
                 # Uniform config handling: warn on any key the dwave schema
                 # doesn't recognize before consuming the ones it does.
                 warn_unknown_backend_keys(cm.configure.backend_toml)
@@ -1034,7 +1063,11 @@ def run_session(
                 # Local binding so the None check narrows: pending_budget is
                 # captured by process_job, which blocks narrowing on it.
                 pacer = pending_budget
-                if pacer is None:
+                if solver_down:
+                    # Nothing to dispatch against until the connect succeeds;
+                    # the boundary that reconnects grants the depth.
+                    pass
+                elif pacer is None:
                     out_q.put(
                         miner_pb2.MinerMsg(
                             job_request=miner_pb2.JobRequest(credits=depth)
@@ -1182,8 +1215,22 @@ def run_session(
                 # the only monotone round counter the coordinator sends, and it
                 # arrives every round even while the QPU holds no credits. That
                 # makes it the point at which participation is decided.
+                reconnected = False
+                if solver_down:
+                    solver_down = not _connect_solver(sampler, cm.cancel.max_generation)
+                    if not solver_down:
+                        reconnected = True
+                        # The session Topology arrived while the live graph
+                        # was unknown, so it was taken as native. Bind it
+                        # again to compute defects against the real QPU.
+                        if session_nodes:
+                            sampler.set_session_topology(session_nodes, session_edges)
+                        logger.info(
+                            "[QPU] qblock %d: solver back, connected",
+                            cm.cancel.max_generation,
+                        )
                 boundary = None
-                if gate is not None:
+                if gate is not None and not solver_down:
                     with state_lock:
                         boundary = gate.on_qblock_boundary(
                             cm.cancel.max_generation, time.time()
@@ -1224,7 +1271,10 @@ def run_session(
                             )
                 with state_lock:
                     parked, parked_credits = parked_credits, 0
-                if parked:
+                # A connect that just succeeded has nothing out at all, so
+                # the whole depth goes out, not just what a reject parked.
+                owed = queue_depth if reconnected else parked
+                if owed and not solver_down:
                     # A round that just rejoined was granted the full depth
                     # above, and a round sat out gets the full depth when it
                     # rejoins; only a round still mining needs its credits
@@ -1236,14 +1286,14 @@ def run_session(
                     mining = gate is None or gate.participating
                     if mining and not regranted:
                         logger.info(
-                            "[QPU] qblock %d: re-granting %d parked credit(s) "
-                            "to probe the solver",
+                            "[QPU] qblock %d: granting %d credit(s) to probe "
+                            "the solver",
                             cm.cancel.max_generation,
-                            parked,
+                            owed,
                         )
                         out_q.put(
                             miner_pb2.MinerMsg(
-                                job_request=miner_pb2.JobRequest(credits=parked)
+                                job_request=miner_pb2.JobRequest(credits=owed)
                             )
                         )
                 if recorder is not None:
@@ -1264,6 +1314,8 @@ def run_session(
                         # `gate.participating` here is a safe placeholder.
                         joined = boundary.allowed if boundary is not None else gate.participating
                         reason = "budget" if joined else "budget-sat-out"
+                    if solver_down:
+                        joined, reason = False, "solver-offline"
                     fresh = recorder.round_boundary(
                         cm.cancel.max_generation,
                         time.time(),

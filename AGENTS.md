@@ -96,6 +96,11 @@ throws away still costs quota.
   `SolverUnavailable` instead of a refunded reject. The session loop parks the
   credit until the next qblock boundary, so the miner probes the solver once
   per round rather than spinning on rejects at SAPI round-trip speed.
+- An offline solver at connect time is not fatal either. `_connect_solver`
+  logs it, the session sends Ready with no credits, and the connect is
+  retried at each qblock boundary. The round is recorded as `solver-offline`.
+  Exiting instead trips the supervisor's six-restart limit and leaves the
+  miner dead after the solver returns. Other connect errors still exit.
 
 ### Arrays from the wire to SAPI and back
 
