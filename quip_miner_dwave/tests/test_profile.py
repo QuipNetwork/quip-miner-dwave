@@ -118,3 +118,23 @@ def test_seeded_rows_carry_throughput_but_no_round_trip():
     stats = slot_stats(rows, now=MONDAY + 3600)
     assert stats[0].jobs_per_s == pytest.approx(1.0)
     assert stats[0].rtt_s is None and stats[0].queue_s is None
+
+
+def test_round_trip_shrinks_by_its_own_evidence_not_the_total_job_count():
+    # A slot can hold many seeded jobs (throughput only) alongside a few
+    # live ones. Round trip has ten samples behind it, not 1010: shrinking
+    # it with the seeded jobs' count would report it as if it were nearly
+    # as certain as the throughput number, when it is not.
+    mostly_seeded = _row(MONDAY, jobs=1000, busy_ms=500_000, source="attempts")
+    a_few_live = _row(MONDAY, jobs=10, busy_ms=5_000, rtt_ms_sum=30_000, source="live")
+    # Wed 00h is weekday-hour-0's other parent contributor: heavy evidence
+    # for a round trip far from the thin slot's own 3.0 s/job.
+    heavy_parent = _row(MONDAY + 2 * DAY, jobs=2000, busy_ms=1_000_000, rtt_ms_sum=2_000_000, source="live")
+    stats = slot_stats([mostly_seeded, a_few_live, heavy_parent], now=MONDAY + 3 * DAY)
+    mon = stats[0]
+    # The rate's own evidence is the full 1010 jobs, so it stays near 2 jobs/s.
+    assert mon.jobs_per_s == pytest.approx(2.0, rel=0.05)
+    # The round trip's own evidence is 10 live jobs against 200 pseudo-jobs:
+    # it lands close to the parent's ~1.0 s/job, nowhere near the slot's own
+    # 3.0 s/job average.
+    assert mon.rtt_s is not None and mon.rtt_s < 1.5

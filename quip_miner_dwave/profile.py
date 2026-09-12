@@ -120,6 +120,16 @@ class _Acc:
             return None
         return max(0.0, self.sapi_s / self.sapi_jobs - self.access_s / self.jobs)
 
+    def evidence_for(self, measure: str) -> float:
+        """The job count backing one measure: seeded rows carry no round
+        trip and no SAPI timing, so ``rtt`` and ``queue`` have less evidence
+        than ``rate`` does whenever seeded jobs are in the mix."""
+        if measure == "rtt":
+            return self.live_jobs
+        if measure == "queue":
+            return self.sapi_jobs
+        return self.jobs
+
 
 def _shrink(
     value: Optional[float], n: float, prior: Optional[float], pseudo: float
@@ -161,8 +171,12 @@ def slot_stats(
         estimates = []
         for measure in ("rate", "rtt", "queue"):
             overall = getattr(everything, measure)()
-            parent_est = _shrink(getattr(parent, measure)(), parent.jobs, overall, pseudo_jobs)
-            estimates.append(_shrink(getattr(mine, measure)(), mine.jobs, parent_est, pseudo_jobs))
+            parent_est = _shrink(
+                getattr(parent, measure)(), parent.evidence_for(measure), overall, pseudo_jobs
+            )
+            estimates.append(
+                _shrink(getattr(mine, measure)(), mine.evidence_for(measure), parent_est, pseudo_jobs)
+            )
         out.append(
             SlotStats(
                 jobs_per_s=estimates[0],
