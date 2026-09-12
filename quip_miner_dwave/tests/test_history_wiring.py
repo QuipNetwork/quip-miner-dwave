@@ -31,6 +31,11 @@ class QuickSampler:
 
     def __init__(self):
         self.entered = threading.Event()
+        # Set already: sample() returns at once. A test can clear it to hold
+        # an anneal open while it changes state (e.g. sends a Cancel) that
+        # the result should see once the anneal is allowed to finish.
+        self.hold = threading.Event()
+        self.hold.set()
         self.native_topology_hash = None
 
     def ensure_connected(self) -> None:
@@ -50,6 +55,7 @@ class QuickSampler:
 
     def sample(self, nodes, h, edges, j, **kwargs) -> SampleResult:
         self.entered.set()
+        self.hold.wait(timeout=5)
         return SampleResult(
             spins=np.array([[1, -1]], dtype=np.int8),
             variables=[0, 1],
@@ -91,6 +97,15 @@ def _cancel(generation: int) -> miner_pb2.CoordMsg:
     return miner_pb2.CoordMsg(cancel=miner_pb2.Cancel(max_generation=generation))
 
 
+def _wait_until(condition, timeout: float = 5.0, interval: float = 0.01) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(interval)
+    return condition()
+
+
 def _run(monkeypatch, sampler: QuickSampler, usage_db: str, attempts_dir: str) -> List:
     sent: List = []
 
@@ -110,8 +125,12 @@ def _run(monkeypatch, sampler: QuickSampler, usage_db: str, attempts_dir: str) -
         )
         yield _job(generation=2)
         assert sampler.entered.wait(timeout=5), "job never reached the sampler"
-        # Give the worker a moment to fold the result in before the boundary.
-        time.sleep(0.2)
+        # Wait for the worker to fold the result in before the boundary,
+        # instead of guessing how long that takes: its Result is what the
+        # drain thread appends to `sent` once the reply is enqueued.
+        assert _wait_until(
+            lambda: any(m.WhichOneof("msg") == "result" for m in sent)
+        ), "job result never reached the outbound queue"
         yield _cancel(2)
         yield miner_pb2.CoordMsg(shutdown=miner_pb2.Shutdown(grace_ms=100))
 
@@ -197,6 +216,70 @@ def test_a_history_failure_leaves_billing_and_the_reply_untouched(
     sent = _run(monkeypatch, QuickSampler(), usage_db, str(tmp_path / "attempts"))
     assert UsageLedger(usage_db).spent_us_since(0.0) == ACCESS_US
     assert any(m.WhichOneof("msg") == "result" for m in sent)
+
+
+def test_an_abandoned_result_lands_in_wasted_jobs_not_jobs(monkeypatch, usage_db, tmp_path):
+    # A job still in flight when its generation is cancelled comes back as a
+    # "result" anyway (SAPI ran the anneal despite the cancel), and that
+    # completed anneal must count against wasted_jobs, not jobs, or the
+    # estimator's denominator for expected_jobs is wrong.
+    sampler = QuickSampler()
+    sampler.hold.clear()  # hold the anneal open until the cancel lands
+    sent: List = []
+
+    def responses():
+        yield miner_pb2.CoordMsg(welcome=miner_pb2.Welcome(protocol_version=1))
+        yield _configure(usage_db)
+        # A qblock boundary before the job: budget pacing only grants
+        # credits, and lets the gate's job check pass, once one has run.
+        yield _cancel(1)
+        yield miner_pb2.CoordMsg(
+            topology=miner_pb2.Topology(
+                nodes=[0, 1], edges=miner_pb2.EdgeList(u=[0], v=[1]), hash=b""
+            )
+        )
+        yield _job(generation=5)
+        assert sampler.entered.wait(timeout=5), "job never reached the sampler"
+        yield _cancel(5)  # abandons generation 5 while the anneal is still held
+        sampler.hold.set()  # only now let it finish, already abandoned
+        yield miner_pb2.CoordMsg(shutdown=miner_pb2.Shutdown(grace_ms=100))
+
+    class _Stub:
+        def __init__(self, channel):
+            pass
+
+        def Session(self, request_iter):
+            def drain():
+                for msg in request_iter:
+                    sent.append(msg)
+
+            threading.Thread(target=drain, daemon=True).start()
+            return responses()
+
+    class _Channel:
+        def close(self):
+            pass
+
+    class _Ready:
+        def result(self, timeout=None):
+            return True
+
+    monkeypatch.setattr(session_loop.grpc, "insecure_channel", lambda *a, **k: _Channel())
+    monkeypatch.setattr(session_loop.grpc, "channel_ready_future", lambda ch: _Ready())
+    monkeypatch.setattr(session_loop.miner_pb2_grpc, "MinerServiceStub", _Stub)
+    monkeypatch.setenv("QUIP_SESSION_TOKEN", "test-token")
+
+    session_loop.run_session(
+        "unix:///tmp/nope.sock",
+        "qpu-test",
+        cast(OceanSampler, sampler),
+        attempts_dir=str(tmp_path / "attempts"),
+    )
+
+    # SPEC section 5: no Result for an abandoned generation.
+    assert not any(m.WhichOneof("msg") == "result" for m in sent)
+    (hour,) = HistoryStore(usage_db).hourly_rows(0)
+    assert (hour["jobs"], hour["wasted_jobs"]) == (0, 1)
 
 
 def test_an_unreadable_history_path_does_not_stop_mining(monkeypatch, tmp_path):

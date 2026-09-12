@@ -1098,11 +1098,14 @@ def run_session(
                 if recorder is not None:
                     if gate is None:
                         joined, reason = True, "unbudgeted"
-                    elif boundary is not None:
-                        joined = boundary.allowed
-                        reason = "budget" if joined else "budget-sat-out"
                     else:
-                        joined, reason = gate.participating, "repeat"
+                        # `boundary` is only None on a repeated watermark,
+                        # which is exactly the condition that makes
+                        # `round_boundary` below a no-op: it discards
+                        # `joined`/`reason` without writing them, so
+                        # `gate.participating` here is a safe placeholder.
+                        joined = boundary.allowed if boundary is not None else gate.participating
+                        reason = "budget" if joined else "budget-sat-out"
                     fresh = recorder.round_boundary(
                         cm.cancel.max_generation,
                         time.time(),

@@ -139,7 +139,9 @@ busy time, round trips, and the D-Wave service time from SAPI's
 last holds a histogram of each job's best energy relative to the round's
 target. The round strategy reads them. Nothing about mining depends on
 them. A database that fails to open disables the history and logs one
-warning.
+warning. Every write from the session thread and the job workers goes
+through the recorder's one worker thread. The seed and outcome-pickup
+threads below write through the database's own lock instead.
 
 At start the miner seeds past rounds from the coordinator's attempts files,
 `<data_dir>/<qblock_id>/attempts.jsonl`. The default location is the
@@ -152,6 +154,8 @@ one QPU miner does not absorb a sibling miner's history.
 jobs per second, the grid of D-Wave queue wait, the win summary for
 weekdays and weekends, and the last 20 rounds with the strategy's predicted
 win probability beside what happened. It needs no QPU and no token.
+`--usage-db` applies to `--profile` only. A session reads the coordinator's
+`usage_db` key instead.
 
 ## Tests
 

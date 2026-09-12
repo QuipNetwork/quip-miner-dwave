@@ -7,6 +7,7 @@ beside what happened. The SQLite file stays the machine-readable surface.
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime, timezone
 from typing import Callable, List, Optional
 
@@ -48,7 +49,7 @@ def _utc(ts: float) -> str:
     return datetime.fromtimestamp(ts, timezone.utc).strftime("%m-%d %H:%M")
 
 
-def _summary(rows, name: str) -> str:
+def _summary(rows: List[sqlite3.Row], name: str) -> str:
     jobs = sum(int(r["jobs"]) for r in rows)
     wins = sum(int(r["won"]) for r in rows)
     line = f"{name}: {len(rows)} rounds joined, {wins} won, {jobs} jobs"

@@ -219,7 +219,7 @@ def run_check(*, force_mock: bool = False) -> int:
     return EXIT_CLEAN
 
 
-def run_profile(args) -> int:
+def run_profile(args: argparse.Namespace) -> int:
     """``--profile``: print the hour-of-week history and exit. No QPU, no token."""
     if not os.path.exists(args.usage_db):
         print(

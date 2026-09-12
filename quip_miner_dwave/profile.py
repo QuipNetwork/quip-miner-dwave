@@ -24,7 +24,8 @@ class Row(Protocol):
     """What a slot needs from a row: field lookup by name.
 
     A plain ``dict`` (tests) and ``sqlite3.Row`` (``HistoryStore.hourly_rows``)
-    both satisfy this; neither is a ``typing.Mapping``.
+    both satisfy this; a ``dict`` is a ``typing.Mapping``, but ``sqlite3.Row``
+    is not, which is why this is a narrower ``Protocol`` instead.
     """
 
     def __getitem__(self, key: str, /) -> Any: ...
@@ -35,7 +36,7 @@ SECONDS_PER_WEEK = 7 * 86_400
 DAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
 # 1970-01-01 was a Thursday, so epoch hour 0 is Thursday 00:00 UTC, which is
-# 96 hours after the Monday 00:00 that slot 0 names. Adding 72 is subtracting
+# 72 hours after the Monday 00:00 that slot 0 names. Adding 72 is subtracting
 # 96, modulo 168.
 _EPOCH_OFFSET_HOURS = 72
 

@@ -520,12 +520,18 @@ _WARN_INTERVAL_S = 60.0
 class HistoryRecorder:
     """The session loop's view of the history: never raises, never blocks it.
 
-    Every store write is queued to one worker thread. Job workers call in
-    after billing, and the session thread calls in at Cancel and SetTarget;
-    neither waits on SQLite, and the single thread keeps writes in order, so
-    a round is opened before its jobs are folded in. A failure costs a row of
-    history and nothing else. The busy clock and the generation-to-round map
-    live here because the store has no notion of "the current round".
+    Every write from the session thread and the job workers is queued to
+    this recorder's one worker thread. Job workers call in after billing,
+    and the session thread calls in at Cancel and SetTarget; neither waits
+    on SQLite, and the single thread keeps writes in order, so a round is
+    opened before its jobs are folded in. A failure costs a row of history
+    and nothing else. The busy clock and the generation-to-round map live
+    here because the store has no notion of "the current round".
+
+    The seed and pickup threads (``attempts.seed_from_attempts``,
+    ``attempts.pickup_outcomes``) are the exception: they write through
+    ``self.store`` directly, on their own threads, serialized by the
+    store's own lock rather than this recorder's queue.
     """
 
     def __init__(self, store: HistoryStore):

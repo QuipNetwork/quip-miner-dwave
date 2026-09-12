@@ -147,9 +147,12 @@ without a migration. The design and the queueing-theory background are in
 `docs/superpowers/specs/2026-09-11-qpu-time-of-week-strategy-design.md`.
 
 `HistoryRecorder` is the only thing the session loop talks to, and it never
-raises. Every write goes through one worker thread, so `Cancel` and
-`SetTarget` handling never touch SQLite. Job workers record after billing
-and outside `state_lock`, for the same reason billing does.
+raises. Every write from the session thread and the job workers goes
+through the recorder's one worker thread, so `Cancel` and `SetTarget`
+handling never touch SQLite. Job workers record after billing and outside
+`state_lock`, for the same reason billing does. The seed and pickup threads
+are the exception: they write through the store directly, serialized by
+the store's own lock rather than the recorder's queue.
 
 Two rules are easy to get wrong. `Cancel(max_generation=N)` names the dead
 generation, so the round it opens is keyed as generation `N + 1`, which is
@@ -161,7 +164,7 @@ Past rounds are seeded from the coordinator's attempts files
 (`attempts.seed_from_attempts`). A directory the miner was live for — a
 generation the live recorder already opened, or an hour of the directory's
 own span that a live hourly row covers — only contributes outcomes and any
-round row a live Cancel never opened; its margins and hourly sums would
+round row a live Cancel never opened. Its margins and hourly sums would
 double count. The coordinator's generations restart independently, so a
 round means one directory paired with one generation number, not a
 generation number alone.
