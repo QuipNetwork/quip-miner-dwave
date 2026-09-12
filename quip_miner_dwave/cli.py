@@ -5,9 +5,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import signal
 import sys
 import threading
+import time
 
 from google.protobuf.json_format import MessageToDict
 
@@ -18,6 +20,7 @@ from quip_miner_dwave import (
     EXIT_INTERNAL_FATAL,
     __version__,
 )
+from quip_miner_dwave.budget import DEFAULT_USAGE_DB
 from quip_miner_dwave.capture import (
     DEFAULT_ALLOWED_H_MILLI,
     DEFAULT_ALLOWED_J_MILLI,
@@ -27,6 +30,7 @@ from quip_miner_dwave.capture import (
     load_spec,
     write_spec,
 )
+from quip_miner_dwave.history import HistoryStore
 from quip_miner_dwave.ocean import (
     OceanSampler,
     SupportsClose,
@@ -35,6 +39,7 @@ from quip_miner_dwave.ocean import (
     mock_mode_enabled,
     ocean_importable,
 )
+from quip_miner_dwave.report import render_profile
 from quip_miner_dwave.session_loop import capabilities_message, run_session_sync
 
 
@@ -107,6 +112,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="coordinator attempts directory to seed round history from "
         "(default: the 'attempts' directory beside the usage database)",
+    )
+    p.add_argument(
+        "--profile",
+        action="store_true",
+        help="print the hour-of-week QPU history and round outcomes, then exit",
+    )
+    p.add_argument(
+        "--usage-db",
+        metavar="PATH",
+        default=DEFAULT_USAGE_DB,
+        help="usage database to read for --profile "
+        f"(default: {DEFAULT_USAGE_DB})",
     )
     return p
 
@@ -202,6 +219,22 @@ def run_check(*, force_mock: bool = False) -> int:
     return EXIT_CLEAN
 
 
+def run_profile(args) -> int:
+    """``--profile``: print the hour-of-week history and exit. No QPU, no token."""
+    if not os.path.exists(args.usage_db):
+        print(
+            f"FAIL: no usage database at {args.usage_db} (set --usage-db)",
+            file=sys.stderr,
+        )
+        return EXIT_CONFIG_INVALID
+    store = HistoryStore(args.usage_db)
+    try:
+        print(render_profile(store, time.time()))
+    finally:
+        store.close()
+    return EXIT_CLEAN
+
+
 def install_sigterm_handler(sampler: SupportsClose) -> None:
     """Register a SIGTERM handler that closes ``sampler`` before exiting.
 
@@ -250,6 +283,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.capabilities:
         print_capabilities()
         return EXIT_CLEAN
+    if args.profile:
+        return run_profile(args)
     # Before anything reads credentials: a v0.2 node delivers the token under
     # the pre-Ocean name, and both --check and the session path resolve it
     # through the SDK.
