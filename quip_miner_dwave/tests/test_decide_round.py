@@ -82,6 +82,8 @@ def test_no_snapshot_or_no_evidence_joins_with_no_data():
         d = _decide(snap)
         assert d.join and d.reason == REASON_NO_DATA
         assert d.slot == SLOT_NOW
+        # No history means no prediction was made, not a prediction of zero.
+        assert d.p_now is None and d.expected_jobs is None
 
 
 def test_deliverable_jobs_is_the_smaller_of_budget_and_rate():
@@ -101,6 +103,7 @@ def test_banking_in_an_identical_slot_is_never_better():
     # Same rate and win rate everywhere: concavity says spend now.
     d = _decide(_snapshot())
     assert d.join and d.reason == REASON_GOOD_SHOT
+    assert d.p_now is not None  # history exists, so a real prediction was made
     assert d.p_best < d.p_now
 
 
@@ -111,6 +114,7 @@ def test_a_higher_win_rate_within_the_horizon_defers():
     d = _decide(_snapshot({NEXT_HOUR: 3.0}, lam_slots={NEXT_HOUR: 3 * LAM}))
     assert not d.join and d.reason == REASON_BETTER_SLOT
     assert d.wait_slot == NEXT_HOUR and d.wait_rounds == 6
+    assert d.p_now is not None  # history exists, so a real prediction was made
     assert d.p_best >= d.p_now * 1.25
     assert d.saturates_in_rounds == 10
 
@@ -153,6 +157,7 @@ def test_the_period_end_bounds_the_horizon():
 def test_below_the_minimum_probability_skips_while_banking_is_possible():
     d = _decide(_snapshot(), config=StrategyConfig(min_win_probability=0.5))
     assert not d.join and d.reason == REASON_BELOW_MIN
+    assert d.p_now is not None  # history exists, so a real prediction was made
     assert d.p_now < 0.5
 
 

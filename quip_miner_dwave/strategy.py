@@ -92,8 +92,10 @@ class RoundDecision:
     join: bool
     reason: str
     slot: int
-    p_now: float
-    expected_jobs: float
+    # None on a no-data verdict: no history means no prediction was made,
+    # not a prediction of zero.
+    p_now: Optional[float]
+    expected_jobs: Optional[float]
     jobs_per_s: Optional[float]
     lam: Optional[float]
     # The marginal win probability banking the headroom buys at the best
@@ -109,8 +111,8 @@ def _no_data(slot: int) -> RoundDecision:
         join=True,
         reason=REASON_NO_DATA,
         slot=slot,
-        p_now=0.0,
-        expected_jobs=0.0,
+        p_now=None,
+        expected_jobs=None,
         jobs_per_s=None,
         lam=None,
         p_best=0.0,
@@ -218,6 +220,9 @@ def describe_round_decision(generation: int, d: RoundDecision, headroom_us: floa
     head = f"[QPU] qblock {generation}: {'join' if d.join else 'skip'} ({d.reason})"
     if d.reason == REASON_NO_DATA:
         return f"{head} | no history yet, mining every round the budget allows"
+    # Every other reason comes from a snapshot with evidence, so decide_round
+    # always sets both to real floats here; narrow for the format calls below.
+    assert d.p_now is not None and d.expected_jobs is not None
     rate = f"{d.jobs_per_s:.2f}" if d.jobs_per_s is not None else "?"
     lam = f"{d.lam:.1e}" if d.lam is not None else "?"
     headroom = f"headroom {headroom_us / 1_000_000:.0f}s"
