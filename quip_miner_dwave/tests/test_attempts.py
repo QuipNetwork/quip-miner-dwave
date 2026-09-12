@@ -129,7 +129,8 @@ def test_seed_inserts_only_complete_directories():
     assert [r["generation"] for r in rows] == [382]
     row = rows[0]
     assert row["source"] == "attempts" and row["joined"] == 1
-    assert (row["jobs"], row["hits"], row["hits_coord"], row["won"]) == (6, 1, 1, 1)
+    # hits is left at its default: the attempts file has no per-read count.
+    assert (row["jobs"], row["hits"], row["hits_coord"], row["won"]) == (6, 0, 1, 1)
     assert row["target_milli"] == -14_546_432 and row["end_ts_s"] == 1788893124
     assert store.margin_counts(0) == {-3: 1, 173: 1, 181: 1, 237: 1, 243: 1, 299: 1}
     (hour,) = store.hourly_rows(0)

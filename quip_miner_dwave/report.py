@@ -76,12 +76,12 @@ def render_profile(store: HistoryStore, now: float) -> str:
     lines.append(_summary([r for r in joined if is_weekend(slot_of(r["start_ts_s"]))], "Weekends"))
     lines.append("")
     lines.append(f"Last {RECENT_ROUNDS} rounds (UTC):")
-    lines.append("start        slot     verdict  reason           P(win)  jobs  hits  won")
+    lines.append("start        slot     verdict  reason           P(win)  jobs    hits  won")
     for r in rounds[:RECENT_ROUNDS]:
         p = "-" if r["p_win"] is None else f"{100 * r['p_win']:.1f}%"
         lines.append(
             f"{_utc(r['start_ts_s']):<12} {slot_label(slot_of(r['start_ts_s'])):<8} "
             f"{'join' if r['joined'] else 'skip':<8} {r['reason']:<16} {p:>6}  "
-            f"{r['jobs']:>4}  {r['hits']:>4}  {'W' if r['won'] else ''}"
+            f"{r['jobs']:>4}  {r['hits']:>6}  {'W' if r['won'] else ''}"
         )
     return "\n".join(lines)

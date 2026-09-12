@@ -128,6 +128,9 @@ def test_apply_attempt_round_updates_a_live_row_and_inserts_a_missing_one():
     rows = {r["generation"]: r for r in store.rounds(since_ts=0, limit=10)}
     assert rows[5]["won"] == 1 and rows[5]["hits_coord"] == 1 and rows[5]["source"] == "live"
     assert rows[9]["source"] == "attempts" and rows[9]["jobs"] == 3 and rows[9]["joined"] == 1
+    # hits counts reads at or below the target; the attempts file has no
+    # per-read count, only hits_coord (attempts the coordinator accepted).
+    assert rows[9]["hits"] == 0 and rows[9]["hits_coord"] == 1
     assert 10 not in rows
 
 

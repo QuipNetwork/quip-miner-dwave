@@ -54,3 +54,28 @@ def test_the_report_lists_recent_rounds_with_predicted_and_actual():
     rows = [line for line in out.splitlines() if " join " in line or " skip " in line]
     assert any("Mon 13h" in r and "join" in r and "4.2%" in r and "budget" in r for r in rows)
     assert any("Sat 00h" in r and "skip" in r and "budget-sat-out" in r for r in rows)
+
+
+def test_the_hits_column_is_wide_enough_for_a_joined_round_s_read_count():
+    # A joined round's hits (reads at or below target) can run into five
+    # digits; a four-character column runs it into the next column.
+    store = HistoryStore(":memory:")
+    start = int(MONDAY + 13 * 3600)
+    store.open_round(start, 2, joined=True, reason="budget", p_win=None, expected_jobs=None)
+    store.record_job(
+        JobSample(
+            completed_at=MONDAY + 13 * 3600 + 1,
+            generation=2,
+            rtt_ms=3000,
+            access_us=46_000,
+            inflight_at_submit=1,
+            reads=1,
+            best_energy_milli=-100,
+            target_milli=-50,
+            hits=12_345,
+        ),
+        round_start_ts=start,
+    )
+    out = render_profile(store, now=MONDAY + 6 * 86_400)
+    row = next(line for line in out.splitlines() if "Mon 13h" in line)
+    assert "   12345" in row  # six-wide right-aligned: one pad space plus the two-space separator

@@ -423,7 +423,10 @@ class HistoryStore:
                     summary.last_ts_s,
                     summary.threshold_milli,
                     summary.jobs,
-                    summary.hits_coord,
+                    # hits counts reads at or below the target; the attempts
+                    # file has no per-read count, only hits_coord (attempts
+                    # the coordinator accepted). Left at its default of 0.
+                    0,
                     summary.hits_coord,
                     summary.best_energy_milli,
                     summary.access_us,
