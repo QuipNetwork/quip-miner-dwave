@@ -27,7 +27,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Dict, Generator, List, Optional, Sequence, Tuple
 
 from quip_miner_dwave.usage import SECONDS_PER_HOUR, hour_floor
 
@@ -207,6 +207,14 @@ class HistoryStore:
         for pragma in _PRAGMAS:
             self._db.execute(pragma)
         self._db.executescript(_SCHEMA)
+        # The first build of this table carried a lines_seen column that
+        # nothing read. CREATE TABLE IF NOT EXISTS leaves an existing table
+        # alone, and its NOT NULL would then reject every mark_seeded.
+        columns = {
+            row["name"] for row in self._db.execute("PRAGMA table_info(seeded_dirs)")
+        }
+        if "lines_seen" in columns:
+            self._db.execute("ALTER TABLE seeded_dirs DROP COLUMN lines_seen")
         self._db.commit()
 
     def _commit(self) -> None:
@@ -215,7 +223,7 @@ class HistoryStore:
             self._db.commit()
 
     @contextmanager
-    def batch(self) -> Iterator[None]:
+    def batch(self) -> Generator[None, None, None]:
         """Group several writes into one transaction.
 
         Reentrant: a method called from inside an open batch still takes

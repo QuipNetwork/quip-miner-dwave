@@ -178,6 +178,23 @@ def test_history_survives_reopening(tmp_path):
     reopened.close()
 
 
+def test_a_seeded_dirs_table_from_the_first_build_is_repaired_on_open(tmp_path):
+    import sqlite3
+
+    path = str(tmp_path / "usage.db")
+    old = sqlite3.connect(path)
+    old.execute(
+        "CREATE TABLE seeded_dirs (dir_name TEXT PRIMARY KEY, lines_seen INTEGER NOT NULL)"
+    )
+    old.execute("INSERT INTO seeded_dirs VALUES ('100', 7)")
+    old.commit()
+    old.close()
+    store = HistoryStore(path)
+    store.mark_seeded("200")
+    assert store.is_seeded("100") and store.is_seeded("200")
+    store.close()
+
+
 def test_history_shares_a_file_with_the_usage_ledger(tmp_path):
     from quip_miner_dwave.usage import UsageLedger
 
