@@ -181,6 +181,17 @@ slot_advantage = 0.25       # defer when a later slot buys 25% more P(win) from 
 explore_fraction = 0.10     # join this share of rounds regardless, so every slot stays measured
 ```
 
+The `reason` column in `--profile` and the strategy's log line name the verdict with one of these strings:
+
+- `no-data`: no history yet, so every round the budget allows is joined.
+- `explore`: the explore share drew this round regardless of the verdict below.
+- `saturated`: banking is no longer possible, so the round is joined.
+- `below-min-p`: this round's P(win) is below `min_win_probability`, so it is skipped.
+- `better-slot`: a later slot buys more P(win) from the same headroom, so this round is skipped.
+- `good-shot`: none of the above applies, so the round is joined.
+
+Three reasons predate the strategy and still appear where it plays no part: `budget` (the budget allowed the round and no strategy is attached yet), `budget-sat-out` (the budget line was crossed, before any strategy is consulted), and `unbudgeted` (no budget is configured, so every round is joined).
+
 ## Tests
 
 ```sh

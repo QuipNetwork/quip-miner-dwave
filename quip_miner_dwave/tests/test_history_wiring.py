@@ -7,6 +7,7 @@ any failure here is that the ledger bills exactly what it billed before.
 
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 import time
@@ -72,6 +73,16 @@ def _configure(usage_db: str) -> miner_pb2.CoordMsg:
             queue_depth=3,
             idle_timeout_s=300,
             backend_toml=f'budget = "3000s"\nusage_db = "{usage_db}"\n',
+        )
+    )
+
+
+def _configure_without_budget(usage_db: str) -> miner_pb2.CoordMsg:
+    return miner_pb2.CoordMsg(
+        configure=miner_pb2.Configure(
+            queue_depth=3,
+            idle_timeout_s=300,
+            backend_toml=f'usage_db = "{usage_db}"\n',
         )
     )
 
@@ -294,6 +305,59 @@ def test_an_abandoned_result_lands_in_wasted_jobs_not_jobs(monkeypatch, usage_db
     assert not any(m.WhichOneof("msg") == "result" for m in sent)
     (hour,) = HistoryStore(usage_db).hourly_rows(0)
     assert (hour["jobs"], hour["wasted_jobs"]) == (0, 1)
+
+
+def test_a_budget_named_after_the_recorder_exists_still_gets_a_strategy(
+    monkeypatch, usage_db, tmp_path, caplog
+):
+    # First Configure names no budget: the recorder and refresher get built,
+    # but there is no gate for a strategy to attach to. Second Configure
+    # names a budget: the gate is created only now, after the refresher
+    # already exists, so the attach has to happen at the gate too, not only
+    # at the recorder.
+    sampler = QuickSampler()
+    sent: List = []
+
+    def responses():
+        yield miner_pb2.CoordMsg(welcome=miner_pb2.Welcome(protocol_version=1))
+        yield _configure_without_budget(usage_db)
+        yield _configure(usage_db)
+        yield miner_pb2.CoordMsg(shutdown=miner_pb2.Shutdown(grace_ms=100))
+
+    class _Stub:
+        def __init__(self, channel):
+            pass
+
+        def Session(self, request_iter):
+            def drain():
+                for msg in request_iter:
+                    sent.append(msg)
+
+            threading.Thread(target=drain, daemon=True).start()
+            return responses()
+
+    class _Channel:
+        def close(self):
+            pass
+
+    class _Ready:
+        def result(self, timeout=None):
+            return True
+
+    monkeypatch.setattr(session_loop.grpc, "insecure_channel", lambda *a, **k: _Channel())
+    monkeypatch.setattr(session_loop.grpc, "channel_ready_future", lambda ch: _Ready())
+    monkeypatch.setattr(session_loop.miner_pb2_grpc, "MinerServiceStub", _Stub)
+    monkeypatch.setenv("QUIP_SESSION_TOKEN", "test-token")
+
+    with caplog.at_level(logging.INFO):
+        session_loop.run_session(
+            "unix:///tmp/nope.sock",
+            "qpu-test",
+            cast(OceanSampler, sampler),
+            attempts_dir=str(tmp_path / "attempts"),
+        )
+
+    assert any("round strategy attached" in r.getMessage() for r in caplog.records)
 
 
 def test_an_unreadable_history_path_does_not_stop_mining(monkeypatch, tmp_path):

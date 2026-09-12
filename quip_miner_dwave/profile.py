@@ -233,7 +233,12 @@ def posterior_win_rate(prior: float, wins: float, jobs: float) -> float:
 
 @dataclass(frozen=True)
 class Snapshot:
-    """Everything the boundary decision reads. Built off the session thread."""
+    """Everything the boundary decision reads. Built off the session thread.
+
+    ``lam_by_slot`` is meaningful only when ``lam_global`` is set: without
+    any evidence at all it is all zeros, and every caller that reads it
+    already returns on ``lam_global is None`` first.
+    """
 
     built_at: float
     slots: List[SlotStats]
@@ -280,6 +285,9 @@ def build_snapshot(
     ][:ROUND_LENGTH_SAMPLE]
     round_length = _median(lengths) if lengths else DEFAULT_ROUND_LENGTH_S
 
+    # `won` defaults to 0 until the coordinator's attempts file publishes the
+    # round's outcome, so the newest round or two here still read as a loss
+    # for a while. Conservative, and negligible against a window this wide.
     joined = [r for r in rounds if r["joined"] and int(r["jobs"]) > 0]
     wins = sum(int(r["won"]) for r in joined)
     jobs_in_rounds = sum(int(r["jobs"]) for r in joined)

@@ -94,6 +94,42 @@ def test_the_global_rate_is_the_posterior_of_the_histogram_prior():
     assert snap.lam_global == pytest.approx(posterior_win_rate(prior, wins=1, jobs=200))
 
 
+def test_rounds_with_no_margin_histogram_fall_back_to_the_round_rate_as_a_prior():
+    # Seeded history from before margins were recorded: jobs and a won round
+    # exist, but no job carried an energy to bin, so the histogram is empty.
+    store = HistoryStore(":memory:")
+    start = MONDAY + 13 * 3600
+    store.open_round(start, 2, joined=True, reason="budget", p_win=None, expected_jobs=None)
+    store.close_round(start, start + 600)
+    for i in range(200):
+        store.record_job(
+            JobSample(
+                completed_at=start + 1 + i,
+                generation=2,
+                rtt_ms=3000,
+                access_us=46_000,
+                inflight_at_submit=1,
+                reads=48,
+                best_energy_milli=None,
+                target_milli=None,
+                hits=0,
+            ),
+            round_start_ts=int(start),
+        )
+    store.apply_attempt_round(
+        AttemptRoundSummary(
+            generation=2, first_ts_s=int(start) + 1, last_ts_s=int(start) + 200,
+            jobs=200, hits_coord=1, won=True, best_energy_milli=-14_560_000,
+            threshold_milli=-14_554_000, access_us=46_000 * 200, margins={},
+        ),
+        insert_missing=False,
+    )
+    assert store.margin_counts(0) == {}
+    snap = build_snapshot(store, NOW)
+    assert snap.jobs_in_rounds == 200 and snap.wins == 1
+    assert snap.lam_global == pytest.approx(posterior_win_rate((1 + 0.5) / (200 + 1), wins=1, jobs=200))
+
+
 def test_round_length_is_the_median_of_closed_live_rounds():
     store = HistoryStore(":memory:")
     for i, length in enumerate((500, 900, 600)):

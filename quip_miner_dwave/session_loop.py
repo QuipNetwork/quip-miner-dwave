@@ -468,6 +468,27 @@ def _log_budget_configured(pacer: BudgetPacer, now: float) -> None:
         )
 
 
+def _attach_round_strategy(
+    gate: ParticipationGate, refresher: SnapshotRefresher, backend_toml: str
+) -> None:
+    """Give the gate a strategy once both a budget and history exist.
+
+    Called from whichever of the two Configure branches runs second: the
+    budget can name a gate before the recorder exists, or the recorder can
+    exist before a budget names a gate. Either order ends with a strategy
+    attached.
+    """
+    config = strategy_config_from_toml(backend_toml)
+    gate.use_strategy(RoundStrategy(config, refresher))
+    logger.info(
+        "[QPU] round strategy attached: min_win_probability=%.2f "
+        "slot_advantage=%.2f explore_fraction=%.2f",
+        config.min_win_probability,
+        config.slot_advantage,
+        config.explore_fraction,
+    )
+
+
 def log_attempt(
     job_id: bytes,
     *,
@@ -840,9 +861,12 @@ def run_session(
             out_q.put(reply)
 
     def _stop_history_threads() -> None:
-        # The refresher stops first: a refresh in flight reads the store, and
-        # both history threads can still be writing to it below, so stopping
-        # it first keeps its own join from racing their writes.
+        # The refresher stops first, and its join is bounded at two seconds:
+        # what that order buys is the join finishing before the recorder
+        # below closes the store. A refresh still in flight when the store
+        # does close is not silently lost -- its next query raises, and
+        # refresh_now logs one warning and returns the snapshot already in
+        # hand, nothing else.
         if refresher is not None:
             refresher.stop()
         # The seed can take tens of seconds on a node with a thousand-plus
@@ -950,6 +974,12 @@ def run_session(
                         break
                     if pending_budget is not None:
                         gate = ParticipationGate(pending_budget)
+                        # The recorder (and its refresher) may already exist
+                        # from an earlier Configure that named no budget.
+                        if refresher is not None:
+                            _attach_round_strategy(
+                                gate, refresher, cm.configure.backend_toml
+                            )
                 out_q.put(miner_pb2.MinerMsg(ready=miner_pb2.Ready()))
                 # Read straight off the wire, not off SessionConfig: the SDK
                 # substitutes its own default of 3 for an unset field, which
@@ -992,11 +1022,8 @@ def run_session(
                         refresher = SnapshotRefresher(recorder.store)
                         refresher.start()
                         if gate is not None:
-                            gate.use_strategy(
-                                RoundStrategy(
-                                    strategy_config_from_toml(cm.configure.backend_toml),
-                                    refresher,
-                                )
+                            _attach_round_strategy(
+                                gate, refresher, cm.configure.backend_toml
                             )
                         # Past rounds come from the coordinator's attempts
                         # files, hundreds of megabytes on a long-lived node:
@@ -1167,6 +1194,10 @@ def run_session(
                     verdict = boundary.round if boundary is not None else None
                     if gate is None:
                         joined, reason = True, "unbudgeted"
+                    # `boundary is not None` is implied by `verdict is not
+                    # None` (verdict comes from boundary.round above), but
+                    # pyright cannot narrow through that assignment, so the
+                    # second conjunct is here only to satisfy it.
                     elif verdict is not None and boundary is not None:
                         joined, reason = boundary.allowed, verdict.reason
                     else:
