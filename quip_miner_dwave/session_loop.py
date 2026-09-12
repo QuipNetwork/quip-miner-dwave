@@ -14,7 +14,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Iterator, Optional, Tuple
+from typing import Callable, Iterator, Optional, Tuple
 
 import grpc
 
@@ -53,6 +53,13 @@ from quip_miner_dwave.history import HistoryRecorder, JobSample
 from quip_miner_dwave.job import handle_job
 from quip_solver_core.session import DEFAULT_NUM_SWEEPS, num_sweeps_from_toml
 from quip_miner_dwave.ocean import OceanSampler
+from quip_miner_dwave.profile import SnapshotRefresher
+from quip_miner_dwave.strategy import (
+    RoundDecision,
+    RoundStrategy,
+    describe_round_decision,
+    strategy_config_from_toml,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +164,8 @@ class GateResult:
     allowed: bool
     changed: bool
     decision: ParticipationDecision
+    # The strategy's verdict, when the budget allowed one to be asked for.
+    round: Optional[RoundDecision] = None
 
 
 class ParticipationGate:
@@ -175,8 +184,9 @@ class ParticipationGate:
       credits immediately; the next join still waits for a boundary.
     """
 
-    def __init__(self, pacer: BudgetPacer):
+    def __init__(self, pacer: BudgetPacer, strategy: Optional[RoundStrategy] = None):
         self._pacer = pacer
+        self._strategy = strategy
         self._participating = False
         self._boundary_generation = 0
 
@@ -184,18 +194,33 @@ class ParticipationGate:
     def participating(self) -> bool:
         return self._participating
 
+    def use_strategy(self, strategy: RoundStrategy) -> None:
+        """Attach the round strategy once history exists. Budget-only before."""
+        self._strategy = strategy
+
     def on_qblock_boundary(
         self, generation: int, now: float
     ) -> Optional[GateResult]:
-        """Re-decide at a new qblock. None when this is not a fresh boundary."""
+        """Re-decide at a new qblock. None when this is not a fresh boundary.
+
+        Budget first, strategy second: the strategy is only asked whether a
+        round the miner can afford is worth it. A skip parks credits the same
+        way a budget line crossing does, and the next join waits for a
+        boundary as before.
+        """
         if generation <= self._boundary_generation:
             return None
         self._boundary_generation = generation
         decision = self._pacer.decide(now)
-        changed = decision.participate != self._participating
-        self._participating = decision.participate
+        allowed = decision.participate
+        verdict: Optional[RoundDecision] = None
+        if allowed and self._strategy is not None:
+            verdict = self._strategy.decide(now, decision)
+            allowed = verdict.join
+        changed = allowed != self._participating
+        self._participating = allowed
         return GateResult(
-            allowed=decision.participate, changed=changed, decision=decision
+            allowed=allowed, changed=changed, decision=decision, round=verdict
         )
 
     def on_job(self, now: float) -> GateResult:
@@ -309,7 +334,11 @@ def _bill_unobserved(sampler, pacer: Optional[BudgetPacer]) -> None:
 
 
 def _seed_history(
-    recorder: HistoryRecorder, attempts_path: str, stop: threading.Event, miner_id: str
+    recorder: HistoryRecorder,
+    attempts_path: str,
+    stop: threading.Event,
+    miner_id: str,
+    on_done: Optional[Callable[[], None]] = None,
 ) -> None:
     """Seed past rounds off the session thread. Best effort by design.
 
@@ -318,7 +347,9 @@ def _seed_history(
     the seed to give up between directories, checked once per directory
     before that directory's writes begin, so it never leaves margins written
     for a directory it does not also mark seeded. ``miner_id`` keeps a
-    second QPU miner on the same node out of this one's history.
+    second QPU miner on the same node out of this one's history. ``on_done``
+    rebuilds the strategy's snapshot as soon as the seed is in, rather than
+    waiting for the next scheduled refresh.
     """
     try:
         seed_from_attempts(
@@ -326,10 +357,15 @@ def _seed_history(
         )
     except Exception:  # noqa: BLE001 - history is optional, mining is not
         logger.warning("history: seeding from %s failed", attempts_path, exc_info=True)
+    if on_done is not None:
+        on_done()
 
 
 def _pickup_history_outcomes(
-    recorder: HistoryRecorder, attempts_path: str, miner_id: str
+    recorder: HistoryRecorder,
+    attempts_path: str,
+    miner_id: str,
+    on_done: Optional[Callable[[], None]] = None,
 ) -> None:
     """Apply the coordinator's verdicts on recent rounds. Best effort."""
     try:
@@ -338,6 +374,8 @@ def _pickup_history_outcomes(
         logger.warning(
             "history: outcome pickup from %s failed", attempts_path, exc_info=True
         )
+    if on_done is not None:
+        on_done()
 
 
 def _extra_int(meta, key: str) -> Optional[int]:
@@ -641,6 +679,7 @@ def run_session(
     seed_thread: Optional[threading.Thread] = None
     seed_stop = threading.Event()
     outcome_thread: Optional[threading.Thread] = None
+    refresher: Optional[SnapshotRefresher] = None
     session_start = time.monotonic()
     best_energy_milli: Optional[int] = None
     PROGRESS_LOG_INTERVAL = 10
@@ -801,6 +840,11 @@ def run_session(
             out_q.put(reply)
 
     def _stop_history_threads() -> None:
+        # The refresher stops first: a refresh in flight reads the store, and
+        # both history threads can still be writing to it below, so stopping
+        # it first keeps its own join from racing their writes.
+        if refresher is not None:
+            refresher.stop()
         # The seed can take tens of seconds on a node with a thousand-plus
         # attempt directories, so shutdown asks it to give up between
         # directories rather than block on it; a bounded join is the
@@ -945,14 +989,25 @@ def run_session(
                     recorder = HistoryRecorder.open(history_path)
                     if recorder is not None:
                         attempts_path = attempts_dir or default_attempts_dir(history_path)
+                        refresher = SnapshotRefresher(recorder.store)
+                        refresher.start()
+                        if gate is not None:
+                            gate.use_strategy(
+                                RoundStrategy(
+                                    strategy_config_from_toml(cm.configure.backend_toml),
+                                    refresher,
+                                )
+                            )
                         # Past rounds come from the coordinator's attempts
                         # files, hundreds of megabytes on a long-lived node:
                         # not work for the session thread. seed_stop lets
                         # shutdown cut it short between directories rather
-                        # than block on it.
+                        # than block on it. The snapshot is rebuilt as soon
+                        # as they are in.
                         seed_thread = threading.Thread(
                             target=_seed_history,
                             args=(recorder, attempts_path, seed_stop, miner_id),
+                            kwargs={"on_done": refresher.request_refresh},
                             name="dwave-history-seed",
                             daemon=True,
                         )
@@ -1075,19 +1130,32 @@ def run_session(
                             cm.cancel.max_generation, time.time()
                         )
                     if boundary is not None:
-                        if not boundary.allowed:
-                            # Every skipped round says so, not just the first:
-                            # a run of silent boundaries is exactly what made
-                            # the old blackout unreadable in the session log.
-                            _log_qblock_sat_out(
-                                cm.cancel.max_generation, boundary.decision
+                        if boundary.round is not None:
+                            # One line per boundary either way; a skipped
+                            # round names the slot it waits for.
+                            logger.info(
+                                "%s",
+                                describe_round_decision(
+                                    cm.cancel.max_generation,
+                                    boundary.round,
+                                    boundary.decision.headroom_us,
+                                ),
                             )
+                        if not boundary.allowed:
+                            if boundary.round is None:
+                                # Every skipped round says so, not just the
+                                # first: a run of silent boundaries is exactly
+                                # what made the old blackout unreadable.
+                                _log_qblock_sat_out(
+                                    cm.cancel.max_generation, boundary.decision
+                                )
                         elif boundary.changed:
                             # Credits survive a reseed, so only the round that
                             # resumes mining needs a grant.
-                            _log_qblock_joined(
-                                cm.cancel.max_generation, boundary.decision
-                            )
+                            if boundary.round is None:
+                                _log_qblock_joined(
+                                    cm.cancel.max_generation, boundary.decision
+                                )
                             out_q.put(
                                 miner_pb2.MinerMsg(
                                     job_request=miner_pb2.JobRequest(
@@ -1096,8 +1164,11 @@ def run_session(
                                 )
                             )
                 if recorder is not None:
+                    verdict = boundary.round if boundary is not None else None
                     if gate is None:
                         joined, reason = True, "unbudgeted"
+                    elif verdict is not None and boundary is not None:
+                        joined, reason = boundary.allowed, verdict.reason
                     else:
                         # `boundary` is only None on a repeated watermark,
                         # which is exactly the condition that makes
@@ -1111,8 +1182,8 @@ def run_session(
                         time.time(),
                         joined=joined,
                         reason=reason,
-                        p_win=None,
-                        expected_jobs=None,
+                        p_win=verdict.p_now if verdict is not None else None,
+                        expected_jobs=verdict.expected_jobs if verdict is not None else None,
                     )
                     # The coordinator's verdict on the round that just ended
                     # lands in its attempts file around now. One reader at a
@@ -1126,6 +1197,13 @@ def run_session(
                         outcome_thread = threading.Thread(
                             target=_pickup_history_outcomes,
                             args=(recorder, attempts_path, miner_id),
+                            kwargs={
+                                "on_done": (
+                                    refresher.request_refresh
+                                    if refresher is not None
+                                    else None
+                                )
+                            },
                             name="dwave-history-outcomes",
                             daemon=True,
                         )

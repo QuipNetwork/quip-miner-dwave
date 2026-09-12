@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import logging
 import math
+import random
 import tomllib
 from dataclasses import dataclass
 from typing import Optional
 
-from quip_miner_dwave.profile import Snapshot, slot_label, slot_of
+from quip_miner_dwave.budget import ParticipationDecision
+from quip_miner_dwave.profile import Snapshot, SnapshotRefresher, slot_label, slot_of
 
 logger = logging.getLogger(__name__)
 
@@ -230,3 +232,32 @@ def describe_round_decision(generation: int, d: RoundDecision, headroom_us: floa
         f"at {wait} in {d.wait_rounds} round(s) | {headroom}, saturates in "
         f"{d.saturates_in_rounds} round(s)"
     )
+
+
+class RoundStrategy:
+    """The gate's adapter: config, the latest snapshot, and the explore draw."""
+
+    def __init__(
+        self,
+        config: StrategyConfig,
+        snapshots: SnapshotRefresher,
+        rng: Optional[random.Random] = None,
+    ):
+        self._config = config
+        self._snapshots = snapshots
+        self._rng = rng or random.Random()
+
+    @property
+    def config(self) -> StrategyConfig:
+        return self._config
+
+    def decide(self, now: float, budget: ParticipationDecision) -> RoundDecision:
+        return decide_round(
+            now=now,
+            headroom_us=budget.headroom_us,
+            accrual_us_per_s=budget.accrual_us_per_s,
+            period_end=budget.period_end,
+            snapshot=self._snapshots.latest(),
+            config=self._config,
+            explore_draw=self._rng.random(),
+        )

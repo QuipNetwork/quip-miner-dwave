@@ -151,6 +151,8 @@ class ParticipationDecision:
     period_start: float
     period_end: float
     seconds_until_headroom: float
+    # Allowance earned per wall second: the budget spread flat over the period.
+    accrual_us_per_s: float = 0.0
 
 
 class BudgetPacer:
@@ -224,10 +226,10 @@ class BudgetPacer:
         spent_us = self._spent_us(start, now)
         headroom_us = allowance_us - spent_us
 
+        rate_us_per_s = budget_us / span
         if headroom_us > 0:
             until = 0.0
         else:
-            rate_us_per_s = budget_us / span
             # Time for the rising line to reach current spend; never longer
             # than the wait for the reset, which zeroes spend outright.
             catch_up = (
@@ -243,6 +245,7 @@ class BudgetPacer:
             period_start=start,
             period_end=end,
             seconds_until_headroom=until,
+            accrual_us_per_s=rate_us_per_s,
         )
 
     def record_access_time(self, qpu_access_time_us: float, now: float) -> None:

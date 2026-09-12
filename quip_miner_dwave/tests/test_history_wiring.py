@@ -106,7 +106,14 @@ def _wait_until(condition, timeout: float = 5.0, interval: float = 0.01) -> bool
     return condition()
 
 
-def _run(monkeypatch, sampler: QuickSampler, usage_db: str, attempts_dir: str) -> List:
+def _run(
+    monkeypatch,
+    sampler: QuickSampler,
+    usage_db: str,
+    attempts_dir: str,
+    *,
+    expect_job: bool = True,
+) -> List:
     sent: List = []
 
     def responses():
@@ -124,13 +131,14 @@ def _run(monkeypatch, sampler: QuickSampler, usage_db: str, attempts_dir: str) -
             set_target=miner_pb2.SetTarget(max_energy_milli=0, min_solutions=1)
         )
         yield _job(generation=2)
-        assert sampler.entered.wait(timeout=5), "job never reached the sampler"
-        # Wait for the worker to fold the result in before the boundary,
-        # instead of guessing how long that takes: its Result is what the
-        # drain thread appends to `sent` once the reply is enqueued.
-        assert _wait_until(
-            lambda: any(m.WhichOneof("msg") == "result" for m in sent)
-        ), "job result never reached the outbound queue"
+        if expect_job:
+            assert sampler.entered.wait(timeout=5), "job never reached the sampler"
+            # Wait for the worker to fold the result in before the boundary,
+            # instead of guessing how long that takes: its Result is what the
+            # drain thread appends to `sent` once the reply is enqueued.
+            assert _wait_until(
+                lambda: any(m.WhichOneof("msg") == "result" for m in sent)
+            ), "job result never reached the outbound queue"
         yield _cancel(2)
         yield miner_pb2.CoordMsg(shutdown=miner_pb2.Shutdown(grace_ms=100))
 
@@ -199,7 +207,10 @@ def test_a_completed_job_lands_in_the_history_and_billing_is_unchanged(
 
     rows = {r["generation"]: r for r in store.rounds(since_ts=0, limit=10)}
     assert set(rows) == {2, 3}
-    assert rows[2]["joined"] == 1 and rows[2]["reason"] == "budget"
+    # A recorder means a strategy is attached (Task 4), so the reason comes
+    # from its verdict, not the old blanket "budget"; with no history yet
+    # that verdict is "no-data" and it still joins every round.
+    assert rows[2]["joined"] == 1 and rows[2]["reason"] == "no-data"
     assert rows[2]["target_milli"] == 0
     assert (rows[2]["jobs"], rows[2]["hits"], rows[2]["best_energy_milli"]) == (1, 1, -1000)
     assert rows[2]["end_ts_s"] is not None and rows[3]["end_ts_s"] is None
