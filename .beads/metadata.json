@@ -1,7 +1,0 @@
-{
-  "database": "dolt",
-  "backend": "dolt",
-  "dolt_mode": "embedded",
-  "dolt_database": "quip_miner_dwave",
-  "project_id": "6d69bb1a-6ac9-494b-b5b4-592ccadc6e8c"
-}

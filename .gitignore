@@ -21,8 +21,8 @@ qpu-1-logs/
 *.log
 *.log.[0-9]
 
-# Beads / Dolt files (added by bd init)
+# Beads / Dolt files. Issues live in the Dolt database and sync through
+# refs/dolt/data, so nothing under .beads/ needs git.
 .dolt/
 *.db
-.beads-credential-key
-.beads/proxieddb/
+.beads/
