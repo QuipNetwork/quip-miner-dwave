@@ -274,6 +274,21 @@ class BudgetPacer:
         }
 
 
+def usage_db_from_backend_toml(toml_text: str) -> str:
+    """The ledger path ``Configure.backend_toml`` names, or the default.
+
+    History shares the ledger's file, and an unbudgeted miner still keeps
+    history, so the path resolves on its own rather than through the pacer.
+    """
+    if not toml_text or not toml_text.strip():
+        return DEFAULT_USAGE_DB
+    try:
+        data = tomllib.loads(toml_text)
+    except Exception:
+        return DEFAULT_USAGE_DB
+    return str(data.get("usage_db") or DEFAULT_USAGE_DB)
+
+
 def budget_from_backend_toml(toml_text: str) -> Optional[BudgetPacer]:
     """Build a pacer from ``Configure.backend_toml``, or None if unbudgeted.
 
@@ -308,7 +323,7 @@ def budget_from_backend_toml(toml_text: str) -> Optional[BudgetPacer]:
             f"budget_reset_day must be 1-31, got {reset_day}"
         )
 
-    db_path = str(data.get("usage_db") or DEFAULT_USAGE_DB)
+    db_path = usage_db_from_backend_toml(toml_text)
     try:
         ledger = UsageLedger(db_path)
     except Exception as exc:

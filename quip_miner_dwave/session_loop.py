@@ -31,11 +31,17 @@ from quip_miner_dwave import (
     MAX_EDGES,
     MAX_NODES,
 )
+from quip_miner_dwave.attempts import (
+    default_attempts_dir,
+    pickup_outcomes,
+    seed_from_attempts,
+)
 from quip_miner_dwave.budget import (
     BudgetPacer,
     BudgetUnavailable,
     ParticipationDecision,
     budget_from_backend_toml,
+    usage_db_from_backend_toml,
     warn_unknown_backend_keys,
 )
 from quip_miner_dwave.config import (
@@ -43,6 +49,7 @@ from quip_miner_dwave.config import (
     queue_depth_from_toml,
     sampling_defaults_from_toml,
 )
+from quip_miner_dwave.history import HistoryRecorder, JobSample
 from quip_miner_dwave.job import handle_job
 from quip_solver_core.session import DEFAULT_NUM_SWEEPS, num_sweeps_from_toml
 from quip_miner_dwave.ocean import OceanSampler
@@ -301,6 +308,37 @@ def _bill_unobserved(sampler, pacer: Optional[BudgetPacer]) -> None:
         pacer.record_access_time(owed, time.time())
 
 
+def _seed_history(recorder: HistoryRecorder, attempts_path: str) -> None:
+    """Seed past rounds off the session thread. Best effort by design."""
+    try:
+        seed_from_attempts(recorder.store, attempts_path, time.time())
+    except Exception:  # noqa: BLE001 - history is optional, mining is not
+        logger.warning("history: seeding from %s failed", attempts_path, exc_info=True)
+
+
+def _pickup_history_outcomes(recorder: HistoryRecorder, attempts_path: str) -> None:
+    """Apply the coordinator's verdicts on recent rounds. Best effort."""
+    try:
+        pickup_outcomes(recorder.store, attempts_path)
+    except Exception:  # noqa: BLE001 - see _seed_history
+        logger.warning(
+            "history: outcome pickup from %s failed", attempts_path, exc_info=True
+        )
+
+
+def _extra_int(meta, key: str) -> Optional[int]:
+    """An integer the sampler stashed in ``SamplerMeta.extra``, or None."""
+    if meta is None:
+        return None
+    raw = meta.extra.get(key)
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
 def _log_qblock_joined(generation: int, decision: ParticipationDecision) -> None:
     logger.info(
         "[QPU] joining qblock %d: %.0fs of headroom on the budget line "
@@ -523,6 +561,7 @@ def run_session(
     sampler: OceanSampler,
     *,
     budget: Optional[BudgetPacer] = None,
+    attempts_dir: Optional[str] = None,
 ) -> int:
     """Run one miner session; return a process exit code."""
     target = _unix_target(coordinator_uri)
@@ -580,6 +619,12 @@ def run_session(
     inflight = InflightJobs()
     tally = CancelTally()
     job_pool: Optional[ThreadPoolExecutor] = None
+    # History of throughput, rounds and margins. None until Configure names
+    # the usage database, or forever if it cannot be opened. Optional in the
+    # strict sense: nothing about mining depends on it.
+    recorder: Optional[HistoryRecorder] = None
+    attempts_path: Optional[str] = None
+    outcome_thread: Optional[threading.Thread] = None
     session_start = time.monotonic()
     best_energy_milli: Optional[int] = None
     PROGRESS_LOG_INTERVAL = 10
@@ -604,28 +649,46 @@ def run_session(
             # Off the QPU one way or another: a later Cancel must not try to
             # drop a problem that has already finished.
             inflight.release(job.job_id)
+            if recorder is not None:
+                recorder.job_finished(time.time())
         _bill_unobserved(sampler, pending_budget)
         wall_ms = int((time.monotonic() - started) * 1000)
         for reply in replies:
             kind = reply.WhichOneof("msg")
-            if kind == "result" and pending_budget is not None:
-                meta = reply.result.meta
-                if meta is not None:
-                    # Billed before the abandoned check, not after. D-Wave
-                    # charged for this anneal whatever the coordinator decided
-                    # to do with the answer, and a ledger that under-counts
-                    # hands the pacer headroom the QPU has already spent.
-                    #
-                    # Billed outside state_lock, too. This commits to SQLite,
-                    # which fsyncs the deployment's mounted volume, and the
-                    # ledger already has its own lock. state_lock is what the
-                    # session-loop thread takes to dispatch the next job, so
-                    # holding it across this put every Cancel, Job and Ping
-                    # behind one worker's disk write — at a pipeline depth of
-                    # 96, behind all of them.
-                    pending_budget.record_access_time(
-                        meta.device_access_time_us, time.time()
+            meta = reply.result.meta if kind == "result" else None
+            if kind == "result" and pending_budget is not None and meta is not None:
+                # Billed before the abandoned check, not after. D-Wave
+                # charged for this anneal whatever the coordinator decided
+                # to do with the answer, and a ledger that under-counts
+                # hands the pacer headroom the QPU has already spent.
+                #
+                # Billed outside state_lock, too. This commits to SQLite,
+                # which fsyncs the deployment's mounted volume, and the
+                # ledger already has its own lock. state_lock is what the
+                # session-loop thread takes to dispatch the next job, so
+                # holding it across this put every Cancel, Job and Ping
+                # behind one worker's disk write — at a pipeline depth of
+                # 96, behind all of them.
+                pending_budget.record_access_time(
+                    meta.device_access_time_us, time.time()
+                )
+            job_best: Optional[int] = None
+            valid = 0
+            if kind == "result":
+                job_best = min(
+                    (s.energy_milli for s in reply.result.solutions),
+                    default=None,
+                )
+                if s_target is not None:
+                    valid = sum(
+                        1
+                        for s in reply.result.solutions
+                        if s.energy_milli <= s_target.max_energy_milli
                     )
+                else:
+                    valid = len(reply.result.solutions)
+            skip = False
+            wasted = False
             with state_lock:
                 abandoned = _is_abandoned(job.generation, cancel_watermark)
                 if kind in ("result", "reject") and abandoned:
@@ -637,26 +700,14 @@ def run_session(
                         # It came back with samples, so SAPI ran the anneal
                         # despite the cancel. That is the miss rate.
                         tally.missed()
-                    continue
-                if kind == "result":
+                        wasted = True
+                    skip = True
+                elif kind == "result":
                     jobs_done += 1
-                    meta = reply.result.meta
-                    job_best = min(
-                        (s.energy_milli for s in reply.result.solutions),
-                        default=None,
-                    )
                     if job_best is not None and (
                         best_energy_milli is None or job_best < best_energy_milli
                     ):
                         best_energy_milli = job_best
-                    if s_target is not None:
-                        valid = sum(
-                            1
-                            for s in reply.result.solutions
-                            if s.energy_milli <= s_target.max_energy_milli
-                        )
-                    else:
-                        valid = len(reply.result.solutions)
                     device_ms = (
                         meta.device_access_time_us // 1000
                         if meta is not None
@@ -694,7 +745,7 @@ def run_session(
                         rejected=_reject_reason_name(reply.reject.reason),
                         wall_ms=wall_ms,
                     )
-                if kind == "job_request" and gate is not None:
+                if not skip and kind == "job_request" and gate is not None:
                     # A finished job refills its own credit to keep the pipeline
                     # full mid-qblock. Dropping the refill is what parks the
                     # credits; the next grant waits for a qblock boundary.
@@ -702,7 +753,35 @@ def run_session(
                     if not result.allowed:
                         if result.changed:
                             _log_line_crossed(result.decision)
-                        continue
+                        skip = True
+            # History goes after the lock for the same reason billing does:
+            # it ends in a SQLite commit, and state_lock is what dispatches
+            # the next job. A wasted result is a completed anneal the
+            # coordinator threw away; the round trip counts, the job does not.
+            if recorder is not None and kind == "result" and meta is not None:
+                if wasted:
+                    recorder.record_wasted(time.time())
+                else:
+                    recorder.record_job(
+                        JobSample(
+                            completed_at=time.time(),
+                            generation=job.generation,
+                            rtt_ms=wall_ms,
+                            access_us=int(meta.device_access_time_us),
+                            inflight_at_submit=_extra_int(meta, "inflight") or 0,
+                            reads=int(meta.reads),
+                            best_energy_milli=job_best,
+                            target_milli=(
+                                s_target.max_energy_milli
+                                if s_target is not None
+                                else None
+                            ),
+                            hits=valid if s_target is not None else 0,
+                            sapi_ms=_extra_int(meta, "sapi_ms"),
+                        )
+                    )
+            if skip:
+                continue
             out_q.put(reply)
 
     exit_code = EXIT_CLEAN
@@ -833,6 +912,20 @@ def run_session(
                     # message. A budgeted miner grants nothing until a qblock
                     # boundary gives it a whole round to decide about.
                     _log_budget_configured(pacer, time.time())
+                if recorder is None:
+                    history_path = usage_db_from_backend_toml(cm.configure.backend_toml)
+                    recorder = HistoryRecorder.open(history_path)
+                    if recorder is not None:
+                        attempts_path = attempts_dir or default_attempts_dir(history_path)
+                        # Past rounds come from the coordinator's attempts
+                        # files, hundreds of megabytes on a long-lived node:
+                        # not work for the session thread.
+                        threading.Thread(
+                            target=_seed_history,
+                            args=(recorder, attempts_path),
+                            name="dwave-history-seed",
+                            daemon=True,
+                        ).start()
             elif which == "topology":
                 topo = cm.topology
                 session_nodes = list(topo.nodes)
@@ -844,6 +937,8 @@ def run_session(
                 sampler.set_session_topology(session_nodes, session_edges)
             elif which == "set_target":
                 session_target = cm.set_target
+                if recorder is not None:
+                    recorder.round_target(cm.set_target.max_energy_milli)
             elif which == "job":
                 with state_lock:
                     cancelled = _is_abandoned(cm.job.generation, cancel_watermark)
@@ -903,6 +998,8 @@ def run_session(
                 # arriving while the job waits for a pool thread must still
                 # reach it, and the sampler holds the note until it registers.
                 inflight.add(cm.job.job_id, cm.job.generation)
+                if recorder is not None:
+                    recorder.job_started(time.time())
                 if job_pool is not None:
                     job_pool.submit(process_job, *args).add_done_callback(
                         _surface_pool_failure
@@ -940,6 +1037,7 @@ def run_session(
                 # the only monotone round counter the coordinator sends, and it
                 # arrives every round even while the QPU holds no credits. That
                 # makes it the point at which participation is decided.
+                boundary = None
                 if gate is not None:
                     with state_lock:
                         boundary = gate.on_qblock_boundary(
@@ -966,6 +1064,38 @@ def run_session(
                                     )
                                 )
                             )
+                if recorder is not None:
+                    if gate is None:
+                        joined, reason = True, "unbudgeted"
+                    elif boundary is not None:
+                        joined = boundary.allowed
+                        reason = "budget" if joined else "budget-sat-out"
+                    else:
+                        joined, reason = gate.participating, "repeat"
+                    fresh = recorder.round_boundary(
+                        cm.cancel.max_generation,
+                        time.time(),
+                        joined=joined,
+                        reason=reason,
+                        p_win=None,
+                        expected_jobs=None,
+                    )
+                    # The coordinator's verdict on the round that just ended
+                    # lands in its attempts file around now. One reader at a
+                    # time; a boundary that finds it still busy waits for the
+                    # next.
+                    if (
+                        fresh
+                        and attempts_path is not None
+                        and (outcome_thread is None or not outcome_thread.is_alive())
+                    ):
+                        outcome_thread = threading.Thread(
+                            target=_pickup_history_outcomes,
+                            args=(recorder, attempts_path),
+                            name="dwave-history-outcomes",
+                            daemon=True,
+                        )
+                        outcome_thread.start()
             elif which == "ping":
                 with state_lock:
                     done = jobs_done
@@ -990,6 +1120,8 @@ def run_session(
         # Last sweep: a charge estimated after the final job's own drain would
         # otherwise die with the process and under-count the period.
         _bill_unobserved(sampler, pending_budget)
+        if recorder is not None:
+            recorder.close()
         # Signal end-of-outbound so the server can finish draining Results.
         out_q.put(_STOP)
         # Give the feeder thread a moment to flush (grace_ms).
@@ -1011,6 +1143,8 @@ def run_session(
             out_q.put(_STOP)
         except Exception:  # noqa: BLE001
             pass
+        if recorder is not None:
+            recorder.close()
         channel.close()
         sampler.close()
 
@@ -1021,6 +1155,9 @@ def run_session_sync(
     sampler: OceanSampler,
     *,
     budget: Optional[BudgetPacer] = None,
+    attempts_dir: Optional[str] = None,
 ) -> int:
     """Sync entry (session is already synchronous)."""
-    return run_session(coordinator_uri, miner_id, sampler, budget=budget)
+    return run_session(
+        coordinator_uri, miner_id, sampler, budget=budget, attempts_dir=attempts_dir
+    )

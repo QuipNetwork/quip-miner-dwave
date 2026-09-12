@@ -101,6 +101,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=",".join(str(v) for v in DEFAULT_ALLOWED_J_MILLI),
         help="comma-separated allowed J values for the captured spec",
     )
+    p.add_argument(
+        "--attempts-dir",
+        metavar="PATH",
+        default=None,
+        help="coordinator attempts directory to seed round history from "
+        "(default: the 'attempts' directory beside the usage database)",
+    )
     return p
 
 
@@ -275,6 +282,7 @@ def main(argv: list[str] | None = None) -> int:
             args.quip_coordinator,
             args.miner_id,
             sampler,
+            attempts_dir=args.attempts_dir,
         )
     except SystemExit as e:
         code = e.code if isinstance(e.code, int) else EXIT_INTERNAL_FATAL
