@@ -309,7 +309,7 @@ def _bill_unobserved(sampler, pacer: Optional[BudgetPacer]) -> None:
 
 
 def _seed_history(
-    recorder: HistoryRecorder, attempts_path: str, stop: threading.Event
+    recorder: HistoryRecorder, attempts_path: str, stop: threading.Event, miner_id: str
 ) -> None:
     """Seed past rounds off the session thread. Best effort by design.
 
@@ -317,18 +317,23 @@ def _seed_history(
     to seed, so shutdown cannot just wait it out: ``stop`` lets shutdown ask
     the seed to give up between directories, checked once per directory
     before that directory's writes begin, so it never leaves margins written
-    for a directory it does not also mark seeded.
+    for a directory it does not also mark seeded. ``miner_id`` keeps a
+    second QPU miner on the same node out of this one's history.
     """
     try:
-        seed_from_attempts(recorder.store, attempts_path, time.time(), stop=stop.is_set)
+        seed_from_attempts(
+            recorder.store, attempts_path, time.time(), stop=stop.is_set, miner_id=miner_id
+        )
     except Exception:  # noqa: BLE001 - history is optional, mining is not
         logger.warning("history: seeding from %s failed", attempts_path, exc_info=True)
 
 
-def _pickup_history_outcomes(recorder: HistoryRecorder, attempts_path: str) -> None:
+def _pickup_history_outcomes(
+    recorder: HistoryRecorder, attempts_path: str, miner_id: str
+) -> None:
     """Apply the coordinator's verdicts on recent rounds. Best effort."""
     try:
-        pickup_outcomes(recorder.store, attempts_path)
+        pickup_outcomes(recorder.store, attempts_path, miner_id=miner_id)
     except Exception:  # noqa: BLE001 - see _seed_history
         logger.warning(
             "history: outcome pickup from %s failed", attempts_path, exc_info=True
@@ -947,7 +952,7 @@ def run_session(
                         # than block on it.
                         seed_thread = threading.Thread(
                             target=_seed_history,
-                            args=(recorder, attempts_path, seed_stop),
+                            args=(recorder, attempts_path, seed_stop, miner_id),
                             name="dwave-history-seed",
                             daemon=True,
                         )
@@ -1117,7 +1122,7 @@ def run_session(
                     ):
                         outcome_thread = threading.Thread(
                             target=_pickup_history_outcomes,
-                            args=(recorder, attempts_path),
+                            args=(recorder, attempts_path, miner_id),
                             name="dwave-history-outcomes",
                             daemon=True,
                         )

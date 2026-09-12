@@ -65,6 +65,7 @@ class Attempt:
     ts_ms: int
     generation: int
     miner_type: str
+    miner_id: str
     raw_best_energy_milli: int
     threshold_milli: int
     accepted: bool
@@ -89,6 +90,7 @@ def parse_attempt(line: str) -> Optional[Attempt]:
             ts_ms=int(obj["ts_ms"]),
             generation=int(obj["generation"]),
             miner_type=str(obj.get("miner_type") or ""),
+            miner_id=str(obj.get("miner_id") or ""),
             # best_energy_milli is i64::MAX when no row cleared the gate; the
             # raw field is the best the miner found either way.
             raw_best_energy_milli=int(obj["raw_best_energy_milli"]),
@@ -101,16 +103,25 @@ def parse_attempt(line: str) -> Optional[Attempt]:
         return None
 
 
-def read_attempts(path: Path) -> Tuple[List[Attempt], int]:
-    """QPU attempts in one file, and how many lines the file had."""
+def read_attempts(path: Path, *, miner_id: Optional[str] = None) -> Tuple[List[Attempt], int]:
+    """QPU attempts in one file, and how many lines the file had.
+
+    ``miner_id``, given, drops lines from any other miner the same way a
+    non-QPU line is dropped: the coordinator writes one file per qblock for
+    every miner it sees, and a node running more than one QPU miner would
+    otherwise absorb a sibling miner's jobs into this one's history.
+    """
     attempts: List[Attempt] = []
     lines = 0
     with path.open("r", encoding="utf-8") as fh:
         for line in fh:
             lines += 1
             att = parse_attempt(line)
-            if att is not None and att.is_qpu:
-                attempts.append(att)
+            if att is None or not att.is_qpu:
+                continue
+            if miner_id is not None and att.miner_id != miner_id:
+                continue
+            attempts.append(att)
     return attempts, lines
 
 
@@ -193,6 +204,7 @@ def seed_from_attempts(
     now: float,
     *,
     stop: Optional[Callable[[], bool]] = None,
+    miner_id: Optional[str] = None,
 ) -> SeedReport:
     """Seed every complete, not-yet-seeded directory. Safe on every start.
 
@@ -204,6 +216,10 @@ def seed_from_attempts(
     directory never leaves it with margins written but not marked seeded —
     that would double-count them on the next start, since ``seed_margin`` is
     additive.
+
+    ``miner_id``, given, restricts every directory to this miner's own
+    lines: the coordinator writes one attempts file per qblock for every
+    miner it sees.
     """
     report = SeedReport()
     dirs = _numbered_dirs(Path(attempts_dir))
@@ -218,7 +234,7 @@ def seed_from_attempts(
             store.mark_seeded(d.name)
             continue
         try:
-            attempts, _ = read_attempts(path)
+            attempts, _ = read_attempts(path, miner_id=miner_id)
         except OSError as exc:
             logger.warning("attempts: cannot read %s: %s", path, exc)
             report.dirs_skipped += 1
@@ -269,7 +285,9 @@ def seed_from_attempts(
     return report
 
 
-def pickup_outcomes(store: HistoryStore, attempts_dir: str) -> int:
+def pickup_outcomes(
+    store: HistoryStore, attempts_dir: str, *, miner_id: Optional[str] = None
+) -> int:
     """Apply accepted and won outcomes from the newest directories to live rounds."""
     updated = 0
     for d in _numbered_dirs(Path(attempts_dir))[-NEWEST_DIRS_FOR_OUTCOMES:]:
@@ -277,7 +295,7 @@ def pickup_outcomes(store: HistoryStore, attempts_dir: str) -> int:
         if not path.is_file():
             continue
         try:
-            attempts, _ = read_attempts(path)
+            attempts, _ = read_attempts(path, miner_id=miner_id)
         except OSError as exc:
             logger.warning("attempts: cannot read %s: %s", path, exc)
             continue

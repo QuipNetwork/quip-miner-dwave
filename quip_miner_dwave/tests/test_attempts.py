@@ -40,6 +40,7 @@ def _attempt(ts_s: float, generation: int = 1) -> Attempt:
         ts_ms=int(ts_s * 1000),
         generation=generation,
         miner_type="QPU-DWAVE",
+        miner_id="qpu-0",
         raw_best_energy_milli=-14_400_000,
         threshold_milli=-14_500_000,
         accepted=False,
@@ -53,6 +54,7 @@ def test_parse_attempt_reads_the_coordinator_fields():
         ts_ms=1788893124504,
         generation=382,
         miner_type="QPU-DWAVE",
+        miner_id="qpu-0",
         raw_best_energy_milli=-14_550_000,
         threshold_milli=-14_546_432,
         accepted=True,
@@ -220,6 +222,55 @@ def test_a_stopped_seed_leaves_the_unreached_directory_unmarked(tmp_path):
     # would mean 200 was seeded despite the stop, and would double on retry.
     assert sum(store.margin_counts(0).values()) == 1
     assert sum(r["jobs"] for r in store.hourly_rows(0)) == 1
+
+
+def _attempt_line(miner_id: str, generation: int = 10, ts_ms: int = 1_000_000) -> str:
+    return json.dumps(
+        {
+            "ts_ms": ts_ms,
+            "generation": generation,
+            "miner_id": miner_id,
+            "miner_type": "QPU-DWAVE",
+            "raw_best_energy_milli": -100,
+            "threshold_milli": -50,
+            "accepted": True,
+            "device_access_time_us": 1000,
+        }
+    )
+
+
+def test_read_attempts_filters_lines_to_the_requested_miner_id(tmp_path):
+    path = tmp_path / "attempts.jsonl"
+    path.write_text(_attempt_line("qpu-0") + "\n" + _attempt_line("qpu-1") + "\n")
+
+    attempts, lines = read_attempts(path, miner_id="qpu-1")
+    assert lines == 2  # every line still counts toward the file's line total
+    assert [a.miner_id for a in attempts] == ["qpu-1"]
+
+    attempts_all, _ = read_attempts(path)
+    assert [a.miner_id for a in attempts_all] == ["qpu-0", "qpu-1"]  # None: today's behaviour
+
+
+def test_seeding_a_directory_shared_by_two_miners_counts_only_this_one(tmp_path):
+    # The coordinator writes one attempts file per qblock for every miner it
+    # sees, so a node running a second QPU miner would otherwise absorb the
+    # other miner's jobs, access time and margins into this one's history.
+    attempts_dir = tmp_path / "attempts"
+    d = attempts_dir / "100"
+    d.mkdir(parents=True)
+    (d / "attempts.jsonl").write_text(_attempt_line("qpu-0") + "\n" + _attempt_line("qpu-1") + "\n")
+    (attempts_dir / "200").mkdir(parents=True)  # the round in progress
+
+    filtered = HistoryStore(":memory:")
+    report = seed_from_attempts(filtered, str(attempts_dir), now=2_000_000, miner_id="qpu-0")
+    assert report.dirs_seeded == 1
+    (row,) = [r for r in filtered.rounds(since_ts=0, limit=10) if r["generation"] == 10]
+    assert row["jobs"] == 1
+
+    unfiltered = HistoryStore(":memory:")
+    seed_from_attempts(unfiltered, str(attempts_dir), now=2_000_000)  # None: today's behaviour
+    (row_both,) = [r for r in unfiltered.rounds(since_ts=0, limit=10) if r["generation"] == 10]
+    assert row_both["jobs"] == 2
 
 
 def test_a_missing_directory_seeds_nothing(tmp_path):

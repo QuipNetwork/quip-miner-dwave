@@ -144,7 +144,9 @@ warning.
 At start the miner seeds past rounds from the coordinator's attempts files,
 `<data_dir>/<qblock_id>/attempts.jsonl`. The default location is the
 `attempts` directory beside the usage database, which is where the node
-manager renders it. `--attempts-dir PATH` overrides it.
+manager renders it. `--attempts-dir PATH` overrides it. Seeding and outcome
+pickup keep only the lines for `--miner-id`, so a node running more than
+one QPU miner does not absorb a sibling miner's history.
 
 `quip-dwave-qa --profile [--usage-db PATH]` prints the hour-of-week grid of
 jobs per second, the grid of D-Wave queue wait, the win summary for
