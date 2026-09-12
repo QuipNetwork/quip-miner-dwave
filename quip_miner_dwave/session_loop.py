@@ -1146,11 +1146,14 @@ def run_session(
         # Last sweep: a charge estimated after the final job's own drain would
         # otherwise die with the process and under-count the period.
         _bill_unobserved(sampler, pending_budget)
+        # Signal end-of-outbound before spending the coordinator's grace
+        # window on the history joins and close: every Result still queued
+        # is an anneal already billed, and it is lost if the coordinator
+        # closes the stream first.
+        out_q.put(_STOP)
         _stop_history_threads()
         if recorder is not None:
             recorder.close()
-        # Signal end-of-outbound so the server can finish draining Results.
-        out_q.put(_STOP)
         # Give the feeder thread a moment to flush (grace_ms).
         time.sleep(min(0.05, grace_ms / 1000.0))
         return exit_code

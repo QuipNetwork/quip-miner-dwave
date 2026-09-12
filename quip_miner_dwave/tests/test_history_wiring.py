@@ -7,6 +7,7 @@ any failure here is that the ledger bills exactly what it billed before.
 
 from __future__ import annotations
 
+import queue
 import threading
 import time
 from typing import List, cast
@@ -206,6 +207,37 @@ def test_an_unreadable_history_path_does_not_stop_mining(monkeypatch, tmp_path):
     )
     sent = _run(monkeypatch, QuickSampler(), usage_db, str(tmp_path / "attempts"))
     assert any(m.WhichOneof("msg") == "result" for m in sent)
+
+
+def test_the_clean_shutdown_path_signals_end_of_outbound_before_closing_history(
+    monkeypatch, usage_db, tmp_path
+):
+    # Results already queued keep flowing while the history joins run, but
+    # only until the coordinator's grace window expires and closes the
+    # stream. _STOP must reach out_q before the joins and the close spend
+    # any of that window, or billed anneals still in the queue are lost.
+    events: List[str] = []
+
+    orig_put = queue.Queue.put
+
+    def tracking_put(self, item, *a, **kw):
+        if item is session_loop._STOP:
+            events.append("stop")
+        return orig_put(self, item, *a, **kw)
+
+    orig_close = session_loop.HistoryRecorder.close
+
+    def tracking_close(self):
+        events.append("close")
+        return orig_close(self)
+
+    monkeypatch.setattr(queue.Queue, "put", tracking_put)
+    monkeypatch.setattr(session_loop.HistoryRecorder, "close", tracking_close)
+
+    _run(monkeypatch, QuickSampler(), usage_db, str(tmp_path / "attempts"))
+
+    assert "stop" in events and "close" in events
+    assert events.index("stop") < events.index("close")
 
 
 def test_attempts_dir_flag_reaches_run_session(monkeypatch):

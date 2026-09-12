@@ -628,20 +628,27 @@ class HistoryRecorder:
             self._round_starts[generation] = start
             for old in [g for g in self._round_starts if g < generation - 4]:
                 del self._round_starts[old]
-        if previous is not None:
-            self._submit("round close", functools.partial(self.store.close_round, previous, now))
-        self._submit(
-            "round open",
-            functools.partial(
-                self.store.open_round,
-                start,
-                generation,
-                joined=joined,
-                reason=reason,
-                p_win=p_win,
-                expected_jobs=expected_jobs,
-            ),
-        )
+            # Submitted while the lock is still held: a record_job for this
+            # generation cannot queue its UPDATE ahead of this INSERT.
+            if previous is not None:
+                # A bumped start can land after `now`; closing at `now`
+                # would then close the round before it opened.
+                self._submit(
+                    "round close",
+                    functools.partial(self.store.close_round, previous, max(now, previous)),
+                )
+            self._submit(
+                "round open",
+                functools.partial(
+                    self.store.open_round,
+                    start,
+                    generation,
+                    joined=joined,
+                    reason=reason,
+                    p_win=p_win,
+                    expected_jobs=expected_jobs,
+                ),
+            )
         return True
 
     def round_target(self, target_milli: int) -> None:

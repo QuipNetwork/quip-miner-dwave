@@ -103,6 +103,24 @@ def test_two_boundaries_in_the_same_second_open_two_rounds():
     assert rows[6]["end_ts_s"] is not None and rows[7]["end_ts_s"] is None
 
 
+def test_three_boundaries_in_the_same_second_never_close_a_round_before_it_opens():
+    # A third boundary in the same wall-clock second bumps the start twice,
+    # so the middle round's own close (at the raw wall time, not the bumped
+    # start) must not land before that bumped start.
+    rec = HistoryRecorder(HistoryStore(":memory:"))
+    rec.round_boundary(5, T0, joined=True, reason="budget", p_win=None, expected_jobs=None)
+    rec.round_boundary(6, T0, joined=True, reason="budget", p_win=None, expected_jobs=None)
+    rec.round_boundary(7, T0, joined=True, reason="budget", p_win=None, expected_jobs=None)
+    rec.flush()
+    rows = {r["generation"]: r for r in rec.store.rounds(since_ts=0, limit=10)}
+    assert set(rows) == {6, 7, 8}
+    starts = {r["start_ts_s"] for r in rows.values()}
+    assert len(starts) == 3
+    for r in rows.values():
+        if r["end_ts_s"] is not None:
+            assert r["end_ts_s"] >= r["start_ts_s"]
+
+
 def test_set_target_fills_the_open_round():
     rec = HistoryRecorder(HistoryStore(":memory:"))
     rec.round_boundary(5, T0, joined=True, reason="budget", p_win=None, expected_jobs=None)
