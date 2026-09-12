@@ -63,6 +63,9 @@ DWAVE_CONFIG_KEYS = frozenset(
         "anneal_time_us",
         "num_reads",
         "queue_depth",
+        "min_win_probability",
+        "slot_advantage",
+        "explore_fraction",
     }
 )
 
@@ -148,6 +151,8 @@ class ParticipationDecision:
     period_start: float
     period_end: float
     seconds_until_headroom: float
+    # Allowance earned per wall second: the budget spread flat over the period.
+    accrual_us_per_s: float = 0.0
 
 
 class BudgetPacer:
@@ -221,10 +226,10 @@ class BudgetPacer:
         spent_us = self._spent_us(start, now)
         headroom_us = allowance_us - spent_us
 
+        rate_us_per_s = budget_us / span
         if headroom_us > 0:
             until = 0.0
         else:
-            rate_us_per_s = budget_us / span
             # Time for the rising line to reach current spend; never longer
             # than the wait for the reset, which zeroes spend outright.
             catch_up = (
@@ -240,6 +245,7 @@ class BudgetPacer:
             period_start=start,
             period_end=end,
             seconds_until_headroom=until,
+            accrual_us_per_s=rate_us_per_s,
         )
 
     def record_access_time(self, qpu_access_time_us: float, now: float) -> None:
@@ -272,6 +278,21 @@ class BudgetPacer:
             "jobs_this_period": self.ledger.jobs_since(decision.period_start),
             "seconds_until_headroom": decision.seconds_until_headroom,
         }
+
+
+def usage_db_from_backend_toml(toml_text: str) -> str:
+    """The ledger path ``Configure.backend_toml`` names, or the default.
+
+    History shares the ledger's file, and an unbudgeted miner still keeps
+    history, so the path resolves on its own rather than through the pacer.
+    """
+    if not toml_text or not toml_text.strip():
+        return DEFAULT_USAGE_DB
+    try:
+        data = tomllib.loads(toml_text)
+    except Exception:
+        return DEFAULT_USAGE_DB
+    return str(data.get("usage_db") or DEFAULT_USAGE_DB)
 
 
 def budget_from_backend_toml(toml_text: str) -> Optional[BudgetPacer]:
@@ -308,7 +329,7 @@ def budget_from_backend_toml(toml_text: str) -> Optional[BudgetPacer]:
             f"budget_reset_day must be 1-31, got {reset_day}"
         )
 
-    db_path = str(data.get("usage_db") or DEFAULT_USAGE_DB)
+    db_path = usage_db_from_backend_toml(toml_text)
     try:
         ledger = UsageLedger(db_path)
     except Exception as exc:

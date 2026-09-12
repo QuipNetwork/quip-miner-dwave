@@ -14,7 +14,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Iterator, Optional, Tuple
+from typing import Callable, Iterator, Optional, Tuple
 
 import grpc
 
@@ -31,11 +31,17 @@ from quip_miner_dwave import (
     MAX_EDGES,
     MAX_NODES,
 )
+from quip_miner_dwave.attempts import (
+    default_attempts_dir,
+    pickup_outcomes,
+    seed_from_attempts,
+)
 from quip_miner_dwave.budget import (
     BudgetPacer,
     BudgetUnavailable,
     ParticipationDecision,
     budget_from_backend_toml,
+    usage_db_from_backend_toml,
     warn_unknown_backend_keys,
 )
 from quip_miner_dwave.config import (
@@ -43,9 +49,17 @@ from quip_miner_dwave.config import (
     queue_depth_from_toml,
     sampling_defaults_from_toml,
 )
+from quip_miner_dwave.history import HistoryRecorder, JobSample
 from quip_miner_dwave.job import handle_job
 from quip_solver_core.session import DEFAULT_NUM_SWEEPS, num_sweeps_from_toml
 from quip_miner_dwave.ocean import OceanSampler
+from quip_miner_dwave.profile import SnapshotRefresher
+from quip_miner_dwave.strategy import (
+    RoundDecision,
+    RoundStrategy,
+    describe_round_decision,
+    strategy_config_from_toml,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +164,8 @@ class GateResult:
     allowed: bool
     changed: bool
     decision: ParticipationDecision
+    # The strategy's verdict, when the budget allowed one to be asked for.
+    round: Optional[RoundDecision] = None
 
 
 class ParticipationGate:
@@ -168,8 +184,9 @@ class ParticipationGate:
       credits immediately; the next join still waits for a boundary.
     """
 
-    def __init__(self, pacer: BudgetPacer):
+    def __init__(self, pacer: BudgetPacer, strategy: Optional[RoundStrategy] = None):
         self._pacer = pacer
+        self._strategy = strategy
         self._participating = False
         self._boundary_generation = 0
 
@@ -177,18 +194,33 @@ class ParticipationGate:
     def participating(self) -> bool:
         return self._participating
 
+    def use_strategy(self, strategy: RoundStrategy) -> None:
+        """Attach the round strategy once history exists. Budget-only before."""
+        self._strategy = strategy
+
     def on_qblock_boundary(
         self, generation: int, now: float
     ) -> Optional[GateResult]:
-        """Re-decide at a new qblock. None when this is not a fresh boundary."""
+        """Re-decide at a new qblock. None when this is not a fresh boundary.
+
+        Budget first, strategy second: the strategy is only asked whether a
+        round the miner can afford is worth it. A skip parks credits the same
+        way a budget line crossing does, and the next join waits for a
+        boundary as before.
+        """
         if generation <= self._boundary_generation:
             return None
         self._boundary_generation = generation
         decision = self._pacer.decide(now)
-        changed = decision.participate != self._participating
-        self._participating = decision.participate
+        allowed = decision.participate
+        verdict: Optional[RoundDecision] = None
+        if allowed and self._strategy is not None:
+            verdict = self._strategy.decide(now, decision)
+            allowed = verdict.join
+        changed = allowed != self._participating
+        self._participating = allowed
         return GateResult(
-            allowed=decision.participate, changed=changed, decision=decision
+            allowed=allowed, changed=changed, decision=decision, round=verdict
         )
 
     def on_job(self, now: float) -> GateResult:
@@ -301,6 +333,64 @@ def _bill_unobserved(sampler, pacer: Optional[BudgetPacer]) -> None:
         pacer.record_access_time(owed, time.time())
 
 
+def _seed_history(
+    recorder: HistoryRecorder,
+    attempts_path: str,
+    stop: threading.Event,
+    miner_id: str,
+    on_done: Optional[Callable[[], None]] = None,
+) -> None:
+    """Seed past rounds off the session thread. Best effort by design.
+
+    A node with a thousand-plus attempt directories can take tens of seconds
+    to seed, so shutdown cannot just wait it out: ``stop`` lets shutdown ask
+    the seed to give up between directories, checked once per directory
+    before that directory's writes begin, so it never leaves margins written
+    for a directory it does not also mark seeded. ``miner_id`` keeps a
+    second QPU miner on the same node out of this one's history. ``on_done``
+    rebuilds the strategy's snapshot as soon as the seed is in, rather than
+    waiting for the next scheduled refresh.
+    """
+    try:
+        seed_from_attempts(
+            recorder.store, attempts_path, time.time(), stop=stop.is_set, miner_id=miner_id
+        )
+    except Exception:  # noqa: BLE001 - history is optional, mining is not
+        logger.warning("history: seeding from %s failed", attempts_path, exc_info=True)
+    if on_done is not None:
+        on_done()
+
+
+def _pickup_history_outcomes(
+    recorder: HistoryRecorder,
+    attempts_path: str,
+    miner_id: str,
+    on_done: Optional[Callable[[], None]] = None,
+) -> None:
+    """Apply the coordinator's verdicts on recent rounds. Best effort."""
+    try:
+        pickup_outcomes(recorder.store, attempts_path, miner_id=miner_id)
+    except Exception:  # noqa: BLE001 - see _seed_history
+        logger.warning(
+            "history: outcome pickup from %s failed", attempts_path, exc_info=True
+        )
+    if on_done is not None:
+        on_done()
+
+
+def _extra_int(meta, key: str) -> Optional[int]:
+    """An integer the sampler stashed in ``SamplerMeta.extra``, or None."""
+    if meta is None:
+        return None
+    raw = meta.extra.get(key)
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
 def _log_qblock_joined(generation: int, decision: ParticipationDecision) -> None:
     logger.info(
         "[QPU] joining qblock %d: %.0fs of headroom on the budget line "
@@ -376,6 +466,27 @@ def _log_budget_configured(pacer: BudgetPacer, now: float) -> None:
             -stats["headroom_seconds"],
             _format_duration_ms(int(stats["seconds_until_headroom"] * 1000)),
         )
+
+
+def _attach_round_strategy(
+    gate: ParticipationGate, refresher: SnapshotRefresher, backend_toml: str
+) -> None:
+    """Give the gate a strategy once both a budget and history exist.
+
+    Called from whichever of the two Configure branches runs second: the
+    budget can name a gate before the recorder exists, or the recorder can
+    exist before a budget names a gate. Either order ends with a strategy
+    attached.
+    """
+    config = strategy_config_from_toml(backend_toml)
+    gate.use_strategy(RoundStrategy(config, refresher))
+    logger.info(
+        "[QPU] round strategy attached: min_win_probability=%.2f "
+        "slot_advantage=%.2f explore_fraction=%.2f",
+        config.min_win_probability,
+        config.slot_advantage,
+        config.explore_fraction,
+    )
 
 
 def log_attempt(
@@ -523,6 +634,7 @@ def run_session(
     sampler: OceanSampler,
     *,
     budget: Optional[BudgetPacer] = None,
+    attempts_dir: Optional[str] = None,
 ) -> int:
     """Run one miner session; return a process exit code."""
     target = _unix_target(coordinator_uri)
@@ -580,6 +692,15 @@ def run_session(
     inflight = InflightJobs()
     tally = CancelTally()
     job_pool: Optional[ThreadPoolExecutor] = None
+    # History of throughput, rounds and margins. None until Configure names
+    # the usage database, or forever if it cannot be opened. Optional in the
+    # strict sense: nothing about mining depends on it.
+    recorder: Optional[HistoryRecorder] = None
+    attempts_path: Optional[str] = None
+    seed_thread: Optional[threading.Thread] = None
+    seed_stop = threading.Event()
+    outcome_thread: Optional[threading.Thread] = None
+    refresher: Optional[SnapshotRefresher] = None
     session_start = time.monotonic()
     best_energy_milli: Optional[int] = None
     PROGRESS_LOG_INTERVAL = 10
@@ -604,28 +725,46 @@ def run_session(
             # Off the QPU one way or another: a later Cancel must not try to
             # drop a problem that has already finished.
             inflight.release(job.job_id)
+            if recorder is not None:
+                recorder.job_finished(time.time())
         _bill_unobserved(sampler, pending_budget)
         wall_ms = int((time.monotonic() - started) * 1000)
         for reply in replies:
             kind = reply.WhichOneof("msg")
-            if kind == "result" and pending_budget is not None:
-                meta = reply.result.meta
-                if meta is not None:
-                    # Billed before the abandoned check, not after. D-Wave
-                    # charged for this anneal whatever the coordinator decided
-                    # to do with the answer, and a ledger that under-counts
-                    # hands the pacer headroom the QPU has already spent.
-                    #
-                    # Billed outside state_lock, too. This commits to SQLite,
-                    # which fsyncs the deployment's mounted volume, and the
-                    # ledger already has its own lock. state_lock is what the
-                    # session-loop thread takes to dispatch the next job, so
-                    # holding it across this put every Cancel, Job and Ping
-                    # behind one worker's disk write — at a pipeline depth of
-                    # 96, behind all of them.
-                    pending_budget.record_access_time(
-                        meta.device_access_time_us, time.time()
+            meta = reply.result.meta if kind == "result" else None
+            if kind == "result" and pending_budget is not None and meta is not None:
+                # Billed before the abandoned check, not after. D-Wave
+                # charged for this anneal whatever the coordinator decided
+                # to do with the answer, and a ledger that under-counts
+                # hands the pacer headroom the QPU has already spent.
+                #
+                # Billed outside state_lock, too. This commits to SQLite,
+                # which fsyncs the deployment's mounted volume, and the
+                # ledger already has its own lock. state_lock is what the
+                # session-loop thread takes to dispatch the next job, so
+                # holding it across this put every Cancel, Job and Ping
+                # behind one worker's disk write — at a pipeline depth of
+                # 96, behind all of them.
+                pending_budget.record_access_time(
+                    meta.device_access_time_us, time.time()
+                )
+            job_best: Optional[int] = None
+            valid = 0
+            if kind == "result":
+                job_best = min(
+                    (s.energy_milli for s in reply.result.solutions),
+                    default=None,
+                )
+                if s_target is not None:
+                    valid = sum(
+                        1
+                        for s in reply.result.solutions
+                        if s.energy_milli <= s_target.max_energy_milli
                     )
+                else:
+                    valid = len(reply.result.solutions)
+            skip = False
+            wasted = False
             with state_lock:
                 abandoned = _is_abandoned(job.generation, cancel_watermark)
                 if kind in ("result", "reject") and abandoned:
@@ -637,26 +776,14 @@ def run_session(
                         # It came back with samples, so SAPI ran the anneal
                         # despite the cancel. That is the miss rate.
                         tally.missed()
-                    continue
-                if kind == "result":
+                        wasted = True
+                    skip = True
+                elif kind == "result":
                     jobs_done += 1
-                    meta = reply.result.meta
-                    job_best = min(
-                        (s.energy_milli for s in reply.result.solutions),
-                        default=None,
-                    )
                     if job_best is not None and (
                         best_energy_milli is None or job_best < best_energy_milli
                     ):
                         best_energy_milli = job_best
-                    if s_target is not None:
-                        valid = sum(
-                            1
-                            for s in reply.result.solutions
-                            if s.energy_milli <= s_target.max_energy_milli
-                        )
-                    else:
-                        valid = len(reply.result.solutions)
                     device_ms = (
                         meta.device_access_time_us // 1000
                         if meta is not None
@@ -694,7 +821,7 @@ def run_session(
                         rejected=_reject_reason_name(reply.reject.reason),
                         wall_ms=wall_ms,
                     )
-                if kind == "job_request" and gate is not None:
+                if not skip and kind == "job_request" and gate is not None:
                     # A finished job refills its own credit to keep the pipeline
                     # full mid-qblock. Dropping the refill is what parks the
                     # credits; the next grant waits for a qblock boundary.
@@ -702,8 +829,56 @@ def run_session(
                     if not result.allowed:
                         if result.changed:
                             _log_line_crossed(result.decision)
-                        continue
+                        skip = True
+            # History goes after the lock for the same reason billing does:
+            # it ends in a SQLite commit, and state_lock is what dispatches
+            # the next job. A wasted result is a completed anneal the
+            # coordinator threw away; the round trip counts, the job does not.
+            if recorder is not None and kind == "result" and meta is not None:
+                if wasted:
+                    recorder.record_wasted(time.time())
+                else:
+                    recorder.record_job(
+                        JobSample(
+                            completed_at=time.time(),
+                            generation=job.generation,
+                            rtt_ms=wall_ms,
+                            access_us=int(meta.device_access_time_us),
+                            inflight_at_submit=_extra_int(meta, "inflight") or 0,
+                            reads=int(meta.reads),
+                            best_energy_milli=job_best,
+                            target_milli=(
+                                s_target.max_energy_milli
+                                if s_target is not None
+                                else None
+                            ),
+                            hits=valid if s_target is not None else 0,
+                            sapi_ms=_extra_int(meta, "sapi_ms"),
+                        )
+                    )
+            if skip:
+                continue
             out_q.put(reply)
+
+    def _stop_history_threads() -> None:
+        # The refresher stops first, and its join is bounded at two seconds:
+        # what that order buys is the join finishing before the recorder
+        # below closes the store. A refresh still in flight when the store
+        # does close is not silently lost -- its next query raises, and
+        # refresh_now logs one warning and returns the snapshot already in
+        # hand, nothing else.
+        if refresher is not None:
+            refresher.stop()
+        # The seed can take tens of seconds on a node with a thousand-plus
+        # attempt directories, so shutdown asks it to give up between
+        # directories rather than block on it; a bounded join is the
+        # backstop if it is already past that check. Outcome pickup only
+        # ever reads two short directories, so a short join is enough there.
+        if seed_thread is not None:
+            seed_stop.set()
+            seed_thread.join(timeout=5.0)
+        if outcome_thread is not None:
+            outcome_thread.join(timeout=2.0)
 
     exit_code = EXIT_CLEAN
 
@@ -799,6 +974,12 @@ def run_session(
                         break
                     if pending_budget is not None:
                         gate = ParticipationGate(pending_budget)
+                        # The recorder (and its refresher) may already exist
+                        # from an earlier Configure that named no budget.
+                        if refresher is not None:
+                            _attach_round_strategy(
+                                gate, refresher, cm.configure.backend_toml
+                            )
                 out_q.put(miner_pb2.MinerMsg(ready=miner_pb2.Ready()))
                 # Read straight off the wire, not off SessionConfig: the SDK
                 # substitutes its own default of 3 for an unset field, which
@@ -833,6 +1014,31 @@ def run_session(
                     # message. A budgeted miner grants nothing until a qblock
                     # boundary gives it a whole round to decide about.
                     _log_budget_configured(pacer, time.time())
+                if recorder is None:
+                    history_path = usage_db_from_backend_toml(cm.configure.backend_toml)
+                    recorder = HistoryRecorder.open(history_path)
+                    if recorder is not None:
+                        attempts_path = attempts_dir or default_attempts_dir(history_path)
+                        refresher = SnapshotRefresher(recorder.store)
+                        refresher.start()
+                        if gate is not None:
+                            _attach_round_strategy(
+                                gate, refresher, cm.configure.backend_toml
+                            )
+                        # Past rounds come from the coordinator's attempts
+                        # files, hundreds of megabytes on a long-lived node:
+                        # not work for the session thread. seed_stop lets
+                        # shutdown cut it short between directories rather
+                        # than block on it. The snapshot is rebuilt as soon
+                        # as they are in.
+                        seed_thread = threading.Thread(
+                            target=_seed_history,
+                            args=(recorder, attempts_path, seed_stop, miner_id),
+                            kwargs={"on_done": refresher.request_refresh},
+                            name="dwave-history-seed",
+                            daemon=True,
+                        )
+                        seed_thread.start()
             elif which == "topology":
                 topo = cm.topology
                 session_nodes = list(topo.nodes)
@@ -844,6 +1050,8 @@ def run_session(
                 sampler.set_session_topology(session_nodes, session_edges)
             elif which == "set_target":
                 session_target = cm.set_target
+                if recorder is not None:
+                    recorder.round_target(cm.set_target.max_energy_milli)
             elif which == "job":
                 with state_lock:
                     cancelled = _is_abandoned(cm.job.generation, cancel_watermark)
@@ -903,6 +1111,8 @@ def run_session(
                 # arriving while the job waits for a pool thread must still
                 # reach it, and the sampler holds the note until it registers.
                 inflight.add(cm.job.job_id, cm.job.generation)
+                if recorder is not None:
+                    recorder.job_started(time.time())
                 if job_pool is not None:
                     job_pool.submit(process_job, *args).add_done_callback(
                         _surface_pool_failure
@@ -940,25 +1150,39 @@ def run_session(
                 # the only monotone round counter the coordinator sends, and it
                 # arrives every round even while the QPU holds no credits. That
                 # makes it the point at which participation is decided.
+                boundary = None
                 if gate is not None:
                     with state_lock:
                         boundary = gate.on_qblock_boundary(
                             cm.cancel.max_generation, time.time()
                         )
                     if boundary is not None:
-                        if not boundary.allowed:
-                            # Every skipped round says so, not just the first:
-                            # a run of silent boundaries is exactly what made
-                            # the old blackout unreadable in the session log.
-                            _log_qblock_sat_out(
-                                cm.cancel.max_generation, boundary.decision
+                        if boundary.round is not None:
+                            # One line per boundary either way; a skipped
+                            # round names the slot it waits for.
+                            logger.info(
+                                "%s",
+                                describe_round_decision(
+                                    cm.cancel.max_generation,
+                                    boundary.round,
+                                    boundary.decision.headroom_us,
+                                ),
                             )
+                        if not boundary.allowed:
+                            if boundary.round is None:
+                                # Every skipped round says so, not just the
+                                # first: a run of silent boundaries is exactly
+                                # what made the old blackout unreadable.
+                                _log_qblock_sat_out(
+                                    cm.cancel.max_generation, boundary.decision
+                                )
                         elif boundary.changed:
                             # Credits survive a reseed, so only the round that
                             # resumes mining needs a grant.
-                            _log_qblock_joined(
-                                cm.cancel.max_generation, boundary.decision
-                            )
+                            if boundary.round is None:
+                                _log_qblock_joined(
+                                    cm.cancel.max_generation, boundary.decision
+                                )
                             out_q.put(
                                 miner_pb2.MinerMsg(
                                     job_request=miner_pb2.JobRequest(
@@ -966,6 +1190,55 @@ def run_session(
                                     )
                                 )
                             )
+                if recorder is not None:
+                    verdict = boundary.round if boundary is not None else None
+                    if gate is None:
+                        joined, reason = True, "unbudgeted"
+                    # `boundary is not None` is implied by `verdict is not
+                    # None` (verdict comes from boundary.round above), but
+                    # pyright cannot narrow through that assignment, so the
+                    # second conjunct is here only to satisfy it.
+                    elif verdict is not None and boundary is not None:
+                        joined, reason = boundary.allowed, verdict.reason
+                    else:
+                        # `boundary` is only None on a repeated watermark,
+                        # which is exactly the condition that makes
+                        # `round_boundary` below a no-op: it discards
+                        # `joined`/`reason` without writing them, so
+                        # `gate.participating` here is a safe placeholder.
+                        joined = boundary.allowed if boundary is not None else gate.participating
+                        reason = "budget" if joined else "budget-sat-out"
+                    fresh = recorder.round_boundary(
+                        cm.cancel.max_generation,
+                        time.time(),
+                        joined=joined,
+                        reason=reason,
+                        p_win=verdict.p_now if verdict is not None else None,
+                        expected_jobs=verdict.expected_jobs if verdict is not None else None,
+                    )
+                    # The coordinator's verdict on the round that just ended
+                    # lands in its attempts file around now. One reader at a
+                    # time; a boundary that finds it still busy waits for the
+                    # next.
+                    if (
+                        fresh
+                        and attempts_path is not None
+                        and (outcome_thread is None or not outcome_thread.is_alive())
+                    ):
+                        outcome_thread = threading.Thread(
+                            target=_pickup_history_outcomes,
+                            args=(recorder, attempts_path, miner_id),
+                            kwargs={
+                                "on_done": (
+                                    refresher.request_refresh
+                                    if refresher is not None
+                                    else None
+                                )
+                            },
+                            name="dwave-history-outcomes",
+                            daemon=True,
+                        )
+                        outcome_thread.start()
             elif which == "ping":
                 with state_lock:
                     done = jobs_done
@@ -990,8 +1263,14 @@ def run_session(
         # Last sweep: a charge estimated after the final job's own drain would
         # otherwise die with the process and under-count the period.
         _bill_unobserved(sampler, pending_budget)
-        # Signal end-of-outbound so the server can finish draining Results.
+        # Signal end-of-outbound before spending the coordinator's grace
+        # window on the history joins and close: every Result still queued
+        # is an anneal already billed, and it is lost if the coordinator
+        # closes the stream first.
         out_q.put(_STOP)
+        _stop_history_threads()
+        if recorder is not None:
+            recorder.close()
         # Give the feeder thread a moment to flush (grace_ms).
         time.sleep(min(0.05, grace_ms / 1000.0))
         return exit_code
@@ -1011,6 +1290,9 @@ def run_session(
             out_q.put(_STOP)
         except Exception:  # noqa: BLE001
             pass
+        _stop_history_threads()
+        if recorder is not None:
+            recorder.close()
         channel.close()
         sampler.close()
 
@@ -1021,6 +1303,9 @@ def run_session_sync(
     sampler: OceanSampler,
     *,
     budget: Optional[BudgetPacer] = None,
+    attempts_dir: Optional[str] = None,
 ) -> int:
     """Sync entry (session is already synchronous)."""
-    return run_session(coordinator_uri, miner_id, sampler, budget=budget)
+    return run_session(
+        coordinator_uri, miner_id, sampler, budget=budget, attempts_dir=attempts_dir
+    )

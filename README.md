@@ -130,6 +130,68 @@ The same config holds other `[dwave]` keys: `budget`, `budget_reset_day`,
 `usage_db`, `num_reads`, and `anneal_time_us`. This README does not document
 them yet.
 
+## History and the profile report
+
+The miner keeps three tables in the usage database, beside the budget
+ledger. One tracks throughput per UTC hour, covering job completions, QPU
+busy time, round trips, and the D-Wave service time from SAPI's
+`submitted_on` and `solved_on`. Another holds one row per qblock round. The
+last holds a histogram of each job's best energy relative to the round's
+target. The round strategy reads them. Nothing about mining depends on
+them. A database that fails to open disables the history and logs one
+warning. Every write from the session thread and the job workers goes
+through the recorder's one worker thread. The seed and outcome-pickup
+threads below write through the database's own lock instead.
+
+At start the miner seeds past rounds from the coordinator's attempts files,
+`<data_dir>/<qblock_id>/attempts.jsonl`. The default location is the
+`attempts` directory beside the usage database, which is where the node
+manager renders it. `--attempts-dir PATH` overrides it. Seeding and outcome
+pickup keep only the lines for `--miner-id`, so a node running more than
+one QPU miner does not absorb a sibling miner's history.
+
+`quip-dwave-qa --profile [--usage-db PATH]` prints the hour-of-week grid of
+jobs per second, the grid of D-Wave queue wait, the win summary for
+weekdays and weekends, the win model, and the last 20 rounds with the
+strategy's predicted win probability beside what happened. It needs no QPU
+and no token. `--usage-db` applies to `--profile` only. A session reads the
+coordinator's `usage_db` key instead.
+
+## The round strategy
+
+At every qblock boundary the budget decides first whether the miner can
+afford the round. When it can, one function decides whether this round is
+worth the headroom or whether a better hour of the week is worth waiting
+for. It reads a snapshot of the history: throughput per hour of the week,
+the round length, the QPU time per job, and a per-job win rate learned
+from the margin histogram and the rounds the miner won.
+
+Banking headroom pays only when it buys more at a later round than it buys
+now, and only while banking is still possible. Once the headroom exceeds
+what any round can spend, or the period is about to reset, waiting throws
+QPU time away, so the miner joins. The verdict and its numbers are one log
+line per boundary.
+
+Three `[dwave]` keys tune it. The defaults change nothing until history
+exists.
+
+```toml
+min_win_probability = 0.0   # skip a round below this P(win) while banking is possible
+slot_advantage = 0.25       # defer when a later slot buys 25% more P(win) from the same headroom
+explore_fraction = 0.10     # join this share of rounds regardless, so every slot stays measured
+```
+
+The `reason` column in `--profile` and the strategy's log line name the verdict with one of these strings:
+
+- `no-data`: no history yet, so every round the budget allows is joined.
+- `explore`: the explore share drew this round regardless of the verdict below.
+- `saturated`: banking is no longer possible, so the round is joined.
+- `below-min-p`: this round's P(win) is below `min_win_probability`, so it is skipped.
+- `better-slot`: a later slot buys more P(win) from the same headroom, so this round is skipped.
+- `good-shot`: none of the above applies, so the round is joined.
+
+Three reasons predate the strategy and still appear where it plays no part: `budget` (the budget allowed the round and no strategy is attached yet), `budget-sat-out` (the budget line was crossed, before any strategy is consulted), and `unbudgeted` (no budget is configured, so every round is joined).
+
 ## Tests
 
 ```sh

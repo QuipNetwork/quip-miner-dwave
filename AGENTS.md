@@ -19,6 +19,7 @@ pyright quip_miner_dwave/                    # type checker (same)
 
 QUIP_DWAVE_MOCK=1 quip-dwave-qa --check      # offline self-test
 quip-dwave-qa --capabilities                 # print the advertised Capabilities
+quip-dwave-qa --profile --usage-db /data/qpu-usage.db   # hour-of-week history, no QPU needed
 quip-dwave-qa --quip-coordinator unix:///run/quip/coord.sock
 ```
 
@@ -135,6 +136,53 @@ Every Ocean internal lives in `OceanSampler._submit_encoded` (`Future`,
 `Present`, `client._submit`). Keep it that way: an SDK change should have a
 one-function blast radius. Polling, auth, retries and `Future.cancel` are still
 the SDK's job.
+
+### The history is a second ledger, and it never blocks the session
+
+`history.HistoryStore` keeps three tables beside `qpu_usage_hourly`:
+operational sums per UTC hour, one row per qblock round, and a histogram of
+job-best energy margins to the round target. Every throughput number is
+derived at query time (`profile.slot_stats`), so the estimator can change
+without a migration. The design and the queueing-theory background are in
+`docs/superpowers/specs/2026-09-11-qpu-time-of-week-strategy-design.md`.
+
+`HistoryRecorder` is the only thing the session loop talks to, and it never
+raises. Every write from the session thread and the job workers goes
+through the recorder's one worker thread, so `Cancel` and `SetTarget`
+handling never touch SQLite. Job workers record after billing and outside
+`state_lock`, for the same reason billing does. The seed and pickup threads
+are the exception: they write through the store directly, serialized by
+the store's own lock rather than the recorder's queue.
+
+Two rules are easy to get wrong. `Cancel(max_generation=N)` names the dead
+generation, so the round it opens is keyed as generation `N + 1`, which is
+what the coordinator writes to `attempts.jsonl`. And the per-job timings
+reach the session loop through `SamplerMeta.extra` (`inflight`, `sapi_ms`),
+because that map is the one channel that already crosses `handle_job`.
+
+Past rounds are seeded from the coordinator's attempts files
+(`attempts.seed_from_attempts`). A directory the miner was live for — a
+generation the live recorder already opened, or an hour of the directory's
+own span that a live hourly row covers — only contributes outcomes and any
+round row a live Cancel never opened. Its margins and hourly sums would
+double count. The coordinator's generations restart independently, so a
+round means one directory paired with one generation number, not a
+generation number alone.
+
+The round strategy (`strategy.decide_round`) runs inside
+`ParticipationGate.on_qblock_boundary`, after the budget said yes and from
+a memory snapshot only (`profile.SnapshotRefresher` rebuilds it on its own
+thread). It compares what the headroom buys now against the *marginal* gain
+the same headroom buys at each round within the banking horizon. Comparing
+totals would be wrong: banked headroom makes any later round look better,
+and the win probability is concave in jobs, so an identical slot never wins
+that comparison. The verdict order is explore, saturated, below minimum,
+better slot, good shot, and it is pinned by mutation tests in
+`test_decide_round.py`.
+
+`scripts/probe_timestamps.py` runs one two-qubit job on the live QPU and
+prints the SAPI timestamps that the history's queue-wait split depends on.
+It exits 1 when they are missing.
 
 ### Precedence ladders
 

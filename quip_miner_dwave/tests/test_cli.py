@@ -94,3 +94,20 @@ def test_sigterm_handler_is_idempotent():
         handler(signal.SIGTERM, None)
     finally:
         signal.signal(signal.SIGTERM, original)
+
+
+def test_profile_prints_the_grid(tmp_path, capsys):
+    from quip_miner_dwave.history import HistoryStore
+
+    path = str(tmp_path / "usage.db")
+    HistoryStore(path).close()
+    assert main(["--profile", "--usage-db", path]) == EXIT_CLEAN
+    out = capsys.readouterr().out
+    assert "QPU throughput by hour of week" in out
+    assert "Sun" in out
+
+
+def test_profile_without_a_database_fails_clearly(tmp_path, capsys):
+    missing = str(tmp_path / "nope.db")
+    assert main(["--profile", "--usage-db", missing]) == EXIT_CONFIG_INVALID
+    assert "--usage-db" in capsys.readouterr().err
