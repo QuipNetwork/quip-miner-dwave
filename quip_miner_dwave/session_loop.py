@@ -38,7 +38,11 @@ from quip_miner_dwave.budget import (
     budget_from_backend_toml,
     warn_unknown_backend_keys,
 )
-from quip_miner_dwave.config import SamplingDefaults, sampling_defaults_from_toml
+from quip_miner_dwave.config import (
+    SamplingDefaults,
+    queue_depth_from_toml,
+    sampling_defaults_from_toml,
+)
 from quip_miner_dwave.job import handle_job
 from quip_solver_core.session import DEFAULT_NUM_SWEEPS, num_sweeps_from_toml
 from quip_miner_dwave.ocean import OceanSampler
@@ -60,6 +64,29 @@ def _surface_pool_failure(future) -> None:
         logger.error("job worker crashed: %r", exc, exc_info=exc)
 
 _STOP = object()
+
+# How many submissions this backend keeps on the QPU at once when nobody says
+# otherwise. Sized so that a QPU which becomes free can be fed at its own
+# ceiling, which is Little's Law and has nothing to do with how contended the
+# device happens to be today: a queue sized for a busy chip starves a free one.
+#
+#     depth = chip_throughput * round_trip
+#
+# Measured against Advantage2_system1 on a production-sized problem (4577
+# nodes, 41514 couplers, num_reads=48): 43.2 ms of access time per job, so the
+# chip tops out at 23.2 jobs/s, and an uncontended round trip is 1.57 s. That
+# needs 36 in flight to saturate. Session logs show the round trip reaching
+# 3.05 s under load, which needs 71.
+#
+# 96 holds the chip saturated through a 4.14 s round trip — 2.6x the clean
+# figure and well past the worst observed — so a connectivity blip degrades
+# throughput rather than stalling the device. Probed to 128 with no error at
+# any depth: the Leap project's concurrency cap is nowhere near this.
+#
+# The cost of depth is reseed exposure: a Cancel catching a full pipeline
+# strands this many jobs, and the ones D-Wave has already begun annealing are
+# billed. That is affordable only because the Cancel path now reaches SAPI.
+DEFAULT_QUEUE_DEPTH = 96
 
 # Operator log token. Distinct from BACKEND ("dwave-qpu"), which is the
 # protocol advertisement. Mixed-fleet lines use [quip-miner-dwave].
@@ -177,6 +204,101 @@ class ParticipationGate:
         return GateResult(
             allowed=decision.participate, changed=changed, decision=decision
         )
+
+
+class InflightJobs:
+    """Which job is on the QPU right now, and for which generation.
+
+    The sampler cancels by job id and knows nothing about generations; the
+    coordinator abandons generations and knows nothing about what this miner
+    still has in flight. This map is the join between the two.
+
+    Reads never consume: a worker thread owns the removal of its own job, so a
+    Cancel that dropped entries here would strand their release and leak the
+    map for the life of the session.
+    """
+
+    def __init__(self) -> None:
+        self._generations: dict[bytes, int] = {}
+        self._lock = threading.Lock()
+
+    def add(self, job_id: bytes, generation: int) -> None:
+        with self._lock:
+            self._generations[bytes(job_id)] = generation
+
+    def release(self, job_id: bytes) -> None:
+        with self._lock:
+            self._generations.pop(bytes(job_id), None)
+
+    def abandoned(self, watermark: int) -> list[bytes]:
+        """Job ids belonging to a generation the coordinator reseeded past."""
+        with self._lock:
+            return [
+                job_id
+                for job_id, generation in self._generations.items()
+                if _is_abandoned(generation, watermark)
+            ]
+
+
+class CancelTally:
+    """How often a SAPI cancel actually beat the anneal.
+
+    D-Wave only refunds a problem it has not started annealing, so the value
+    of cancelling is an empirical question this answers: ``requested`` counts
+    the problems handed to SAPI, ``missed`` the ones that came back with a
+    full result anyway, having been charged in full.
+    """
+
+    def __init__(self) -> None:
+        self._requested = 0
+        self._missed = 0
+
+    def requested(self, count: int) -> None:
+        self._requested += count
+
+    def missed(self) -> None:
+        self._missed += 1
+
+    def summary(self) -> str:
+        if self._requested == 0:
+            return "no cancels yet"
+        pct = 100.0 * self._missed / self._requested
+        return (
+            f"{self._requested} cancelled, "
+            f"{self._missed} annealed anyway ({pct:.0f}% missed)"
+        )
+
+
+def resolve_queue_depth(*, coordinator: int, configured: int) -> int:
+    """Pick the pipeline depth from the three rungs that can set it.
+
+    Mirrors the per-job ladder in :func:`quip_miner_dwave.job._sampling_params`:
+    the operator's ``backend_toml`` wins because QPU-specific knowledge lives
+    there, then whatever the coordinator sent, then this backend's own measured
+    default. Zero means "not set" on the wire and in the config, and the floor
+    of 1 keeps a misconfiguration from granting no credits and mining nothing.
+    """
+    if configured > 0:
+        return configured
+    if coordinator > 0:
+        return coordinator
+    return max(1, DEFAULT_QUEUE_DEPTH)
+
+
+def _bill_unobserved(sampler, pacer: Optional[BudgetPacer]) -> None:
+    """Record access time D-Wave charged for but never reported back.
+
+    A cancelled submission raises instead of returning samples, so it carries
+    no ``device_access_time_us``. The sampler estimates the charge rather than
+    assuming none (see ``OceanSampler._charge_unobserved``); this drains that
+    estimate into the ledger. Draining on a job that ran unbudgeted would
+    throw the estimate away, so the pacer's absence is checked first.
+    """
+    if pacer is None:
+        return
+    owed = sampler.drain_unobserved_access_us()
+    if owed:
+        pacer.record_access_time(owed, time.time())
 
 
 def _log_qblock_joined(generation: int, decision: ParticipationDecision) -> None:
@@ -450,10 +572,13 @@ def run_session(
     gate: Optional[ParticipationGate] = (
         ParticipationGate(pending_budget) if pending_budget is not None else None
     )
-    queue_depth = 3
+    queue_depth = DEFAULT_QUEUE_DEPTH
     # Pipeline: up to queue_depth QPU submissions in flight (overlaps cloud RTT).
     # jobs_done + pending_budget are shared with worker threads -> guard them.
     state_lock = threading.Lock()
+    # What the QPU is chewing on right now, so a Cancel can reach it.
+    inflight = InflightJobs()
+    tally = CancelTally()
     job_pool: Optional[ThreadPoolExecutor] = None
     session_start = time.monotonic()
     best_energy_milli: Optional[int] = None
@@ -464,35 +589,58 @@ def run_session(
         # replies. Shared-state mutations are guarded by state_lock.
         nonlocal jobs_done, best_energy_milli
         started = time.monotonic()
-        replies = handle_job(
-            job,
-            sampler,
-            session_nodes=s_nodes,
-            session_edges=s_edges,
-            session_hash=s_hash,
-            session_target=s_target,
-            session_sweeps=s_sweeps,
-            session_defaults=s_defaults,
-        )
+        try:
+            replies = handle_job(
+                job,
+                sampler,
+                session_nodes=s_nodes,
+                session_edges=s_edges,
+                session_hash=s_hash,
+                session_target=s_target,
+                session_sweeps=s_sweeps,
+                session_defaults=s_defaults,
+            )
+        finally:
+            # Off the QPU one way or another: a later Cancel must not try to
+            # drop a problem that has already finished.
+            inflight.release(job.job_id)
+        _bill_unobserved(sampler, pending_budget)
         wall_ms = int((time.monotonic() - started) * 1000)
         for reply in replies:
             kind = reply.WhichOneof("msg")
+            if kind == "result" and pending_budget is not None:
+                meta = reply.result.meta
+                if meta is not None:
+                    # Billed before the abandoned check, not after. D-Wave
+                    # charged for this anneal whatever the coordinator decided
+                    # to do with the answer, and a ledger that under-counts
+                    # hands the pacer headroom the QPU has already spent.
+                    #
+                    # Billed outside state_lock, too. This commits to SQLite,
+                    # which fsyncs the deployment's mounted volume, and the
+                    # ledger already has its own lock. state_lock is what the
+                    # session-loop thread takes to dispatch the next job, so
+                    # holding it across this put every Cancel, Job and Ping
+                    # behind one worker's disk write — at a pipeline depth of
+                    # 96, behind all of them.
+                    pending_budget.record_access_time(
+                        meta.device_access_time_us, time.time()
+                    )
             with state_lock:
-                if kind == "result" and _is_abandoned(job.generation, cancel_watermark):
+                abandoned = _is_abandoned(job.generation, cancel_watermark)
+                if kind in ("result", "reject") and abandoned:
                     # SPEC section 5: no Result for an abandoned generation.
-                    # The cancel landed while the QPU sampled this job; the
-                    # coordinator reseeded past it and reclaims the credit
-                    # itself, so the reply is dropped whole.
+                    # The Reject goes the same way — a cancelled submission
+                    # surfaces as one, and answering a job the coordinator has
+                    # already reseeded past is noise it cannot act on.
+                    if kind == "result":
+                        # It came back with samples, so SAPI ran the anneal
+                        # despite the cancel. That is the miss rate.
+                        tally.missed()
                     continue
                 if kind == "result":
                     jobs_done += 1
                     meta = reply.result.meta
-                    if pending_budget is not None and meta is not None:
-                        # Billed before anything else reads the ledger, so a
-                        # crash here can only over-count, never under-count.
-                        pending_budget.record_access_time(
-                            meta.device_access_time_us, time.time()
-                        )
                     job_best = min(
                         (s.energy_milli for s in reply.result.solutions),
                         default=None,
@@ -652,8 +800,20 @@ def run_session(
                     if pending_budget is not None:
                         gate = ParticipationGate(pending_budget)
                 out_q.put(miner_pb2.MinerMsg(ready=miner_pb2.Ready()))
-                depth = config.queue_depth if config else 3
+                # Read straight off the wire, not off SessionConfig: the SDK
+                # substitutes its own default of 3 for an unset field, which
+                # would hide the "coordinator said nothing" case this backend
+                # wants to answer with its own measured depth.
+                depth = resolve_queue_depth(
+                    coordinator=cm.configure.queue_depth,
+                    configured=queue_depth_from_toml(cm.configure.backend_toml),
+                )
                 queue_depth = depth
+                logger.info(
+                    "[QPU] pipeline depth %d (coordinator asked for %s)",
+                    depth,
+                    cm.configure.queue_depth or "nothing",
+                )
                 if job_pool is None:
                     job_pool = ThreadPoolExecutor(
                         max_workers=max(1, depth), thread_name_prefix="dwave-job"
@@ -739,6 +899,10 @@ def run_session(
                     session_sweeps,
                     session_defaults,
                 )
+                # Tracked before the submit, not inside the worker: a Cancel
+                # arriving while the job waits for a pool thread must still
+                # reach it, and the sampler holds the note until it registers.
+                inflight.add(cm.job.job_id, cm.job.generation)
                 if job_pool is not None:
                     job_pool.submit(process_job, *args).add_done_callback(
                         _surface_pool_failure
@@ -756,6 +920,22 @@ def run_session(
                     done = jobs_done
                     watermark = cancel_watermark
                 out_q.put(_status(miner_id, done, abandoned=watermark))
+                # Every job of an abandoned generation still on the QPU is
+                # access time buying a round the coordinator has thrown away.
+                # Ask D-Wave to drop them; it refunds only the ones it has not
+                # started annealing, which is what the tally measures.
+                doomed = inflight.abandoned(watermark)
+                if doomed:
+                    live = sampler.cancel_inflight(doomed)
+                    tally.requested(len(doomed))
+                    logger.info(
+                        "[QPU] cancel gen<=%d: asked D-Wave to drop %d in-flight "
+                        "job(s), %d still running | session: %s",
+                        watermark,
+                        len(doomed),
+                        live,
+                        tally.summary(),
+                    )
                 # A reseed is the one qblock boundary the miner can see: it is
                 # the only monotone round counter the coordinator sends, and it
                 # arrives every round even while the QPU holds no credits. That
@@ -807,6 +987,9 @@ def run_session(
         # end-of-outbound marker, bounded by the grace window.
         if job_pool is not None:
             job_pool.shutdown(wait=True)
+        # Last sweep: a charge estimated after the final job's own drain would
+        # otherwise die with the process and under-count the period.
+        _bill_unobserved(sampler, pending_budget)
         # Signal end-of-outbound so the server can finish draining Results.
         out_q.put(_STOP)
         # Give the feeder thread a moment to flush (grace_ms).

@@ -5,6 +5,8 @@ import logging
 import time
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
+
 from quip_solver_core import miner_pb2, wire
 from quip_solver_core.session import DEFAULT_NUM_SWEEPS
 
@@ -156,7 +158,7 @@ def _resolve_problem(
     session_edges: Sequence[Tuple[int, int]],
     *,
     job_id: bytes,
-) -> Tuple[List[int], Dict[int, float], Dict[Tuple[int, int], float]]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Resolve the job's graph and build the sampler's ``h``/``J`` mappings.
 
     ``h_milli_le32`` and ``j_milli_le32`` are dense positional arrays over the
@@ -170,7 +172,8 @@ def _resolve_problem(
     the node check; it catches a job desynced from the session ``Topology``.
 
     Returns:
-        The resolved node ordering and the ``h``/``J`` dicts keyed by qubit id.
+        ``(nodes, h, edges, j)`` as numpy arrays: the resolved node ordering,
+        its biases, the resolved edge list, and its couplings.
 
     Raises:
         _Rejected: ``MALFORMED`` when ``h`` or ``j`` disagrees with the graph.
@@ -197,11 +200,16 @@ def _resolve_problem(
         )
         raise _Rejected(miner_pb2.MALFORMED)
 
-    h_dict = {int(nodes[i]): float(h[i]) for i in range(len(nodes))}
-    j_dict: Dict[Tuple[int, int], float] = {
-        (int(u), int(v)): float(j_vals[k]) for k, (u, v) in enumerate(edges)
-    }
-    return nodes, h_dict, j_dict
+    # Arrays, not dicts. The submission payload is positional in the solver's
+    # own ordering, so a dict keyed by qubit label exists only to be walked
+    # once and thrown away — ~13 ms of GIL-bound work per job at production
+    # size. quip_miner_dwave.qp maps these straight into the payload.
+    return (
+        np.asarray(nodes, dtype=np.int64),
+        np.asarray(h, dtype=np.float64),
+        np.asarray(edges, dtype=np.int64).reshape(-1, 2),
+        np.asarray(j_vals, dtype=np.float64),
+    )
 
 
 def _sampling_params(
@@ -254,7 +262,7 @@ def _sampling_params(
 
 def _build_result(
     job_id: bytes,
-    nodes: Sequence[int],
+    nodes: "np.ndarray | Sequence[int]",
     result: SampleResult,
     num_sweeps: int,
 ) -> List[miner_pb2.MinerMsg]:
@@ -265,15 +273,31 @@ def _build_result(
     energy regardless, so it re-scores whatever it accepts. ``energy_milli`` is
     an integer field, so the only transform is quantizing to milli.
     """
-    solutions = []
-    for sample, qpu_e in zip(result.samples, result.energies):
-        spins = sample_dict_to_vector(sample, nodes if nodes else sorted(sample))
-        solutions.append(
-            miner_pb2.Solution(
-                spins_bytes=spins_to_bytes(spins),
-                energy_milli=int(round(qpu_e * 1000)),
-            )
+    # One vectorised reorder from the sampler's column order into session node
+    # order, then a raw copy per read. The wire format is one signed byte per
+    # spin, which is exactly an int8 row, so nothing has to be packed by hand
+    # (test_spin_encoding pins that equivalence against wire.encode_spins).
+    order = nodes if len(nodes) else sorted(result.variables)
+    col_of = {v: i for i, v in enumerate(result.variables)}
+    spins = result.spins
+    n_cols = spins.shape[1]
+    # A node the sampler never reported reads as +1, matching the dict path's
+    # `sample.get(n, 1)`. Point those at one appended constant column so the
+    # reorder stays a single fancy-index.
+    idx = np.fromiter(
+        (col_of.get(int(n), n_cols) for n in order), dtype=np.intp, count=len(order)
+    )
+    if idx.size and idx.max() == n_cols:
+        spins = np.hstack([spins, np.ones((spins.shape[0], 1), dtype=np.int8)])
+    ordered = spins[:, idx] if idx.size else spins[:, :0]
+
+    solutions = [
+        miner_pb2.Solution(
+            spins_bytes=row.tobytes(),
+            energy_milli=int(round(qpu_e * 1000)),
         )
+        for row, qpu_e in zip(ordered, result.energies)
+    ]
 
     meta = miner_pb2.SamplerMeta(
         reads=result.num_reads,
@@ -320,7 +344,7 @@ def handle_job(
     job_id = job.job_id
     try:
         ising, h, j_vals = _validate_job(job, session_hash)
-        nodes, h_dict, j_dict = _resolve_problem(
+        nodes, h_arr, edges, j_arr = _resolve_problem(
             ising,
             h,
             j_vals,
@@ -336,14 +360,20 @@ def handle_job(
     )
     try:
         result: SampleResult = sampler.sample(
-            h_dict,
-            j_dict,
+            nodes,
+            h_arr,
+            edges,
+            j_arr,
             num_reads=num_reads,
             # 0 leaves annealing_time unset so the QPU default applies.
             anneal_time_us=anneal_time_us or None,
             # Use job_id bytes as the defect-clamp seed when present.
             nonce_seed=bytes(job_id) if job_id else None,
             label=f"quip-{job_id.hex()[:8] if job_id else 'job'}",
+            # The handle a coordinator Cancel reaches this submission by. The
+            # session loop cancels by job id, so the seed cannot double as it:
+            # a job with no defects is given no seed at all.
+            cancel_key=bytes(job_id) if job_id else None,
         )
     except Exception:
         # Ocean raises many exception types (Leap auth, network, solver

@@ -2,9 +2,11 @@
 
 Design points carried from ``QPU/dwave_sampler.py``:
 - Thread-pooled async submits (GIL-bound encode/submit off the main path)
-- SampleSet decode happens only after the cloud future completes (not on submit)
+- The answer is read off the cloud future once it completes, never decoded
+  into a SampleSet on the submit path
 - Defect-qubit clamping before submit; reconstruction after decode
-- Real ``device_access_time_us`` extracted from sampleset timing info
+- Real ``device_access_time_us`` comes from the timing info already carried
+  on the future
 
 Offline mode (``QUIP_DWAVE_MOCK=1`` or an injected sampler) uses a dimod
 sampler so unit/conformance tests never hit a real QPU.
@@ -14,16 +16,20 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
 
+import numpy as np
 
+from quip_miner_dwave.answer import AnswerView, answer_view
+from quip_miner_dwave.qp import QpEncoder, build_submission_body
 from quip_miner_dwave.defects import (
     DefectInfo,
     prepare_problem,
-    reconstruct_sample,
+    reconstruct_samples,
 )
 from quip_miner_dwave.topology import native_topology_hash
 
@@ -97,20 +103,21 @@ def ocean_importable() -> bool:
         return False
 
 
-def qpu_access_time_us(sampleset: Any) -> int:
-    """Sum qpu_programming_time + qpu_sampling_time (µs); 0 if missing."""
-    info = getattr(sampleset, "info", None) or {}
-    timing = info.get("timing") or {}
-    prog = timing.get("qpu_programming_time") or 0
-    sample = timing.get("qpu_sampling_time") or 0
-    return int(prog) + int(sample)
-
-
 @dataclass
 class SampleResult:
-    """One decoded sample batch from the QPU/mock."""
+    """One decoded sample batch from the QPU/mock.
 
-    samples: List[Dict[int, int]]
+    Spins stay in the array the sampler produced. Materialising a dict per
+    read, keyed by qubit label, cost ~220k Python-level operations per job and
+    bought nothing: the only consumer wants a dense vector in session node
+    order, which is one vectorised reorder away from this form.
+
+    ``spins`` is ``(reads, len(variables))`` of int8, normalised to +1/-1, and
+    ``variables[i]`` is the qubit label of column ``i``.
+    """
+
+    spins: "np.ndarray"
+    variables: List[int]
     energies: List[float]
     device_access_time_us: int
     num_reads: int
@@ -128,13 +135,16 @@ class SupportsSample(Protocol):
 
     def sample(
         self,
-        h: Dict[int, float],
-        j: Dict[Tuple[int, int], float],
+        nodes: "np.ndarray",
+        h: "np.ndarray",
+        edges: "np.ndarray",
+        j: "np.ndarray",
         *,
         num_reads: int = 1,
         anneal_time_us: Optional[int] = None,
         nonce_seed: Optional[bytes] = None,
         label: str = "quip-dwave-qa",
+        cancel_key: Optional[bytes] = None,
     ) -> SampleResult: ...
 
 
@@ -213,6 +223,23 @@ class OceanSampler:
             max_workers=max(1, submit_workers),
             thread_name_prefix="dwave-submit",
         )
+        # Live cloud problems, keyed by the caller's cancel key, so a
+        # coordinator Cancel can reach a problem still sitting on the QPU.
+        # Crossed by the submit pool and the session thread -> guard it.
+        self._inflight: Dict[bytes, Any] = {}
+        # Keys cancelled before their submit landed. The cloud Future only
+        # exists once _submit_sync has run and SAPI has accepted the problem;
+        # a Cancel inside that window has nothing to call yet, and that window
+        # is exactly when cancelling saves the most access time.
+        self._cancel_pending: set = set()
+        self._inflight_lock = threading.Lock()
+        # Access time D-Wave charged for problems whose timing we never saw.
+        # See _charge_unobserved for why this exists and why it over-counts.
+        self._unobserved_access_us = 0
+        self._max_access_us = 0
+        # Built on first submit, when the solver's ordering is known.
+        self._encoder: Optional[QpEncoder] = None
+        self._plan_cache = None
         self._defective_qubits: List[int] = list(defective_qubits or [])
         self._defective_edges: set = set(defective_edges or set())
         self._live_nodes: List[int] = []
@@ -383,6 +410,133 @@ class OceanSampler:
             edge_pct,
         )
 
+    def _graph_plan(self, solver, nodes, edges):
+        """The job graph's mapping into the solver's payload ordering.
+
+        Cached on the graph's identity because a session sends the same graph
+        every job: planning it costs ~10 ms, encoding against it ~0.6 ms.
+        """
+        key = (int(nodes.shape[0]), int(edges.shape[0]))
+        with self._inflight_lock:
+            cached = self._plan_cache
+        encoder = self._encoder
+        if encoder is None:
+            encoder = QpEncoder(
+                solver._encoding_qubits, solver._encoding_couplers
+            )
+            self._encoder = encoder
+        if cached is not None and cached[0] == key:
+            return encoder, cached[1]
+        plan = encoder.plan(nodes, edges)
+        with self._inflight_lock:
+            self._plan_cache = (key, plan)
+        return encoder, plan
+
+    def _clamp_defects(self, nodes, h, edges, j, nonce_seed):
+        """Apply defect clamping, which still speaks dicts.
+
+        The live graph matches the chip in the normal case, so this is a
+        no-op and the arrays pass straight through. When it is not a no-op the
+        conversion cost is paid on a path that only runs for a miner whose
+        chip has lost qubits or couplers.
+        """
+        if not (self._defective_qubits or self._defective_edges):
+            return nodes, h, edges, j, None
+        h_dict = {int(n): float(b) for n, b in zip(nodes, h)}
+        j_dict = {
+            (int(u), int(v)): float(b) for (u, v), b in zip(edges.tolist(), j)
+        }
+        h_eff, j_eff, defect_info = prepare_problem(
+            h_dict,
+            j_dict,
+            defective_qubits=self._defective_qubits,
+            defective_edges=self._defective_edges,
+            # Either kind of defect needs the reduction. Withholding the seed
+            # when only couplers are missing skipped it entirely and sent the
+            # QPU a graph it does not have.
+            nonce_seed=nonce_seed,
+        )
+        nodes_eff = np.fromiter(h_eff.keys(), dtype=np.int64, count=len(h_eff))
+        h_arr = np.fromiter(h_eff.values(), dtype=np.float64, count=len(h_eff))
+        edge_keys = list(j_eff.keys())
+        edges_eff = np.asarray(edge_keys, dtype=np.int64).reshape(-1, 2)
+        j_arr = np.fromiter(j_eff.values(), dtype=np.float64, count=len(j_eff))
+        return nodes_eff, h_arr, edges_eff, j_arr, defect_info
+
+    def _register_inflight(self, key: bytes, future: Any) -> None:
+        """Record a live cloud problem, or drop it if a Cancel beat it here."""
+        with self._inflight_lock:
+            if key in self._cancel_pending:
+                # The note is consumed by the registration it applies to; a
+                # key left poisoned would kill the next job that reuses it.
+                self._cancel_pending.discard(key)
+                doomed = future
+            else:
+                self._inflight[key] = future
+                doomed = None
+        if doomed is not None:
+            doomed.cancel()
+
+    def _release_inflight(self, key: bytes) -> None:
+        """Forget a problem that has finished, cancelled or not."""
+        with self._inflight_lock:
+            self._inflight.pop(key, None)
+            self._cancel_pending.discard(key)
+
+    def cancel_inflight(self, keys: Sequence[bytes]) -> int:
+        """Ask SAPI to drop these problems; return how many were still live.
+
+        Best-effort by construction: D-Wave only refunds a problem it has not
+        started annealing, so the return value counts the ones that had not
+        finished when we asked, which is the ceiling on what was saved — not a
+        confirmed refund. Keys whose submit has not landed are noted so
+        :meth:`_register_inflight` cancels them the moment it does.
+        """
+        with self._inflight_lock:
+            found = []
+            for key in keys:
+                future = self._inflight.pop(key, None)
+                if future is None:
+                    self._cancel_pending.add(key)
+                else:
+                    found.append(future)
+        live = 0
+        for future in found:
+            if future.done():
+                continue
+            future.cancel()
+            live += 1
+        return live
+
+    def _observe_access_us(self, access_us: int) -> None:
+        """Note a measured charge, so an unmeasurable one can be estimated."""
+        with self._inflight_lock:
+            self._max_access_us = max(self._max_access_us, int(access_us))
+
+    def _charge_unobserved(self) -> None:
+        """Bill a problem SAPI accepted but whose timing we never saw.
+
+        A cancel that beat the anneal costs nothing; a cancel that lost is
+        charged by D-Wave in full. The raised path carries no timing to tell
+        those apart, so the ledger assumes the anneal ran. That over-counts
+        every successful cancel, which is the safe direction to be wrong:
+        under-counting lets the pacer hand out headroom D-Wave has already
+        spent, and the drift compounds across the period.
+
+        The estimate is the largest charge measured this session, which is
+        exact on a fleet whose jobs all carry the same num_reads. It is 0
+        until the first job completes, so a cancel in the opening seconds of a
+        session is under-billed; that window is bounded and does not recur.
+        """
+        with self._inflight_lock:
+            self._unobserved_access_us += self._max_access_us
+
+    def drain_unobserved_access_us(self) -> int:
+        """Take the estimated charges accrued since the last call."""
+        with self._inflight_lock:
+            owed, self._unobserved_access_us = self._unobserved_access_us, 0
+        return owed
+
     def close(self) -> None:
         self._submit_pool.shutdown(wait=False)
         if self._qpu_solver is not None:
@@ -393,110 +547,171 @@ class OceanSampler:
 
     def _submit_sync(
         self,
+        nodes,
         h,
+        edges,
         j,
         num_reads: int,
         label: str,
         anneal_time_us: Optional[int] = None,
+        cancel_key: Optional[bytes] = None,
     ):
         """Run on a pool thread: build/submit only; do NOT touch .sampleset."""
-        kwargs: Dict[str, Any] = {
-            "num_reads": num_reads,
-            "label": label,
-        }
+        params: Dict[str, Any] = {"num_reads": num_reads}
         # D-Wave's SAPI parameter is `annealing_time`, in microseconds — the
         # same unit as the proto's `anneal_time_us`, so no conversion needed.
         # Only set when the caller supplied an explicit override; otherwise
         # leave it out so the QPU's hardware-default anneal applies.
         if anneal_time_us:
-            kwargs["annealing_time"] = anneal_time_us
-        # Prefer sample_ising; mock ExactSolver also supports it.
-        sample_fn = getattr(self.sampler, "sample_ising", None)
-        if not callable(sample_fn):
-            raise RuntimeError("sampler has no sample_ising")
-        # For real cloud futures the SDK returns a Future when async is used;
-        # dimod/mock return a SampleSet. We normalize in _decode.
-        if hasattr(self.sampler, "sample_ising") and not self._is_mock:
-            # Async path via underlying solver when available.
-            solver = getattr(self.sampler, "solver", None)
-            if solver is not None and hasattr(solver, "sample_ising"):
-                return solver.sample_ising(h, j, **kwargs)
-        return sample_fn(h, j, **kwargs)
+            params["annealing_time"] = anneal_time_us
+
+        solver = getattr(self.sampler, "solver", None)
+        if self._is_mock or solver is None:
+            # dimod samplers and injected doubles take dicts, and the problems
+            # they see are tiny. Only the cloud path is worth encoding by hand.
+            sample_fn = getattr(self.sampler, "sample_ising", None)
+            if not callable(sample_fn):
+                raise RuntimeError("sampler has no sample_ising")
+            return sample_fn(
+                {int(n): float(b) for n, b in zip(nodes, h)},
+                {
+                    (int(u), int(v)): float(b)
+                    for (u, v), b in zip(edges.tolist(), j)
+                },
+                label=label,
+                **params,
+            )
+
+        # Encode straight from the arrays into the solver's own ordering. The
+        # Ocean path would build an h/J dict here and hand it to
+        # encode_problem_as_qp, which walks it back into these same two dense
+        # arrays: ~27 ms of GIL-bound work per job at production size, against
+        # ~0.6 ms here. quip_miner_dwave.qp pins byte equality with that
+        # function, so what reaches SAPI is unchanged.
+        encoder, plan = self._graph_plan(solver, nodes, edges)
+        data = encoder.encode(plan, h, j)
+        body = build_submission_body(solver, data, params, label=label)
+
+        computation = self._submit_encoded(solver, body, cancel_key)
+        return computation
+
+    def _submit_encoded(self, solver, body: bytes, cancel_key: Optional[bytes]):
+        """Hand an encoded problem to the cloud client.
+
+        Every Ocean internal this backend depends on lives in this method, so
+        the blast radius of an SDK change is one function: ``Future`` and
+        ``Present`` to build the computation, and ``client._submit`` to queue
+        it. Everything upstream is our own arrays and our own encoder.
+        """
+        # Imported here so an offline/mock run never needs the cloud client.
+        from dwave.cloud.computation import Future
+        from dwave.cloud.concurrency import Present
+
+        computation = Future(
+            solver=solver,
+            id_=None,
+            # numpy, not lists. With return_matrix=False the decoder calls
+            # .tolist() on a (reads x qubits) array, which is 220k Python
+            # objects a job at production size. Safe only because nothing on
+            # this path builds a SampleSet: the same flag makes
+            # wait_sampleset's comprehension 4.4x slower.
+            return_matrix=True,
+        )
+        # XXX carried on the Future until SAPI implements it, as Ocean does.
+        computation._offset = 0
+        # Registered before the submit, not after: _submit hands the problem to
+        # the client's own threads, so the id can come back before this line
+        # would otherwise run.
+        if cancel_key is not None:
+            self._register_inflight(cancel_key, computation)
+        solver.client._submit(Present(result=body), computation)
+        return computation
 
     @staticmethod
-    def _decode_future(future_or_ss: Any):
-        """Decode sampleset OFF the submit path (main/consumer thread)."""
-        if hasattr(future_or_ss, "sampleset"):
-            return future_or_ss.sampleset
-        return future_or_ss
+    def _decode_and_view(future_or_ss: Any) -> AnswerView:
+        """Read the answer OFF the submit path (v0.2 lesson: never on it).
+
+        Deliberately not ``.sampleset``. That property turns the decoded numpy
+        arrays into Python lists, walks them with a nested comprehension over
+        reads times variables, and hands them to dimod to convert back into
+        numpy: about 38.8 ms per job at production size, to arrive at the arrays
+        the decoder already had.
+        """
+        return answer_view(future_or_ss)
 
     def sample(
         self,
-        h: Dict[int, float],
-        j: Dict[Tuple[int, int], float],
+        nodes: "np.ndarray",
+        h: "np.ndarray",
+        edges: "np.ndarray",
+        j: "np.ndarray",
         *,
         num_reads: int = 1,
         anneal_time_us: Optional[int] = None,
         nonce_seed: Optional[bytes] = None,
         label: str = "quip-dwave-qa",
+        cancel_key: Optional[bytes] = None,
     ) -> SampleResult:
         """Submit one Ising problem and return decoded, reconstructed samples.
 
-        Submit work runs on the thread pool; sampleset decode runs here after
-        the future completes (v0.2 lesson: never decode on the submit path).
+        Submit work runs on the thread pool. The answer is read off the future
+        here, after it completes (v0.2 lesson: never decode on the submit
+        path).
         ``anneal_time_us`` (microseconds) maps directly to D-Wave's
         ``annealing_time`` SAPI parameter; ``None``/``0`` leaves it unset so
         the QPU's hardware-default anneal applies.
+
+        ``cancel_key`` makes the submission reachable by
+        :meth:`cancel_inflight` until it finishes. A cancelled problem raises
+        out of here rather than returning samples, which is what the caller
+        wants: there is no Result to send for a generation the coordinator has
+        already abandoned.
         """
-        h_eff, j_eff, defect_info = prepare_problem(
-            h,
-            j,
-            defective_qubits=self._defective_qubits,
-            defective_edges=self._defective_edges,
-            # Either kind of defect needs the reduction. Withholding the seed
-            # when only couplers are missing skipped it entirely and sent the
-            # QPU a graph it does not have.
-            nonce_seed=(
-                nonce_seed
-                if (self._defective_qubits or self._defective_edges)
-                else None
-            ),
+        nodes, h, edges, j, defect_info = self._clamp_defects(
+            nodes, h, edges, j, nonce_seed
         )
         # Thread-pooled submit
         fut = self._submit_pool.submit(
             self._submit_sync,
-            h_eff,
-            j_eff,
+            nodes,
+            h,
+            edges,
+            j,
             max(1, int(num_reads)),
             label,
             anneal_time_us,
+            cancel_key,
         )
-        raw = fut.result()
-        # Decode off the submit path
-        ss = self._decode_future(raw)
-        access_us = qpu_access_time_us(ss)
+        # Two failure boundaries, billed differently. A failure here is the
+        # submit itself dying in this process: D-Wave never saw the problem,
+        # so charging for it would burn quota the QPU never spent.
+        try:
+            raw = fut.result()
+        except BaseException:
+            if cancel_key is not None:
+                self._release_inflight(cancel_key)
+            raise
+        # Decode off the submit path. A failure here is a problem SAPI already
+        # accepted — a cancelled one, most often — and it may have annealed.
+        try:
+            view = self._decode_and_view(raw)
+        except BaseException:
+            self._charge_unobserved()
+            raise
+        finally:
+            if cancel_key is not None:
+                self._release_inflight(cancel_key)
+        access_us = view.access_time_us
+        self._observe_access_us(access_us)
 
-        samples: List[Dict[int, int]] = []
-        energies: List[float] = []
-        variables = list(ss.variables)
-        for row, energy in zip(ss.record.sample, ss.record.energy):
-            reduced = {int(variables[i]): int(row[i]) for i in range(len(variables))}
-            # ExactSolver / SA use ±1; coerce zeros just in case
-            reduced = {k: (1 if v >= 0 else -1) for k, v in reduced.items()}
-            full, e_corr = reconstruct_sample(reduced, float(energy), defect_info)
-            samples.append(full)
-            energies.append(e_corr)
-
-        # The cloud client aggregates identical reads into one record row
-        # carrying num_occurrences, so len(samples) counts distinct solutions,
-        # not anneals performed. Sum the occurrences to report reads actually
-        # run; the offline samplers do not aggregate, where the sum degrades to
-        # the row count anyway.
-        occurrences = getattr(ss.record, "num_occurrences", None)
-        reads_done = int(sum(occurrences)) if occurrences is not None else len(samples)
+        spins, variables, energies = reconstruct_samples(
+            view.spins, view.variables, view.energies, defect_info
+        )
+        reads_done = view.reads
 
         return SampleResult(
-            samples=samples,
+            spins=spins,
+            variables=variables,
             energies=energies,
             device_access_time_us=access_us,
             num_reads=reads_done,

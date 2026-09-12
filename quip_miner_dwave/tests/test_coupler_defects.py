@@ -95,6 +95,18 @@ def test_sample_submits_only_couplers_the_chip_has():
     assert s._defective_qubits == []
     assert s._defective_edges == {(1, 2)}
 
-    s.sample({0: 1.0, 1: 0.0, 2: -1.0}, {(0, 1): 1.0, (1, 2): -1.0}, nonce_seed=b"\x07")
-    _, submitted_j = rec.submitted[0]
-    assert submitted_j == {(0, 1): 1.0}
+    import numpy as np
+
+    nodes, h, edges, j, info = s._clamp_defects(
+        np.array([0, 1, 2]),
+        np.array([1.0, 0.0, -1.0]),
+        np.array([(0, 1), (1, 2)]),
+        np.array([1.0, -1.0]),
+        b"\x07",
+    )
+
+    # (1, 2) is not on the chip. Submitting it makes SAPI reject the whole
+    # problem, so it must be gone from what the encoder will see.
+    assert [tuple(e) for e in edges.tolist()] == [(0, 1)]
+    assert j.tolist() == [1.0]
+    assert info is not None and info.removed_edges == {(1, 2): -1.0}

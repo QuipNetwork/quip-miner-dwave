@@ -23,7 +23,7 @@ def gate_with(budget_s=3000.0, reset_day=9):
     pacer = BudgetPacer(
         BudgetConfig(budget_seconds=budget_s, reset_day=reset_day), led
     )
-    return ParticipationGate(pacer), led
+    return ParticipationGate(pacer), pacer
 
 
 # Ten days into a 30-day period at 3000s/month: 1000s of allowance earned.
@@ -56,8 +56,8 @@ def test_a_boundary_with_headroom_starts_participation():
 
 
 def test_a_boundary_without_headroom_sits_the_round_out():
-    gate, led = gate_with()
-    led.record(1500 * 1_000_000, now=MID_PERIOD)  # 500s past the line
+    gate, pacer = gate_with()
+    pacer.record_access_time(1500 * 1_000_000, MID_PERIOD)  # 500s past the line
     result = gate.on_qblock_boundary(100, MID_PERIOD)
     assert result is not None
     assert result.allowed is False
@@ -84,11 +84,11 @@ def test_staying_in_across_a_boundary_does_not_re_grant():
 
 
 def test_crossing_the_line_mid_qblock_parks_credits_immediately():
-    gate, led = gate_with()
+    gate, pacer = gate_with()
     gate.on_qblock_boundary(100, MID_PERIOD)
     assert gate.participating is True
 
-    led.record(1500 * 1_000_000, now=MID_PERIOD)  # blow past the line mid-round
+    pacer.record_access_time(1500 * 1_000_000, MID_PERIOD)  # blow past the line mid-round
     result = gate.on_job(MID_PERIOD)
     assert result.allowed is False
     assert result.changed is True  # caller logs the stop once
@@ -96,9 +96,9 @@ def test_crossing_the_line_mid_qblock_parks_credits_immediately():
 
 
 def test_the_stop_is_logged_once_not_per_rejected_job():
-    gate, led = gate_with()
+    gate, pacer = gate_with()
     gate.on_qblock_boundary(100, MID_PERIOD)
-    led.record(1500 * 1_000_000, now=MID_PERIOD)
+    pacer.record_access_time(1500 * 1_000_000, MID_PERIOD)
     assert gate.on_job(MID_PERIOD).changed is True
     # Every later job in the same shut round is a silent refusal.
     assert gate.on_job(MID_PERIOD).changed is False
@@ -108,9 +108,9 @@ def test_the_stop_is_logged_once_not_per_rejected_job():
 def test_recovery_waits_for_a_boundary_not_for_the_line():
     # The line recovers continuously, but rejoining mid-round is exactly what
     # the gate exists to prevent.
-    gate, led = gate_with()
+    gate, pacer = gate_with()
     gate.on_qblock_boundary(100, MID_PERIOD)
-    led.record(1500 * 1_000_000, now=MID_PERIOD)
+    pacer.record_access_time(1500 * 1_000_000, MID_PERIOD)
     gate.on_job(MID_PERIOD)
     assert gate.participating is False
 
@@ -127,8 +127,8 @@ def test_recovery_waits_for_a_boundary_not_for_the_line():
 
 
 def test_a_sat_out_round_reports_the_wait():
-    gate, led = gate_with()
-    led.record(1500 * 1_000_000, now=MID_PERIOD)
+    gate, pacer = gate_with()
+    pacer.record_access_time(1500 * 1_000_000, MID_PERIOD)
     result = gate.on_qblock_boundary(100, MID_PERIOD)
     assert result is not None
     assert result.decision.seconds_until_headroom > 0

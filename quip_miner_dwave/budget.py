@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import calendar
 import logging
+import threading
 import tomllib
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -39,6 +40,15 @@ logger = logging.getLogger(__name__)
 # so it is the one directory known to outlive the container.
 DEFAULT_USAGE_DB = "/data/qpu-usage.db"
 
+# How long a pacer may serve this period's spend from memory before consulting
+# the durable record again. The per-job participation check runs on the
+# session-loop thread under the dispatch lock, so a SQLite read there stalls
+# Cancel, Job and Ping handling; at the chip's ceiling of ~23 jobs/s this turns
+# 23 reads a second into one every few seconds. The window is what another
+# writer sharing usage_db can add without this pacer seeing it, which at that
+# same ceiling is about a second of QPU time against a monthly quota.
+SPEND_REFRESH_S = 5.0
+
 # Config keys the dwave backend recognizes in Configure.backend_toml. Anything
 # else (outside SESSION_KEYS) is a typo and gets warned about, uniform with the
 # Rust backends' unknown-field handling. Connection credentials (token/solver/
@@ -52,6 +62,7 @@ DWAVE_CONFIG_KEYS = frozenset(
         "usage_db",
         "anneal_time_us",
         "num_reads",
+        "queue_depth",
     }
 )
 
@@ -140,11 +151,65 @@ class ParticipationDecision:
 
 
 class BudgetPacer:
-    """Even-distribution gate over one period's QPU allotment."""
+    """Even-distribution gate over one period's QPU allotment.
+
+    Spend for the live period is held in memory. :meth:`decide` runs on the
+    session-loop thread, under the lock that dispatches jobs, once per job, so
+    a SQLite query there sits on the path that also handles Cancel, Job and
+    Ping — and the ledger is on a mounted volume in the deployment. Nothing
+    else adds to this period's spend, so the durable record only has to be
+    consulted when the period rolls over, or when this process starts and
+    inherits whatever a previous run already spent.
+    """
 
     def __init__(self, config: BudgetConfig, ledger: UsageLedger):
         self.config = config
         self.ledger = ledger
+        # Guards the cached total only. Never held across ledger IO.
+        self._spend_lock = threading.Lock()
+        self._cached_period_start: Optional[float] = None
+        self._cached_spent_us = 0.0
+        self._cached_at = 0.0
+
+    def _spent_us(self, period_start: float, now: float) -> float:
+        """This period's billed access time, from memory where possible.
+
+        Spend this process bills is added to the cache as it happens, so the
+        cache is exact for its own work. It is not the only writer, though:
+        ``usage_db`` defaults to a shared path, and two miners drawing on one
+        D-Wave account must share a ledger or they will collectively overrun
+        the quota. So the durable record is re-read on a short interval, which
+        bounds how much of another writer's spend this pacer can be blind to
+        while still keeping SQLite off the per-job path.
+
+        Staleness is measured on the caller's own clock, the one the period
+        maths already uses, so a simulated month ages the cache exactly as a
+        real one does. A clock that steps backwards only holds the cache a
+        little longer, which is the safe direction.
+        """
+        with self._spend_lock:
+            fresh = (
+                self._cached_period_start == period_start
+                and 0.0 <= now - self._cached_at < SPEND_REFRESH_S
+            )
+            if fresh:
+                return self._cached_spent_us
+        # Read outside the lock so a slow volume cannot block a billing.
+        spent = self.ledger.spent_us_since(period_start)
+        with self._spend_lock:
+            if self._cached_period_start != period_start:
+                # A new period starts from whatever the record holds, which is
+                # also how a restart mid-period inherits a previous run.
+                self._cached_period_start = period_start
+                self._cached_spent_us = spent
+            else:
+                # Same period: another writer may have added to the record,
+                # and this pacer may have billed since the read began. Take
+                # the larger, because under-counting hands out headroom the
+                # QPU has already spent.
+                self._cached_spent_us = max(self._cached_spent_us, spent)
+            self._cached_at = now
+            return self._cached_spent_us
 
     def decide(self, now: float) -> ParticipationDecision:
         """Evaluate spend against the flat allowance line at ``now``."""
@@ -153,7 +218,7 @@ class BudgetPacer:
         elapsed = min(max(now - start, 0.0), span)
         budget_us = self.config.budget_seconds * 1_000_000
         allowance_us = budget_us * elapsed / span
-        spent_us = self.ledger.spent_us_since(start)
+        spent_us = self._spent_us(start, now)
         headroom_us = allowance_us - spent_us
 
         if headroom_us > 0:
@@ -178,7 +243,20 @@ class BudgetPacer:
         )
 
     def record_access_time(self, qpu_access_time_us: float, now: float) -> None:
-        """Bill a completed job against the period."""
+        """Bill a completed job against the period.
+
+        The cached total is raised before the durable write, not after, so the
+        two can only ever disagree in the safe direction: a decision taken
+        while the write is in flight sees the charge rather than missing it.
+        Under-counting is what hands the pacer headroom the QPU has already
+        spent.
+        """
+        start, _ = period_bounds(now, self.config.reset_day)
+        with self._spend_lock:
+            if self._cached_period_start == start:
+                self._cached_spent_us += float(qpu_access_time_us)
+            # Otherwise the period has rolled over or nothing has been read
+            # yet, and the next _spent_us reloads from the record below.
         self.ledger.record(qpu_access_time_us, now=now)
 
     def stats(self, now: float) -> Dict[str, Any]:

@@ -20,3 +20,9 @@ leap_usage_report_*.csv
 qpu-1-logs/
 *.log
 *.log.[0-9]
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
