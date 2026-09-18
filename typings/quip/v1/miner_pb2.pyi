@@ -164,7 +164,7 @@ class EdgeList(_message.Message):
     def __init__(self, u: _Optional[_Iterable[int]] = ..., v: _Optional[_Iterable[int]] = ...) -> None: ...
 
 class IsingProblem(_message.Message):
-    __slots__ = ("topology_hash", "edges", "h_milli_le32", "j_milli_le32", "num_reads", "num_sweeps", "anneal_time_us")
+    __slots__ = ("topology_hash", "edges", "h_milli_le32", "j_milli_le32", "num_reads", "num_sweeps", "anneal_time_us", "initial_spins", "start_beta_milli", "reversal_s_milli", "reversal_pause_us")
     TOPOLOGY_HASH_FIELD_NUMBER: _ClassVar[int]
     EDGES_FIELD_NUMBER: _ClassVar[int]
     H_MILLI_LE32_FIELD_NUMBER: _ClassVar[int]
@@ -172,6 +172,10 @@ class IsingProblem(_message.Message):
     NUM_READS_FIELD_NUMBER: _ClassVar[int]
     NUM_SWEEPS_FIELD_NUMBER: _ClassVar[int]
     ANNEAL_TIME_US_FIELD_NUMBER: _ClassVar[int]
+    INITIAL_SPINS_FIELD_NUMBER: _ClassVar[int]
+    START_BETA_MILLI_FIELD_NUMBER: _ClassVar[int]
+    REVERSAL_S_MILLI_FIELD_NUMBER: _ClassVar[int]
+    REVERSAL_PAUSE_US_FIELD_NUMBER: _ClassVar[int]
     topology_hash: bytes
     edges: EdgeList
     h_milli_le32: bytes
@@ -179,7 +183,11 @@ class IsingProblem(_message.Message):
     num_reads: int
     num_sweeps: int
     anneal_time_us: int
-    def __init__(self, topology_hash: _Optional[bytes] = ..., edges: _Optional[_Union[EdgeList, _Mapping]] = ..., h_milli_le32: _Optional[bytes] = ..., j_milli_le32: _Optional[bytes] = ..., num_reads: _Optional[int] = ..., num_sweeps: _Optional[int] = ..., anneal_time_us: _Optional[int] = ...) -> None: ...
+    initial_spins: _containers.RepeatedScalarFieldContainer[bytes]
+    start_beta_milli: int
+    reversal_s_milli: int
+    reversal_pause_us: int
+    def __init__(self, topology_hash: _Optional[bytes] = ..., edges: _Optional[_Union[EdgeList, _Mapping]] = ..., h_milli_le32: _Optional[bytes] = ..., j_milli_le32: _Optional[bytes] = ..., num_reads: _Optional[int] = ..., num_sweeps: _Optional[int] = ..., anneal_time_us: _Optional[int] = ..., initial_spins: _Optional[_Iterable[bytes]] = ..., start_beta_milli: _Optional[int] = ..., reversal_s_milli: _Optional[int] = ..., reversal_pause_us: _Optional[int] = ...) -> None: ...
 
 class Provenance(_message.Message):
     __slots__ = ("is_pow", "order_id")
