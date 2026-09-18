@@ -33,6 +33,7 @@ from quip_miner_dwave.defects import (
     reconstruct_samples,
 )
 from quip_miner_dwave.topology import native_topology_hash
+from quip_miner_dwave.schedule import forward_schedule
 
 logger = logging.getLogger(__name__)
 
@@ -520,6 +521,26 @@ class OceanSampler:
         j_arr = np.fromiter(j_eff.values(), dtype=np.float64, count=len(j_eff))
         return nodes_eff, h_arr, edges_eff, j_arr, defect_info
 
+    @staticmethod
+    def _anneal_params(solver: Any, anneal_time_us: Optional[int]) -> Dict[str, Any]:
+        """The anneal half of a submission: always a schedule, never a time.
+
+        SAPI refuses ``annealing_time`` beside ``anneal_schedule``, and a
+        reverse anneal has no ``annealing_time`` form, so one spelling covers
+        every job. With no override the solver's own published default is
+        written out as a schedule. A sampler that publishes none (the mock)
+        gets no schedule at all and keeps its own default.
+        """
+        props = getattr(solver, "properties", None) or {}
+        anneal_us = anneal_time_us or props.get("default_annealing_time")
+        if not anneal_us:
+            return {}
+        return {
+            "anneal_schedule": forward_schedule(
+                anneal_us, time_range=props.get("annealing_time_range")
+            )
+        }
+
     def _register_inflight(self, key: bytes, future: Any) -> None:
         """Record a live cloud problem, or drop it if a Cancel beat it here."""
         with self._inflight_lock:
@@ -614,15 +635,12 @@ class OceanSampler:
         cancel_key: Optional[bytes] = None,
     ):
         """Run on a pool thread: build/submit only; do NOT touch .sampleset."""
-        params: Dict[str, Any] = {"num_reads": num_reads}
-        # D-Wave's SAPI parameter is `annealing_time`, in microseconds — the
-        # same unit as the proto's `anneal_time_us`, so no conversion needed.
-        # Only set when the caller supplied an explicit override; otherwise
-        # leave it out so the QPU's hardware-default anneal applies.
-        if anneal_time_us:
-            params["annealing_time"] = anneal_time_us
-
         solver = getattr(self.sampler, "solver", None)
+        params: Dict[str, Any] = {"num_reads": num_reads}
+        # The proto's `anneal_time_us` and SAPI's schedule times are both
+        # microseconds, so no conversion is needed.
+        params.update(self._anneal_params(solver, anneal_time_us))
+
         if self._is_mock or solver is None:
             # dimod samplers and injected doubles take dicts, and the problems
             # they see are tiny. Only the cloud path is worth encoding by hand.
@@ -714,9 +732,9 @@ class OceanSampler:
         Submit work runs on the thread pool. The answer is read off the future
         here, after it completes (v0.2 lesson: never decode on the submit
         path).
-        ``anneal_time_us`` (microseconds) maps directly to D-Wave's
-        ``annealing_time`` SAPI parameter; ``None``/``0`` leaves it unset so
-        the QPU's hardware-default anneal applies.
+        ``anneal_time_us`` (microseconds) is the time a full ramp of the
+        anneal takes; ``None``/``0`` means the solver's published default. It
+        reaches SAPI as an ``anneal_schedule`` (see ``_anneal_params``).
 
         ``cancel_key`` makes the submission reachable by
         :meth:`cancel_inflight` until it finishes. A cancelled problem raises
