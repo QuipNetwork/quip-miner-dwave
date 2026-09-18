@@ -19,7 +19,7 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
 
@@ -32,8 +32,13 @@ from quip_miner_dwave.defects import (
     prepare_problem,
     reconstruct_samples,
 )
+from quip_miner_dwave.schedule import (
+    FALLBACK_ANNEAL_US,
+    forward_schedule,
+    reverse_schedule,
+)
 from quip_miner_dwave.topology import native_topology_hash
-from quip_miner_dwave.schedule import forward_schedule
+from quip_miner_dwave.warm import WarmStart
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +181,7 @@ class SupportsSample(Protocol):
         nonce_seed: Optional[bytes] = None,
         label: str = "quip-dwave-qa",
         cancel_key: Optional[bytes] = None,
+        warm_start: Optional[WarmStart] = None,
     ) -> SampleResult: ...
 
 
@@ -185,11 +191,44 @@ class SupportsClose(Protocol):
     def close(self) -> None: ...
 
 
+def descend_from(
+    h: Dict[int, float], j: Dict[Tuple[int, int], float], state: Dict[int, int]
+) -> Tuple[Dict[int, int], float]:
+    """Zero-temperature single-spin descent from ``state``; the mock's reverse anneal.
+
+    A reverse anneal searches near the state it starts from and never returns
+    to a random one. Descent is the deterministic version of that: it flips a
+    spin only when the flip lowers the energy, so a ground state comes back
+    unchanged. That is what the conformance driver's seeded 4096-spin ring
+    grades, and no exact enumeration could answer a problem that size.
+
+    Returns the final state and its energy ``sum(h s) + sum(J s s)``.
+    """
+    nbrs: Dict[int, List[Tuple[int, float]]] = {v: [] for v in h}
+    for (u, v), coupling in j.items():
+        nbrs.setdefault(u, []).append((v, coupling))
+        nbrs.setdefault(v, []).append((u, coupling))
+    spins = {v: (1 if state.get(v, 1) >= 0 else -1) for v in nbrs}
+    moved = True
+    while moved:
+        moved = False
+        for v, around in nbrs.items():
+            field = h.get(v, 0.0) + sum(c * spins[u] for u, c in around)
+            if spins[v] * field > 0:
+                spins[v] = -spins[v]
+                moved = True
+    energy = sum(bias * spins[v] for v, bias in h.items()) + sum(
+        c * spins[u] * spins[v] for (u, v), c in j.items()
+    )
+    return spins, float(energy)
+
+
 class MockSampler:
     """Offline sampler backed by dimod ExactSolver / SimulatedAnnealingSampler.
 
     Returns a sampleset-like object with a synthetic timing dict so
-    ``device_access_time_us`` is non-zero in tests.
+    ``device_access_time_us`` is non-zero in tests. A job that carries
+    ``initial_state`` is answered by :func:`descend_from` on either backend.
     """
 
     def __init__(self, backend: str = "exact"):
@@ -212,7 +251,15 @@ class MockSampler:
 
         num_reads = int(kwargs.get("num_reads") or 1)
         t0 = time.monotonic()
-        if self._backend == "exact":
+        initial = kwargs.get("initial_state")
+        if initial:
+            # Every read of a reverse anneal starts from the one state, and
+            # descent is deterministic, so the reads are one aggregated row.
+            spins, energy = descend_from(h, j, initial)
+            ss = dimod.SampleSet.from_samples(
+                [spins], dimod.SPIN, energy=[energy], num_occurrences=[num_reads]
+            )
+        elif self._backend == "exact":
             ss = self._sampler.sample_ising(h, j)
             # ExactSolver returns every state; keep the lowest-energy rows.
             if len(ss) > num_reads:
@@ -490,13 +537,14 @@ class OceanSampler:
             self._plan_cache = (key, plan)
         return encoder, plan
 
-    def _clamp_defects(self, nodes, h, edges, j, nonce_seed):
+    def _clamp_defects(self, nodes, h, edges, j, nonce_seed, warm_start=None):
         """Apply defect clamping, which still speaks dicts.
 
         The live graph matches the chip in the normal case, so this is a
         no-op and the arrays pass straight through. When it is not a no-op the
         conversion cost is paid on a path that only runs for a miner whose
-        chip has lost qubits or couplers.
+        chip has lost qubits or couplers. The clamped qubits of a warm start
+        take their spins from its state.
         """
         if not (self._defective_qubits or self._defective_edges):
             return nodes, h, edges, j, None
@@ -504,6 +552,11 @@ class OceanSampler:
         j_dict = {
             (int(u), int(v)): float(b) for (u, v), b in zip(edges.tolist(), j)
         }
+        start_state = (
+            None
+            if warm_start is None
+            else {int(n): int(s) for n, s in zip(nodes, warm_start.state)}
+        )
         h_eff, j_eff, defect_info = prepare_problem(
             h_dict,
             j_dict,
@@ -513,6 +566,7 @@ class OceanSampler:
             # when only couplers are missing skipped it entirely and sent the
             # QPU a graph it does not have.
             nonce_seed=nonce_seed,
+            start_state=start_state,
         )
         nodes_eff = np.fromiter(h_eff.keys(), dtype=np.int64, count=len(h_eff))
         h_arr = np.fromiter(h_eff.values(), dtype=np.float64, count=len(h_eff))
@@ -522,7 +576,41 @@ class OceanSampler:
         return nodes_eff, h_arr, edges_eff, j_arr, defect_info
 
     @staticmethod
-    def _anneal_params(solver: Any, anneal_time_us: Optional[int]) -> Dict[str, Any]:
+    def _restrict_warm_start(
+        warm_start: WarmStart, full_nodes, kept_nodes
+    ) -> WarmStart:
+        """Cut a start state down to the qubits that survived clamping.
+
+        SAPI wants a spin for every qubit in the submitted problem and for no
+        other, and clamping both drops qubits and reorders the rest.
+        """
+        spin_of = {int(n): int(s) for n, s in zip(full_nodes, warm_start.state)}
+        return replace(
+            warm_start,
+            state=np.fromiter(
+                (spin_of[int(n)] for n in kept_nodes),
+                dtype=np.int8,
+                count=len(kept_nodes),
+            ),
+        )
+
+    @staticmethod
+    def _initial_state(props: Dict[str, Any], nodes, warm_start: WarmStart) -> Any:
+        """The start state in the form the sampler behind ``props`` takes."""
+        num_qubits = props.get("num_qubits")
+        if num_qubits is None:
+            return {int(n): int(s) for n, s in zip(nodes, warm_start.state)}
+        state = np.full(int(num_qubits), 3, dtype=np.int8)
+        state[np.asarray(nodes, dtype=np.int64)] = warm_start.state
+        return state.tolist()
+
+    @staticmethod
+    def _anneal_params(
+        solver: Any,
+        nodes,
+        anneal_time_us: Optional[int],
+        warm_start: Optional[WarmStart],
+    ) -> Dict[str, Any]:
         """The anneal half of a submission: always a schedule, never a time.
 
         SAPI refuses ``annealing_time`` beside ``anneal_schedule``, and a
@@ -530,15 +618,34 @@ class OceanSampler:
         every job. With no override the solver's own published default is
         written out as a schedule. A sampler that publishes none (the mock)
         gets no schedule at all and keeps its own default.
+
+        SAPI takes ``initial_state`` as one entry per physical qubit, indexed
+        by label, with 3 for a qubit the problem does not use. That list is
+        built here for the cloud path. Ocean would expand a label-to-spin
+        mapping itself, but the body is serialised by orjson, which refuses
+        integer keys, so the mapping must never reach it. A dimod sampler has
+        no physical qubits and takes the mapping.
         """
         props = getattr(solver, "properties", None) or {}
+        time_range = props.get("annealing_time_range")
         anneal_us = anneal_time_us or props.get("default_annealing_time")
-        if not anneal_us:
-            return {}
+        if warm_start is None:
+            if not anneal_us:
+                return {}
+            return {
+                "anneal_schedule": forward_schedule(anneal_us, time_range=time_range)
+            }
         return {
-            "anneal_schedule": forward_schedule(
-                anneal_us, time_range=props.get("annealing_time_range")
-            )
+            "anneal_schedule": reverse_schedule(
+                anneal_us or FALLBACK_ANNEAL_US,
+                warm_start.reversal_s,
+                warm_start.reversal_pause_us,
+                time_range=time_range,
+            ),
+            "initial_state": OceanSampler._initial_state(props, nodes, warm_start),
+            # D-Wave's default, stated because the miner depends on it: every
+            # read restarts from the seed instead of from the read before it.
+            "reinitialize_state": True,
         }
 
     def _register_inflight(self, key: bytes, future: Any) -> None:
@@ -633,13 +740,14 @@ class OceanSampler:
         label: str,
         anneal_time_us: Optional[int] = None,
         cancel_key: Optional[bytes] = None,
+        warm_start: Optional[WarmStart] = None,
     ):
         """Run on a pool thread: build/submit only; do NOT touch .sampleset."""
         solver = getattr(self.sampler, "solver", None)
         params: Dict[str, Any] = {"num_reads": num_reads}
         # The proto's `anneal_time_us` and SAPI's schedule times are both
         # microseconds, so no conversion is needed.
-        params.update(self._anneal_params(solver, anneal_time_us))
+        params.update(self._anneal_params(solver, nodes, anneal_time_us, warm_start))
 
         if self._is_mock or solver is None:
             # dimod samplers and injected doubles take dicts, and the problems
@@ -726,6 +834,7 @@ class OceanSampler:
         nonce_seed: Optional[bytes] = None,
         label: str = "quip-dwave-qa",
         cancel_key: Optional[bytes] = None,
+        warm_start: Optional[WarmStart] = None,
     ) -> SampleResult:
         """Submit one Ising problem and return decoded, reconstructed samples.
 
@@ -735,6 +844,7 @@ class OceanSampler:
         ``anneal_time_us`` (microseconds) is the time a full ramp of the
         anneal takes; ``None``/``0`` means the solver's published default. It
         reaches SAPI as an ``anneal_schedule`` (see ``_anneal_params``).
+        ``warm_start`` makes the job a reverse anneal from its state.
 
         ``cancel_key`` makes the submission reachable by
         :meth:`cancel_inflight` until it finishes. A cancelled problem raises
@@ -742,9 +852,12 @@ class OceanSampler:
         wants: there is no Result to send for a generation the coordinator has
         already abandoned.
         """
+        full_nodes = nodes
         nodes, h, edges, j, defect_info = self._clamp_defects(
-            nodes, h, edges, j, nonce_seed
+            nodes, h, edges, j, nonce_seed, warm_start
         )
+        if warm_start is not None and defect_info is not None:
+            warm_start = self._restrict_warm_start(warm_start, full_nodes, nodes)
         # Counted before the hand-off rather than inside _submit_encoded, so
         # the number needs no SDK object to carry it back.
         with self._inflight_lock:
@@ -760,6 +873,7 @@ class OceanSampler:
             label,
             anneal_time_us,
             cancel_key,
+            warm_start,
         )
         # Two failure boundaries, billed differently. A failure here is the
         # submit itself dying in this process: D-Wave never saw the problem,

@@ -10,6 +10,7 @@ from quip_solver_core import miner_pb2, scoring, wire
 
 from quip_miner_dwave.job import SolverUnavailable, handle_job
 from quip_miner_dwave.ocean import OceanSampler, SampleResult
+from quip_miner_dwave.warm import WarmStart
 
 
 def test_energy_milli_matches_golden_shape():
@@ -292,6 +293,7 @@ class _RecordingSampler:
         nonce_seed: Optional[bytes] = None,
         label: str = "",
         cancel_key: Optional[bytes] = None,
+        warm_start: Optional[WarmStart] = None,
     ) -> SampleResult:
         self.calls.append({"num_reads": num_reads, "anneal_time_us": anneal_time_us})
         return SampleResult(

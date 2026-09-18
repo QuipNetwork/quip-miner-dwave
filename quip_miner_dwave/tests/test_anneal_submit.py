@@ -13,8 +13,9 @@ import json
 import numpy as np
 import pytest
 
-from quip_miner_dwave.ocean import OceanSampler
+from quip_miner_dwave.ocean import MockSampler, OceanSampler, descend_from
 from quip_miner_dwave.schedule import ScheduleError
+from quip_miner_dwave.warm import WarmStart
 
 _PARAMETERS = {
     "num_reads": None,
@@ -142,4 +143,169 @@ def test_an_anneal_the_chip_cannot_run_raises_before_anything_is_submitted():
         _submit(s, anneal_time_us=5000)
 
     assert bodies == []
+    s.close()
+
+
+def test_a_warm_start_sends_a_reverse_schedule_and_one_entry_per_physical_qubit():
+    s, bodies = _cloud_sampler()
+    warm = WarmStart(
+        state=np.array([-1, 1], dtype=np.int8), reversal_s=0.5, reversal_pause_us=25
+    )
+    _submit(s, warm_start=warm)
+
+    params = bodies[0]["params"]
+    assert params["anneal_schedule"] == [
+        [0.0, 1.0],
+        [10.0, 0.5],
+        [35.0, 0.5],
+        [45.0, 1.0],
+    ]
+    # Indexed by qubit label; 3 is SAPI's marker for "not in the problem".
+    assert params["initial_state"] == [-1, 1, 3, 3]
+    assert params["reinitialize_state"] is True
+    assert "annealing_time" not in params
+    s.close()
+
+
+def test_a_warm_start_ramps_at_the_jobs_own_anneal_time():
+    s, bodies = _cloud_sampler()
+    warm = WarmStart(
+        state=np.array([-1, 1], dtype=np.int8), reversal_s=0.9, reversal_pause_us=10
+    )
+    _submit(s, anneal_time_us=100, warm_start=warm)
+
+    assert bodies[0]["params"]["anneal_schedule"] == [
+        [0.0, 1.0],
+        [10.0, 0.9],
+        [20.0, 0.9],
+        [30.0, 1.0],
+    ]
+    s.close()
+
+
+def test_ocean_leaves_a_per_qubit_list_exactly_as_it_was_built():
+    # build_submission_body hands every parameter to Ocean's formatter. Pinned
+    # against the installed SDK: the list form passes through untouched, and
+    # Ocean's own expansion of a mapping produces the same list.
+    from dwave.cloud.solver import StructuredSolver
+
+    as_list = StructuredSolver.reformat_parameters(
+        "ising", {"initial_state": [-1, 3, 1, 3]}, {"num_qubits": 4}
+    )
+    as_mapping = StructuredSolver.reformat_parameters(
+        "ising", {"initial_state": {0: -1, 2: 1}}, {"num_qubits": 4}
+    )
+
+    assert as_list["initial_state"] == [-1, 3, 1, 3]
+    assert as_mapping["initial_state"] == as_list["initial_state"]
+
+
+# --- the offline mock ------------------------------------------------------
+
+
+def _ring(n: int):
+    """The conformance driver's proof ring: every bond satisfied by ``planted``."""
+
+    def spin(i: int) -> int:
+        return 1 if ((i * 2_654_435_761) >> 7) & 1 else -1
+
+    planted = {i: spin(i) for i in range(n)}
+    h = {i: 0.0 for i in range(n)}
+    j = {(i, (i + 1) % n): -1.0 * spin(i) * spin((i + 1) % n) for i in range(n)}
+    return h, j, planted
+
+
+def test_descent_from_a_ground_state_returns_it_unchanged():
+    h, j, planted = _ring(4096)
+    state, energy = descend_from(h, j, planted)
+
+    assert state == planted
+    assert energy == -4096.0
+
+
+def test_descent_never_raises_the_energy():
+    h, j, planted = _ring(64)
+    knocked = dict(planted)
+    for i in (3, 4, 20):
+        knocked[i] = -knocked[i]
+    start_energy = sum(c * knocked[u] * knocked[v] for (u, v), c in j.items())
+    _, energy = descend_from(h, j, knocked)
+
+    assert energy <= start_energy
+
+
+def test_the_exact_mock_answers_a_seeded_job_too_large_to_enumerate():
+    # ExactSolver walks every state, so without the seeded path this call
+    # never returns: the ring has 2**4096 of them.
+    h, j, planted = _ring(4096)
+    ss = MockSampler(backend="exact").sample_ising(
+        h, j, num_reads=3, initial_state=planted
+    )
+
+    assert float(ss.record.energy[0]) == -4096.0
+    assert int(ss.record.num_occurrences[0]) == 3
+    assert ss.info["timing"]["qpu_sampling_time"] >= 1
+
+
+def test_a_warm_start_reaches_the_mock_as_a_state_mapping():
+    s = OceanSampler(mock=True)
+    warm = WarmStart(
+        state=np.array([-1, 1], dtype=np.int8), reversal_s=0.5, reversal_pause_us=25
+    )
+    # h = [1, -1], J = 0.5: the ground state is [-1, +1] at energy -2.5.
+    result = _submit(s, warm_start=warm)
+
+    assert result.energies == [-2.5]
+    assert result.num_reads == 4
+    s.close()
+
+
+# --- a chip that has lost a qubit ------------------------------------------
+
+
+class _Recorder:
+    """Stands in for a QPU: records what it is handed, returns one read."""
+
+    def __init__(self):
+        self.calls = []
+
+    def sample_ising(self, h, j, **kwargs):
+        import dimod
+
+        self.calls.append((dict(h), dict(j), dict(kwargs)))
+        variables = sorted({v for e in j for v in e} | set(h))
+        return dimod.SampleSet.from_samples(
+            [{v: 1 for v in variables}], vartype="SPIN", energy=[0.0]
+        )
+
+
+def test_a_missing_qubit_is_clamped_to_the_start_states_own_spin():
+    rec = _Recorder()
+    s = OceanSampler(sampler=rec, mock=False)
+    s._live_nodes = [0, 1]
+    s._live_edges = [(0, 1)]
+    s.set_session_topology([0, 1, 2], [(0, 1), (1, 2)])
+    assert s._defective_qubits == [2]
+
+    warm = WarmStart(
+        state=np.array([1, -1, -1], dtype=np.int8), reversal_s=0.5, reversal_pause_us=25
+    )
+    result = s.sample(
+        np.array([0, 1, 2]),
+        np.zeros(3),
+        np.array([(0, 1), (1, 2)]),
+        np.array([1.0, 1.0]),
+        num_reads=1,
+        # A seed that would draw its own spin for qubit 2 if it were used.
+        nonce_seed=b"\x07",
+        warm_start=warm,
+    )
+
+    h_sent, _, kwargs = rec.calls[0]
+    # J(1,2) = 1 folds the clamped spin -1 into qubit 1's bias.
+    assert h_sent == {0: 0.0, 1: -1.0}
+    # SAPI wants a spin for each submitted qubit and for no other.
+    assert kwargs["initial_state"] == {0: 1, 1: -1}
+    assert result.defect_info is not None
+    assert result.defect_info.fixed_spins == {2: -1}
     s.close()
