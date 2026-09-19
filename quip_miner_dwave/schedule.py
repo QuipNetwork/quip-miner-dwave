@@ -29,9 +29,10 @@ FALLBACK_ANNEAL_US = 20.0
 DEFAULT_REVERSAL_S = 0.5
 DEFAULT_REVERSAL_PAUSE_US = 25
 
-# SAPI takes times as floats. Rounding to a nanosecond keeps sums such as
-# 0.1 * 20 from reaching the wire as 1.9999999999999996.
-_TIME_DECIMALS = 3
+# SAPI takes times as floats. Rounding to the 0.01 us time grid keeps sums
+# such as 0.1 * 20 from reaching the wire as 1.9999999999999996, and keeps
+# every schedule point on a grid SAPI actually accepts.
+_TIME_DECIMALS = 2
 
 
 class ScheduleError(ValueError):
@@ -93,11 +94,7 @@ def reverse_schedule(
         raise ScheduleError(
             f"reversal point {reversal_s!r} leaves no ramp at {anneal_us:g} us"
         )
-    if time_range is not None and total > float(time_range[1]):
-        raise ScheduleError(
-            f"a {total:g} us reverse schedule is longer than the solver's "
-            f"longest anneal of {float(time_range[1]):g} us"
-        )
+    _check_total(total, time_range)
     points: Schedule = [[0.0, 1.0], [down, float(reversal_s)]]
     if hold > down:
         points.append([hold, float(reversal_s)])

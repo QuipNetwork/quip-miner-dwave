@@ -59,8 +59,23 @@ def test_a_reversal_point_outside_the_open_unit_interval_is_refused(bad_s):
 
 
 def test_a_reverse_anneal_longer_than_the_solver_allows_is_refused():
-    with pytest.raises(ScheduleError, match="longest anneal"):
+    with pytest.raises(ScheduleError, match="annealing_time_range"):
         reverse_schedule(20, 0.5, 1990, time_range=ADVANTAGE2_RANGE)
+
+
+def test_a_reverse_anneal_shorter_than_the_solver_allows_is_refused():
+    # 20 us at reversal 0.999 with no pause totals 0.04 us, well under the
+    # chip's 0.5 us shortest anneal. A slope that passes the per-ramp check
+    # can still add up to a schedule the solver's own range refuses.
+    with pytest.raises(ScheduleError, match="annealing_time_range"):
+        reverse_schedule(20, 0.999, 0, time_range=ADVANTAGE2_RANGE)
+
+
+def test_a_reverse_anneal_below_the_time_grid_is_refused():
+    # 7 us at reversal 0.999 totals 0.014 us: below D-Wave's 0.01 us grid,
+    # and also below the solver's 0.5 us minimum.
+    with pytest.raises(ScheduleError, match="annealing_time_range"):
+        reverse_schedule(7, 0.999, 0, time_range=ADVANTAGE2_RANGE)
 
 
 def test_a_ramp_steeper_than_the_solver_allows_is_refused():

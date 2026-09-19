@@ -64,13 +64,20 @@ def clamp_fixed_variables(
     """
     defective_set = set(defective_qubits)
     fixed_spins: Dict[int, int] = {}
+    if isinstance(nonce_seed, (bytes, bytearray)):
+        nonce_seed = int.from_bytes(nonce_seed, "big")
+    rng = np.random.default_rng(nonce_seed)
     if start_state is not None:
         for qubit in defective_qubits:
-            fixed_spins[qubit] = 1 if start_state[qubit] >= 0 else -1
+            spin = start_state.get(qubit)
+            if spin is None:
+                # This defect sits outside the job's own graph, so the warm
+                # start carries no spin for it: clamp it exactly as the cold
+                # (seedless) path would.
+                fixed_spins[qubit] = int(2 * rng.integers(2) - 1)
+            else:
+                fixed_spins[qubit] = 1 if spin >= 0 else -1
     else:
-        if isinstance(nonce_seed, (bytes, bytearray)):
-            nonce_seed = int.from_bytes(nonce_seed, "big")
-        rng = np.random.default_rng(nonce_seed)
         for qubit in defective_qubits:
             fixed_spins[qubit] = int(2 * rng.integers(2) - 1)
 

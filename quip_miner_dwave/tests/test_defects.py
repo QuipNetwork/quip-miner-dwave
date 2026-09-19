@@ -1,4 +1,6 @@
 """Defect clamping unit tests."""
+import numpy as np
+
 from quip_miner_dwave.defects import (
     DefectInfo,
     clamp_fixed_variables,
@@ -71,3 +73,25 @@ def test_a_warm_start_needs_no_seed_to_clamp_a_missing_qubit():
         start_state={0: 1, 1: -1},
     )
     assert info is not None and info.fixed_spins == {1: -1}
+
+
+def test_a_defective_qubit_absent_from_the_start_state_does_not_raise():
+    # A session-wide defect outside this job's own graph (e.g. an inline
+    # EdgeList subgraph) has no spin in start_state. The reduction never
+    # reads it, so it must clamp deterministically rather than crash.
+    h_r, j_r, info = prepare_problem(
+        {0: 0.0, 1: 0.0},
+        {(0, 1): 1.0},
+        defective_qubits=[5],
+        start_state={0: 1, 1: -1},
+    )
+    assert info is not None
+    assert 5 in info.fixed_spins
+    # The fallback matches the cold (seedless) path for the same qubit.
+    rng = np.random.default_rng(0)
+    expected = int(2 * rng.integers(2) - 1)
+    assert info.fixed_spins[5] == expected
+    # Qubit 5 has no couplings in this problem, so clamping it changes
+    # nothing else; the reduced problem is passed through untouched.
+    assert h_r == {0: 0.0, 1: 0.0}
+    assert j_r == {(0, 1): 1.0}

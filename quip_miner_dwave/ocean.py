@@ -598,7 +598,7 @@ class OceanSampler:
     def _initial_state(props: Dict[str, Any], nodes, warm_start: WarmStart) -> Any:
         """The start state in the form the sampler behind ``props`` takes."""
         num_qubits = props.get("num_qubits")
-        if num_qubits is None:
+        if not num_qubits:
             return {int(n): int(s) for n, s in zip(nodes, warm_start.state)}
         state = np.full(int(num_qubits), 3, dtype=np.int8)
         state[np.asarray(nodes, dtype=np.int64)] = warm_start.state
