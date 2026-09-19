@@ -57,9 +57,13 @@ def main() -> int:
 
     if args.full:
         lite = by_sweeps[args.sweeps]
-        missing = len(attempts) - len(lite)
+        missing = set(attempts) - set(lite)
         if missing:
-            print(f"the data set lacks {missing} nonces at {args.sweeps} sweeps", file=sys.stderr)
+            example = sorted(missing)[0]
+            print(
+                f"the data set lacks {len(missing)} nonces at {args.sweeps} sweeps, "
+                f"e.g. {example}", file=sys.stderr,
+            )
             return 1
         passed = {n for n, e in lite.items() if e <= args.ceiling_milli}
         false_positive = sorted(passed - low)

@@ -33,6 +33,18 @@ def test_load_spec_keeps_the_edge_order_of_the_file(tmp_path):
     assert spec.edges.tolist() == shuffled["edges"]
 
 
+def test_load_spec_dense_edges_follow_a_shuffled_nodes_order(tmp_path):
+    # dense_edges indexes into h/j by position in `nodes`. If the shuffled
+    # order were not honoured, every kernel call built on it would score the
+    # wrong pair of variables.
+    shuffled = dict(SPEC, nodes=[31, 10, 30, 12])
+    spec = replay.load_spec(write_spec(tmp_path, shuffled))
+    assert spec.nodes.tolist() == [31, 10, 30, 12]
+    # edges are [[10, 12], [12, 30], [30, 31], [31, 10]]; position of each
+    # label in the shuffled nodes list is 31->0, 10->1, 30->2, 12->3.
+    assert spec.dense_edges.tolist() == [[1, 3], [3, 2], [2, 0], [0, 1]]
+
+
 def test_load_spec_refuses_an_edge_that_names_an_unknown_node(tmp_path):
     broken = dict(SPEC, edges=[[10, 99]])
     with pytest.raises(ValueError, match="99"):
