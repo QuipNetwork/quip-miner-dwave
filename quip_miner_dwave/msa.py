@@ -47,8 +47,14 @@ def load_kernel() -> "quip_msa.Msa":
 
 def _best_first(spins: np.ndarray, energies: np.ndarray) -> np.ndarray:
     """Rows of ``spins`` by ascending energy. Stable, so ties keep their order."""
-    order = np.argsort(np.asarray(energies), kind="stable")
-    return np.asarray(spins, dtype=np.int8)[order]
+    states = np.asarray(spins, dtype=np.int8)
+    scores = np.asarray(energies)
+    if states.ndim != 2 or scores.shape != (states.shape[0],):
+        raise ValueError(
+            f"spins must be 2-D with one energy each; got spins.shape="
+            f"{states.shape}, energies.shape={scores.shape}"
+        )
+    return states[np.argsort(scores, kind="stable")]
 
 
 def pack_lanes(
@@ -73,12 +79,15 @@ def pack_lanes(
         ``(states, qpu_count)``. ``states`` is int8 of shape ``(k, nodes)``
         with ``k <= lanes``, and rows ``0..qpu_count`` came from the QPU.
     """
+    if (lite_spins is None) != (lite_energies is None):
+        raise ValueError("lite_spins and lite_energies are passed together or not at all")
+
     rows = [_best_first(qpu_spins, qpu_energies)]
     if lite_spins is not None and lite_energies is not None:
         rows.append(_best_first(lite_spins, lite_energies))
 
-    packed: list = []
-    seen: set = set()
+    packed: list[np.ndarray] = []
+    seen: set[bytes] = set()
     qpu_count = 0
     for source, block in enumerate(rows):
         for state in block:

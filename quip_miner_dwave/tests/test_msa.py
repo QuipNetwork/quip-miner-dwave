@@ -62,6 +62,39 @@ def test_a_job_with_no_msa_lite_reads_packs_the_qpu_reads_alone():
     assert qpu_count == 5 and states.shape == (5, 16)
 
 
+def test_an_energy_count_that_does_not_match_the_state_count_is_refused():
+    rng = np.random.default_rng(5)
+    qpu = _states(rng, 3)
+    with pytest.raises(ValueError, match="one energy each"):
+        pack_lanes(qpu, np.arange(2.0))
+
+
+def test_a_one_dimensional_qpu_spins_array_is_refused():
+    with pytest.raises(ValueError, match="one energy each"):
+        pack_lanes(np.array([1, -1, 1], dtype=np.int8), np.array([-1.0]))
+
+
+def test_an_empty_qpu_block_still_packs():
+    states, qpu_count = pack_lanes(np.empty((0, 16), dtype=np.int8), np.array([]))
+
+    assert qpu_count == 0
+    assert states.shape == (0, 16)
+
+
+def test_lite_spins_without_lite_energies_is_refused():
+    rng = np.random.default_rng(6)
+    qpu, lite = _states(rng, 2), _states(rng, 2)
+    with pytest.raises(ValueError, match="lite_spins and lite_energies"):
+        pack_lanes(qpu, np.array([-1.0, -2.0]), lite)
+
+
+def test_lite_energies_without_lite_spins_is_refused():
+    rng = np.random.default_rng(7)
+    qpu = _states(rng, 2)
+    with pytest.raises(ValueError, match="lite_spins and lite_energies"):
+        pack_lanes(qpu, np.array([-1.0, -2.0]), lite_energies=np.array([-1.0, -2.0]))
+
+
 def test_a_miner_without_the_binding_says_how_to_get_it(monkeypatch):
     real_import = builtins.__import__
 
