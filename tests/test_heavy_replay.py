@@ -65,6 +65,42 @@ def test_compare_with_an_empty_set_prints_n_zero_and_skips_gap(tmp_path, capsys)
     assert "skipping mean gap and KS test" in out
 
 
+def test_run_writes_no_solution_rows_so_a_resume_does_not_repeat_them(tmp_path, monkeypatch):
+    low = tmp_path / "low.nonces"
+    low.write_text("aa\n", encoding="utf-8")
+    fp = tmp_path / "fp.nonces"
+    fp.write_text("", encoding="utf-8")
+
+    def fake_run(command, **_kwargs):
+        report = command[command.index("--report") + 1]
+        pathlib.Path(report).write_text(
+            f'{{"job_id": "aa", "best_energy_milli": {heavy_replay.NO_SOLUTION}, '
+            '"reads": 128, "sweeps": 9, "wall_ms": 1}\n',
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(heavy_replay.subprocess, "run", fake_run)
+    out = tmp_path / "heavy.csv"
+    args = heavy_replay.argparse.Namespace(
+        low=str(low), false_positive=str(fp), out=str(out), cap=0, seed=1, chunk=10,
+        coordinator="c", miner="m", spec="s", reads=128, sweeps=9, device=None,
+    )
+    assert heavy_replay.run(args) == 0
+
+    with open(out, newline="", encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    assert len(rows) == 1
+    assert int(rows[0]["heavy_best_milli"]) == heavy_replay.NO_SOLUTION
+
+    run_calls = []
+    monkeypatch.setattr(
+        heavy_replay.subprocess, "run",
+        lambda command, **_kwargs: run_calls.append(command),
+    )
+    assert heavy_replay.run(args) == 0
+    assert run_calls == []
+
+
 def test_run_asks_the_driver_to_select_every_read(tmp_path, monkeypatch):
     # The driver reports the best energy of its diverse selection. Only a
     # selection of every read makes that the true minimum.

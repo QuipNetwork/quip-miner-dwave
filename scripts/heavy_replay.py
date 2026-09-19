@@ -85,7 +85,10 @@ def run(args: argparse.Namespace) -> int:
                                 continue
                             if row["best_energy_milli"] == NO_SOLUTION:
                                 skipped += 1
-                                continue
+                            # A no-solution row is still written, at the sentinel
+                            # value, so done_nonces sees it and a resume does not
+                            # re-spend GPU time reproducing it. compare's
+                            # read_energies already filters the sentinel back out.
                             writer.writerow([
                                 row["job_id"], name, row["best_energy_milli"],
                                 row["reads"], row["sweeps"], row["wall_ms"],
@@ -93,7 +96,7 @@ def run(args: argparse.Namespace) -> int:
                 out.flush()
                 print(f"{name}: {min(start + args.chunk, len(todo))} of {len(todo)}")
     if skipped:
-        print(f"skipped {skipped} no-solution rows (sentinel {NO_SOLUTION})", file=sys.stderr)
+        print(f"wrote {skipped} no-solution rows at the sentinel (sentinel {NO_SOLUTION})", file=sys.stderr)
     return 0
 
 
