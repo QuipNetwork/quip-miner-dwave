@@ -21,4 +21,6 @@ ALGORITHM = "quantum-anneal"
 # drift apart.
 MAX_NODES = 10_000
 MAX_EDGES = 100_000
-FEATURES = ("quantum-anneal", "native-topology")
+# "initial-spins" is SPEC section 3's promise that a job's start state is
+# used: this backend reverse-anneals from it (see quip_miner_dwave.warm).
+FEATURES = ("quantum-anneal", "native-topology", "initial-spins")
