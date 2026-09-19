@@ -53,6 +53,79 @@ def test_check_budget_refuses_estimate_over_the_cap():
         capture_qpu_reads.check_budget(1000, max_qpu_seconds=30.0)
 
 
+class _FakeResult:
+    def __init__(self, spins, variables, access_us):
+        self.spins = spins
+        self.variables = variables
+        self.device_access_time_us = access_us
+
+
+class _FakeSampler:
+    """Stands in for OceanSampler: each read spends far more than the estimate."""
+
+    def __init__(self, *args, **kwargs):
+        self.closed = False
+
+    def ensure_connected(self):
+        pass
+
+    def set_session_topology(self, nodes, edges):
+        pass
+
+    def sample(self, nodes, h, edges, j, num_reads, nonce_seed, label):
+        spins = np.ones((num_reads, len(nodes)), dtype=np.int8)
+        return _FakeResult(spins, list(nodes), access_us=200_000)
+
+    def close(self):
+        self.closed = True
+
+
+def test_submit_loop_stops_at_max_qpu_seconds_and_reports_progress(tmp_path, monkeypatch, capsys):
+    heavy = tmp_path / "heavy.csv"
+    heavy.write_text(
+        "set,nonce\nlow-energy,aa\nlow-energy,bb\n", encoding="utf-8"
+    )
+    out_dir = tmp_path / "out"
+
+    class _Spec:
+        nodes = np.array([1, 2, 3])
+        edges = np.array([[1, 2], [2, 3]])
+        dense_edges = np.array([[0, 1], [1, 2]])
+
+    monkeypatch.setattr(capture_qpu_reads, "OceanSampler", _FakeSampler)
+    monkeypatch.setattr(capture_qpu_reads.replay, "load_spec", lambda _path: _Spec())
+    monkeypatch.setattr(
+        capture_qpu_reads.replay, "model_from_nonce",
+        lambda _spec, _nonce: (np.zeros(3), np.zeros(2)),
+    )
+    monkeypatch.setattr(
+        capture_qpu_reads.replay, "spec_order",
+        lambda spins, _variables, _spec: spins,
+    )
+    monkeypatch.setattr(
+        capture_qpu_reads.sys, "argv",
+        [
+            "capture_qpu_reads.py",
+            "--spec", "spec.json",
+            "--heavy", str(heavy),
+            "--out-dir", str(out_dir),
+            "--per-set", "2",
+            "--reads", "4",
+            "--yes",
+            "--max-qpu-seconds", "0.15",
+        ],
+    )
+    rc = capture_qpu_reads.main()
+    captured = capsys.readouterr()
+    assert rc == 3
+    assert "stopping" in captured.err
+    assert "1 of 2 models done" in captured.err
+    assert "0.1 s" in captured.err
+    # The one model already paid for keeps its file; the rest were never submitted.
+    written = sorted(p.name for p in out_dir.iterdir())
+    assert len(written) == 1
+
+
 def test_dry_run_never_constructs_or_connects_a_sampler(tmp_path, monkeypatch):
     heavy = tmp_path / "heavy.csv"
     heavy.write_text("set,nonce\nlow-energy,ab\n", encoding="utf-8")

@@ -141,6 +141,14 @@ def main() -> int:
             spent_us += int(result.device_access_time_us)
             if count % 50 == 0:
                 print(f"{count} of {len(nonces)}  spent {spent_us / 1e6:.1f} s")
+            if spent_us / 1e6 >= args.max_qpu_seconds:
+                print(
+                    f"stopping: {count} of {len(nonces)} models done, spent "
+                    f"{spent_us / 1e6:.1f} s, at the --max-qpu-seconds cap of "
+                    f"{args.max_qpu_seconds:.1f} s",
+                    file=sys.stderr,
+                )
+                return 3
     finally:
         close = getattr(sampler, "close", None)
         if close:
