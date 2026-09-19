@@ -101,14 +101,19 @@ def run(args: argparse.Namespace) -> int:
         h, j = replay.model_from_nonce(spec, nonce)
         hot, cold = quip_msa.default_beta_range(h, spec.dense_edges, j)
         seed = int(nonce[:15], 16)
-        fill_start = time.perf_counter()
-        lite_spins, lite_energies = kernel.sample(
-            h, spec.dense_edges, j, num_sweeps=args.lite_sweeps, num_reads=64, seed=seed
-        )
-        fill_wall_ms = (time.perf_counter() - fill_start) * 1000
-        states, qpu_count = pack_lanes(
-            reads["spins"], reads["energies_milli"], lite_spins, lite_energies
-        )
+        order = np.argsort(reads["energies_milli"], kind="stable")[: args.qpu_lanes]
+        qpu_spins = reads["spins"][order]
+        qpu_energies = reads["energies_milli"][order]
+        if args.qpu_lanes >= 64:
+            lite_spins = lite_energies = None
+            fill_wall_ms = 0.0
+        else:
+            fill_start = time.perf_counter()
+            lite_spins, lite_energies = kernel.sample(
+                h, spec.dense_edges, j, num_sweeps=args.lite_sweeps, num_reads=64, seed=seed
+            )
+            fill_wall_ms = (time.perf_counter() - fill_start) * 1000
+        states, qpu_count = pack_lanes(qpu_spins, qpu_energies, lite_spins, lite_energies)
         rows: List[list] = []
         for sweeps in args.sweeps:
             if (nonce, "cold", "", sweeps) not in done:
@@ -260,10 +265,17 @@ def main() -> int:
     parser.add_argument("--sweeps", type=int, nargs="+", default=[1024, 4096, 16384, 65536])
     parser.add_argument("--fractions", type=float, nargs="+", default=[0.25, 0.4, 0.5, 0.6, 0.75, 0.9])
     parser.add_argument("--lite-sweeps", type=int, default=512)
+    parser.add_argument(
+        "--qpu-lanes", type=int, default=32,
+        help="lanes seeded from the best QPU reads, lowest energy first; the rest are "
+        "filled with MSA-lite states (1..64)",
+    )
     parser.add_argument("--threads", type=int, default=16)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--ceiling-fraction", type=lambda s: f"{float(s):.2f}", default="0.50")
     args = parser.parse_args()
+    if not 1 <= args.qpu_lanes <= 64:
+        parser.error("--qpu-lanes must be between 1 and 64")
     return run(args) if args.mode == "run" else summarise(args)
 
 

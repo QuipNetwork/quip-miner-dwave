@@ -81,6 +81,126 @@ def test_summarise_skips_a_missing_cell_instead_of_raising(tmp_path, capsys):
     assert text.count("skipped") == 1
 
 
+class _Spec:
+    # 6 nodes gives 2**6 = 64 distinct +-1 rows, one per QPU read, so pack_lanes'
+    # de-duplication does not collapse the fixture into a single lane.
+    nodes = np.array([1, 2, 3, 4, 5, 6])
+    edges = np.array([[1, 2], [2, 3]])
+    dense_edges = np.array([[0, 1], [1, 2]])
+
+
+def _distinct_spins(count: int, width: int) -> np.ndarray:
+    bits = ((np.arange(count)[:, None] >> np.arange(width)[None, :]) & 1).astype(np.int8)
+    return np.where(bits == 0, -1, 1).astype(np.int8)
+
+
+class _FakeKernel:
+    """Records every call so a test can check which samples were run."""
+
+    def __init__(self):
+        self.calls = []
+
+    def sample(self, h, dense_edges, j, num_sweeps, num_reads, seed, initial_spins=None, start_beta=None):
+        self.calls.append(dict(num_sweeps=num_sweeps, num_reads=num_reads, initial_spins=initial_spins))
+        # Offset by seed so a lite fill call does not draw the same rows as the
+        # QPU reads fixture and get de-duplicated away by pack_lanes.
+        spins = _distinct_spins(num_reads, len(h)) * (1 if seed % 2 == 0 else -1)
+        energies = np.arange(num_reads, dtype=np.int64) * -10
+        return spins, energies
+
+
+def _patch_run_deps(monkeypatch, kernel):
+    monkeypatch.setattr(seeded_sweep.replay, "load_spec", lambda _path: _Spec())
+    monkeypatch.setattr(seeded_sweep, "load_kernel", lambda: kernel)
+    monkeypatch.setattr(
+        seeded_sweep.replay, "model_from_nonce",
+        lambda _spec, _nonce: (np.zeros(6), np.zeros(2)),
+    )
+    monkeypatch.setattr(
+        seeded_sweep.quip_msa, "default_beta_range", lambda h, edges, j: (1.0, 10.0)
+    )
+
+
+def _run_args(reads_dir, out, qpu_lanes):
+    return seeded_sweep.argparse.Namespace(
+        spec="spec.json",
+        reads_dir=str(reads_dir),
+        out=str(out),
+        sweeps=[1024],
+        fractions=[0.5],
+        lite_sweeps=8,
+        qpu_lanes=qpu_lanes,
+        threads=1,
+        limit=0,
+    )
+
+
+def test_qpu_lanes_64_skips_the_fill_run_and_records_zero_fill_wall_ms(tmp_path, monkeypatch):
+    reads_dir = tmp_path / "reads"
+    reads_dir.mkdir()
+    np.savez(
+        reads_dir / "aa.npz",
+        spins=_distinct_spins(64, 6),
+        energies_milli=np.arange(64, dtype=np.int64),
+    )
+    out = tmp_path / "seeded.csv"
+    kernel = _FakeKernel()
+    _patch_run_deps(monkeypatch, kernel)
+
+    rc = seeded_sweep.run(_run_args(reads_dir, out, qpu_lanes=64))
+    assert rc == 0
+
+    # Only the cold and seeded samples ran; no lite fill sample (num_reads=64,
+    # num_sweeps=lite_sweeps, no initial_spins) was ever taken.
+    fill_calls = [c for c in kernel.calls if c["initial_spins"] is None and c["num_sweeps"] == 8]
+    assert fill_calls == []
+
+    rows = list(csv.DictReader(open(out, newline="", encoding="utf-8")))
+    seeded_rows = [r for r in rows if r["arm"] == "seeded"]
+    assert seeded_rows
+    assert all(r["fill_wall_ms"] == "0" for r in seeded_rows)
+    assert all(r["fill_lane_best_milli"] == "" for r in seeded_rows)
+
+
+def test_qpu_lanes_below_64_seeds_best_n_and_fills_the_rest_with_lite(tmp_path, monkeypatch):
+    reads_dir = tmp_path / "reads"
+    reads_dir.mkdir()
+    np.savez(
+        reads_dir / "aa.npz",
+        spins=_distinct_spins(64, 6),
+        energies_milli=np.arange(64, dtype=np.int64),
+    )
+    out = tmp_path / "seeded.csv"
+    kernel = _FakeKernel()
+    _patch_run_deps(monkeypatch, kernel)
+
+    rc = seeded_sweep.run(_run_args(reads_dir, out, qpu_lanes=32))
+    assert rc == 0
+
+    fill_calls = [c for c in kernel.calls if c["initial_spins"] is None and c["num_sweeps"] == 8]
+    assert len(fill_calls) == 1
+
+    rows = list(csv.DictReader(open(out, newline="", encoding="utf-8")))
+    seeded_rows = [r for r in rows if r["arm"] == "seeded"]
+    assert seeded_rows
+    for r in seeded_rows:
+        assert int(r["qpu_lanes"]) <= 32
+        assert r["fill_lane_best_milli"] != ""
+
+
+def test_qpu_lanes_out_of_range_is_rejected_by_argparse(monkeypatch, tmp_path):
+    argv = [
+        "seeded_sweep.py", "run",
+        "--spec", "spec.json",
+        "--reads-dir", str(tmp_path),
+        "--out", str(tmp_path / "seeded.csv"),
+        "--qpu-lanes", "65",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(SystemExit):
+        seeded_sweep.main()
+
+
 def test_ceiling_fraction_is_normalised_like_the_stored_key(tmp_path, capsys, monkeypatch):
     out = tmp_path / "seeded.csv"
     reads_dir = tmp_path / "reads"
