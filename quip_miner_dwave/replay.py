@@ -14,7 +14,7 @@ import csv
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -74,3 +74,13 @@ def load_attempts(path: Union[str, Path]) -> Dict[str, int]:
             if nonce not in best or energy < best[nonce]:
                 best[nonce] = energy
     return best
+
+
+def spec_order(spins: np.ndarray, variables: Sequence[int], spec: TopologySpec) -> np.ndarray:
+    """Reorder read columns from the sampler's variable order into spec node order."""
+    column = {int(label): i for i, label in enumerate(variables)}
+    missing = [int(label) for label in spec.nodes if int(label) not in column]
+    if missing:
+        raise ValueError(f"the reads lack spec nodes: {missing[:5]}")
+    take = [column[int(label)] for label in spec.nodes]
+    return np.ascontiguousarray(spins[:, take], dtype=np.int8)
