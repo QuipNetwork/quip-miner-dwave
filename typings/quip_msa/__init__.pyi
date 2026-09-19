@@ -24,3 +24,16 @@ class Msa:
         initial_spins: Optional[npt.NDArray[np.int8]] = None,
         start_beta: Optional[float] = None,
     ) -> Tuple[npt.NDArray[np.int8], npt.NDArray[np.int64]]: ...
+
+def draw_ising(
+    nonce: bytes,
+    n_nodes: int,
+    n_edges: int,
+    allowed_h_milli: list[int],
+    allowed_j_milli: list[int],
+) -> Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]: ...
+def default_beta_range(
+    h: npt.NDArray[np.float64],
+    edges: npt.NDArray[np.int64],
+    j: npt.NDArray[np.float64],
+) -> Tuple[float, float]: ...
