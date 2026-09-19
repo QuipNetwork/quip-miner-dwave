@@ -69,6 +69,10 @@ def run(args: argparse.Namespace) -> int:
                         args.coordinator, "drive", "--miner", args.miner, "--source", "list",
                         "--list", list_path, "--topology", args.spec,
                         "--num-reads", str(args.reads), "--num-sweeps", str(args.sweeps),
+                        # The report's best energy is the best of the diverse
+                        # selection, which keeps min(rows, min_solutions) rows.
+                        # Asking for every read makes it the true minimum.
+                        "--min-solutions", str(args.reads),
                         "--report", report_path,
                     ]
                     if args.device is not None:
