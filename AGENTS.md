@@ -240,6 +240,34 @@ the QPU does not have makes SAPI reject the whole problem. This path still
 speaks dicts; the normal case (live graph matches) passes arrays straight
 through.
 
+## Measurement harness (QUI-1387 steps 5 to 7)
+
+Six scripts measure the hybrid pipeline against the recorded QPU attempts of a
+node. No production code path of the miner imports them. They need the
+`quip_msa` wheel from quip-miner-cpu. Keep the data outside the repository, in
+one directory such as `~/quip-data/qui-1387/`. That directory holds the
+topology spec, `attempts.csv`, and every output.
+
+Run them in this order:
+
+1. `scripts/fetch_attempts.py` reads the attempts logs of a node over ssh and
+   writes `attempts.csv`.
+2. `scripts/lite_dataset.py` rebuilds each model from its nonce and records the
+   MSA-lite energy and the rate at each sweep count.
+3. `scripts/lite_report.py` prints recall and false positives for each sweep
+   count and pass share, then writes `low-energy.nonces` and
+   `false-positive.nonces`.
+4. `scripts/heavy_replay.py` runs MSA at high sweeps on both lists through
+   `quip-coordinator drive` and quip-miner-cuda, then compares the two sets.
+5. `scripts/capture_qpu_reads.py` submits sampled models to the QPU and keeps
+   every read.
+6. `scripts/seeded_sweep.py` starts the MSA kernel from those reads at a range
+   of start betas, and compares each run with a cold run.
+
+Only `capture_qpu_reads.py` spends QPU time. It prints the estimate with
+`--dry-run`, refuses to submit without `--yes`, and stops at
+`--max-qpu-seconds`.
+
 ## Conventions
 
 - Comments explain why, especially why an obvious-looking simplification is
