@@ -23,13 +23,14 @@ import statistics
 import subprocess
 import sys
 import tempfile
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 from quip_miner_dwave.stats import ks_two_sample
 
 HEADER = ["nonce", "set", "heavy_best_milli", "reads", "sweeps", "wall_ms"]
 CHUNK = 10_000
 THRESHOLDS = (-14_500_000, -14_540_000, -14_560_000, -14_580_000, -14_600_000, -14_620_000)
+NO_SOLUTION = 9223372036854775807  # i64::MAX sentinel the driver uses for "no solution"
 
 
 def read_nonces(path: str) -> List[str]:
@@ -47,7 +48,8 @@ def done_nonces(path: str) -> set:
 def run(args: argparse.Namespace) -> int:
     sets = {"low-energy": read_nonces(args.low), "false-positive": read_nonces(args.false_positive)}
     done = done_nonces(args.out)
-    new_file = not os.path.exists(args.out)
+    new_file = not os.path.exists(args.out) or os.path.getsize(args.out) == 0
+    skipped = 0
     with open(args.out, "a", newline="", encoding="utf-8") as out:
         writer = csv.writer(out)
         if new_file:
@@ -77,24 +79,48 @@ def run(args: argparse.Namespace) -> int:
                             row = json.loads(line)
                             if row.get("aggregate"):
                                 continue
+                            if row["best_energy_milli"] == NO_SOLUTION:
+                                skipped += 1
+                                continue
                             writer.writerow([
                                 row["job_id"], name, row["best_energy_milli"],
                                 row["reads"], row["sweeps"], row["wall_ms"],
                             ])
                 out.flush()
                 print(f"{name}: {min(start + args.chunk, len(todo))} of {len(todo)}")
+    if skipped:
+        print(f"skipped {skipped} no-solution rows (sentinel {NO_SOLUTION})", file=sys.stderr)
     return 0
 
 
-def compare(args: argparse.Namespace) -> int:
+def read_energies(path: str) -> Tuple[Dict[str, List[int]], int]:
+    """Read ``heavy_best_milli`` per set, ignoring rows at the no-solution sentinel."""
     by_set: Dict[str, List[int]] = {"low-energy": [], "false-positive": []}
-    with open(args.out, newline="", encoding="utf-8") as fh:
+    ignored = 0
+    with open(path, newline="", encoding="utf-8") as fh:
         for row in csv.DictReader(fh):
-            by_set[row["set"]].append(int(row["heavy_best_milli"]))
+            energy = int(row["heavy_best_milli"])
+            if energy == NO_SOLUTION:
+                ignored += 1
+                continue
+            by_set[row["set"]].append(energy)
+    return by_set, ignored
+
+
+def compare(args: argparse.Namespace) -> int:
+    by_set, ignored = read_energies(args.out)
+    if ignored:
+        print(f"ignored {ignored} no-solution rows (sentinel {NO_SOLUTION})", file=sys.stderr)
     print(f"{'set':<15} {'n':>6} {'mean':>12} {'median':>12} " + " ".join(f"{t // 1000:>8}" for t in THRESHOLDS))
     for name, energies in by_set.items():
+        if not energies:
+            print(f"{name:<15} {0:6d}")
+            continue
         counts = " ".join(f"{sum(e <= t for e in energies):8d}" for t in THRESHOLDS)
         print(f"{name:<15} {len(energies):6d} {statistics.mean(energies):12.0f} {statistics.median(energies):12.0f} {counts}")
+    if not by_set["low-energy"] or not by_set["false-positive"]:
+        print("skipping mean gap and KS test: one or both sets are empty")
+        return 0
     d_stat, p_value = ks_two_sample(by_set["low-energy"], by_set["false-positive"])
     gap = statistics.mean(by_set["low-energy"]) - statistics.mean(by_set["false-positive"])
     print(f"mean gap (low-energy minus false-positive): {gap:+.0f} milli   KS D={d_stat:.4f} p={p_value:.2g}")

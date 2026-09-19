@@ -38,8 +38,28 @@ RATE_HEADER = ["sweeps", "threads", "models", "seconds", "models_per_s"]
 def already_done(path: str) -> Set[Tuple[str, int]]:
     if not os.path.exists(path):
         return set()
+    done: Set[Tuple[str, int]] = set()
     with open(path, newline="", encoding="utf-8") as fh:
-        return {(row["nonce"], int(row["sweeps"])) for row in csv.DictReader(fh)}
+        for row in csv.DictReader(fh):
+            try:
+                done.add((row["nonce"], int(row["sweeps"])))
+            except (TypeError, ValueError):
+                continue
+    return done
+
+
+def ensure_trailing_newline(path: str) -> None:
+    """If ``path`` exists and its last byte is not a newline, append one.
+
+    Protects a resumed run against gluing its first new row onto a partial
+    tail left by a killed prior run.
+    """
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return
+    with open(path, "rb+") as fh:
+        fh.seek(-1, os.SEEK_END)
+        if fh.read(1) != b"\n":
+            fh.write(b"\n")
 
 
 def select(attempts: Dict[str, int], sample: int, seed: int) -> List[str]:
@@ -71,11 +91,13 @@ def main() -> int:
     lock = threading.Lock()
 
     new_file = not os.path.exists(args.out)
+    ensure_trailing_newline(args.out)
     out = open(args.out, "a", newline="", encoding="utf-8")
     writer = csv.writer(out)
     if new_file:
         writer.writerow(HEADER)
     new_rates = not os.path.exists(args.rates_out)
+    ensure_trailing_newline(args.rates_out)
     rates = open(args.rates_out, "a", newline="", encoding="utf-8")
     rate_writer = csv.writer(rates)
     if new_rates:
