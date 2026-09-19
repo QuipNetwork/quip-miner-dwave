@@ -19,7 +19,7 @@ import csv
 import os
 import random
 import sys
-from typing import List
+from typing import Any, List
 
 import numpy as np
 
@@ -27,6 +27,36 @@ from quip_miner_dwave import replay
 from quip_miner_dwave.ocean import OceanSampler
 
 EST_ACCESS_US = 46_100
+
+
+def atomic_savez_compressed(path: str, **arrays: Any) -> None:
+    """Write an npz atomically: temp file in the same directory, then replace.
+
+    ``np.savez_compressed`` appends ``.npz`` to a path that lacks it, so the
+    temp name must already end in ``.npz`` to land at the right final name
+    after ``os.replace``. A kill mid-write leaves only the temp file behind,
+    which the resume check (looking for ``<nonce>.npz``) does not see.
+    """
+    tmp_path = f"{path}.{os.getpid()}.tmp.npz"
+    try:
+        with open(tmp_path, "wb") as fh:
+            np.savez_compressed(fh, **arrays)  # pyright: ignore[reportArgumentType]
+        os.replace(tmp_path, path)
+    except BaseException:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+
+
+def check_budget(model_count: int, max_qpu_seconds: float) -> None:
+    """Refuse to run if the estimated spend for the remaining models is too high."""
+    estimated_seconds = model_count * EST_ACCESS_US / 1e6
+    if estimated_seconds > max_qpu_seconds:
+        raise SystemExit(
+            f"refusing to run: {model_count} models would cost about "
+            f"{estimated_seconds:.1f} s of QPU access, over the "
+            f"--max-qpu-seconds limit of {max_qpu_seconds:.1f} s"
+        )
 
 
 def pick(heavy_csv: str, per_set: int, seed: int) -> List[str]:
@@ -59,6 +89,10 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=1387)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--yes", action="store_true", help="confirm the QPU spend")
+    parser.add_argument(
+        "--max-qpu-seconds", type=float, default=30.0,
+        help="refuse to run if the estimated spend for the remaining models exceeds this",
+    )
     args = parser.parse_args()
 
     spec = replay.load_spec(args.spec)
@@ -68,12 +102,19 @@ def main() -> int:
     print(f"{len(nonces)} models to capture, about {len(nonces) * EST_ACCESS_US / 1e6:.1f} s of QPU access")
     if args.dry_run:
         return 0
+    check_budget(len(nonces), args.max_qpu_seconds)
     if not args.yes:
         print("pass --yes to spend it")
         return 2
 
     sampler = OceanSampler(mock=False)
+    sampler.ensure_connected()
+    sampler.set_session_topology(
+        [int(n) for n in spec.nodes],
+        [(int(u), int(v)) for u, v in spec.edges],
+    )
     spent_us = 0
+    skipped = 0
     try:
         for count, nonce in enumerate(nonces, 1):
             h, j = replay.model_from_nonce(spec, nonce)
@@ -81,8 +122,17 @@ def main() -> int:
                 spec.nodes, h, spec.edges, j,
                 num_reads=args.reads, nonce_seed=bytes.fromhex(nonce), label="quip-seed-capture",
             )
-            spins = replay.spec_order(result.spins, result.variables, spec)
-            np.savez_compressed(
+            try:
+                spins = replay.spec_order(result.spins, result.variables, spec)
+            except ValueError as exc:
+                print(f"skipping nonce {nonce}: {exc}", file=sys.stderr)
+                skipped += 1
+                continue
+            # The sampler's own energies are scored against the (possibly
+            # defect-reduced) problem it actually ran; recompute here from the
+            # spins on the full spec model so the values are comparable across
+            # runs regardless of which qubits were clamped.
+            atomic_savez_compressed(
                 f"{args.out_dir}/{nonce}.npz",
                 spins=spins,
                 energies_milli=energies_milli(spins, spec.dense_edges, h, j),
@@ -95,8 +145,9 @@ def main() -> int:
         close = getattr(sampler, "close", None)
         if close:
             close()
-    print(f"captured {len(nonces)} models, QPU access spent {spent_us / 1e6:.2f} s")
-    return 0
+    captured = len(nonces) - skipped
+    print(f"captured {captured} models, skipped {skipped}, QPU access spent {spent_us / 1e6:.2f} s")
+    return 1 if skipped else 0
 
 
 if __name__ == "__main__":
