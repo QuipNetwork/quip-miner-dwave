@@ -130,6 +130,28 @@ The same config holds other `[dwave]` keys: `budget`, `budget_reset_day`,
 `usage_db`, `num_reads`, and `anneal_time_us`. This README does not document
 them yet.
 
+## Anneal schedule and warm starts
+
+The miner states every anneal as an `anneal_schedule`. It never sends
+`annealing_time`, because SAPI refuses a problem that carries both. A forward
+anneal of `T` microseconds is `[[0, 0], [T, 1]]`. `T` is `anneal_time_us`, or
+the solver's `default_annealing_time` when `anneal_time_us` is 0.
+
+A job that carries `IsingProblem.initial_spins` runs as a reverse anneal from
+its first state. The miner lists the `initial-spins` feature for that reason.
+`anneal_time_us` sets the slope of both ramps, so a ramp to the reversal point
+`s` takes `(1 - s) * anneal_time_us`. Two `[dwave]` keys set the defaults for a
+job that leaves fields 11 and 12 at 0:
+
+```toml
+reversal_s_milli = 500   # reversal point s, 1 to 999, in milli-units
+reversal_pause_us = 25   # hold at s, in microseconds
+```
+
+The built-in defaults are 500 and 25, which is D-Wave's documented example.
+`scripts/ab_anneal_schedule.py` checks on the live QPU that the schedule form
+costs and performs the same as the old form.
+
 ## History and the profile report
 
 The miner keeps three tables in the usage database, beside the budget

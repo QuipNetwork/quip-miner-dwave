@@ -137,6 +137,20 @@ and reads it through `.sampleset`. The new one builds a `Future` with
 4577 qubits and 41514 couplers and 48 reads, the old configuration costs
 38.8 ms a job. The new one costs 1.6 ms, a factor of 24.
 
+### One spelling for the anneal
+
+`OceanSampler._anneal_params` is the only place that turns `anneal_time_us`
+and a warm start into SAPI parameters, and it never emits `annealing_time`.
+SAPI refuses a problem that carries both forms, and a reverse anneal has no
+`annealing_time` form. `schedule.py` holds the rules, and `warm.py` decodes
+`IsingProblem.initial_spins`.
+
+Two traps. `initial_state` must reach `build_submission_body` as SAPI's
+per-qubit list, not as a label-to-spin mapping: orjson refuses integer keys.
+And the offline mock answers a seeded job by descent from the seed
+(`descend_from`), because the conformance driver's seeded ring has 4096 spins
+and `ExactSolver` enumerates every state.
+
 One trap sits on this path. `Future.samples` returns a matrix padded out to
 the solver's full physical qubit count, while `Future.variables` returns only
 the active labels. The reader must pick the columns by label. That
