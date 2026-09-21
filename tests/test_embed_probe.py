@@ -117,7 +117,8 @@ def test_solver_properties_keeps_the_named_properties_and_closes_the_sampler(mon
     closed = []
 
     class _Solver:
-        properties = {"chip_id": "test-chip", "j_range": [-1.0, 1.0], "qubits": [0, 1, 2]}
+        properties = {"chip_id": "test-chip", "j_range": [-1.0, 1.0], "qubits": [0, 1, 2],
+                      "per_group_coupling_range": [-13.0, 10.0]}
 
     class _Sampler:
         def __init__(self, mock: bool) -> None:
@@ -133,5 +134,6 @@ def test_solver_properties_keeps_the_named_properties_and_closes_the_sampler(mon
     monkeypatch.setattr("quip_miner_dwave.ocean.OceanSampler", _Sampler)
     properties = embed_probe.solver_properties()
     assert properties["chip_id"] == "test-chip" and properties["j_range"] == [-1.0, 1.0]
+    assert properties["per_group_coupling_range"] == [-13.0, 10.0]
     assert set(properties) == set(embed_probe.PROPERTY_NAMES)
     assert closed == [True]

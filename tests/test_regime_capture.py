@@ -94,7 +94,7 @@ def _captures(tmp_path):
 
 def _capture(path: pathlib.Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(path, access_us=np.int64(1))
+    np.savez_compressed(path, access_us=np.int64(1), spins=np.ones((8, 2), dtype=np.int8), energies=np.zeros(8))
 
 
 def test_the_estimate_matches_the_access_time_model_of_the_specification():
@@ -110,7 +110,7 @@ def test_check_budget_counts_prior_spend_and_refuses_a_run_that_would_pass_the_c
 
 def test_pending_skips_a_capture_that_has_a_file(tmp_path):
     _capture(tmp_path / "qpu-80" / "aa.npz")
-    todo = regime_capture.pending(tmp_path, ["aa", "bb"], [80, 400])
+    todo = regime_capture.pending(tmp_path, ["aa", "bb"], [80, 400], 8)
     assert todo == [("bb", 80), ("aa", 400), ("bb", 400)]
 
 
@@ -265,3 +265,41 @@ def test_a_run_counts_what_another_process_spends_meanwhile(monkeypatch, tmp_pat
     sampler = _Sampler(during_job=another_process)
     assert _run(monkeypatch, tmp_path, sampler, "--yes") == 3
     assert len(sampler.jobs) == 1
+
+
+def test_a_resume_refuses_the_short_answer_that_stopped_the_previous_run(monkeypatch, tmp_path):
+    with pytest.raises(SystemExit, match='holds 7 rows'):
+        _run(monkeypatch, tmp_path, _Sampler(rows=7), '--yes')
+    saved = _captures(tmp_path)[0].read_bytes()
+    sampler = _Sampler()
+    with pytest.raises(SystemExit, match='row count'):
+        _run(monkeypatch, tmp_path, sampler, '--yes')
+    assert sampler.jobs == []
+    assert _captures(tmp_path)[0].read_bytes() == saved
+    assert regime_io.read_spend(tmp_path / 'round') == (40_000, 0)
+
+
+def test_a_capture_refuses_a_round_locked_by_another_process(monkeypatch, tmp_path):
+    import subprocess
+
+    round_dir = tmp_path / 'round'
+    round_dir.mkdir()
+    code = (
+        'import fcntl,sys; '
+        'f=open(sys.argv[1], "a"); fcntl.flock(f, fcntl.LOCK_EX); '
+        'print("locked", flush=True); sys.stdin.readline()'
+    )
+    holder = subprocess.Popen(
+        [sys.executable, '-c', code, str(round_dir / '.capture.lock')],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+    )
+    try:
+        assert holder.stdout is not None and holder.stdout.readline().strip() == 'locked'
+        sampler = _Sampler()
+        with pytest.raises(SystemExit, match='another capture'):
+            _run(monkeypatch, tmp_path, sampler, '--yes')
+        assert sampler.jobs == []
+        assert regime_io.read_spend(round_dir) == (0, 0)
+    finally:
+        holder.communicate('\n', timeout=10)
+    assert _run(monkeypatch, tmp_path, _Sampler(), '--yes') == 0

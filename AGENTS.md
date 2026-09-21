@@ -299,7 +299,12 @@ chip lacks a qubit or a coupler of the cell. With `--mock` it runs the same
 path on an offline sampler and spends nothing.
 
 Each cell has a `manifest.json` that records what defines its data. A run
-with another topology, read count, anneal time, or sampler kind stops.
+with another topology order, embedding, read count, anneal time, or sampler
+kind stops. The ladder also checks its rungs, seed sweeps, and thread count.
+Only one capture process can hold a round at a time. A saved answer with
+the wrong read count stops both capture resume and the report. The report
+requires a complete control cell and states which solver range checks lack
+data.
 
 ## Conventions
 

@@ -116,9 +116,12 @@ def test_model_source_refuses_clique_chains_of_another_topology(tmp_path):
         regime_io.model_source("clique-portfolio", SPEC, tmp_path, 1)
 
 
-def test_cell_identity_names_the_holdings_for_the_clique_cell_only():
-    assert set(regime_io.cell_identity("native-pm1", SPEC, 9)) == {"topology_hash"}
-    assert regime_io.cell_identity("clique-portfolio", SPEC, 9)["clique_holdings"] == 9
+def test_cell_identity_names_the_holdings_for_the_clique_cell_only(tmp_path):
+    assert set(regime_io.cell_identity("native-pm1", SPEC, 9)) == {"topology_hash", "model_order_hash"}
+    regime_io.atomic_write_json(tmp_path / regime_io.CLIQUE_FILE, {
+        "topology_hash": regime_io.spec_topology_hash(SPEC), "chains": [[0, 1], [2], [3, 4]],
+    })
+    assert regime_io.cell_identity("clique-portfolio", SPEC, 9, tmp_path)["clique_holdings"] == 9
 
 
 def test_check_manifest_records_a_cell_on_first_use_and_accepts_the_same_run_again(tmp_path):
@@ -174,3 +177,28 @@ def test_read_spend_refuses_a_journal_line_that_it_does_not_know(tmp_path):
     regime_io.append_spend(tmp_path, "refund", "native-pm1", "aa", 80, 1)
     with pytest.raises(ValueError, match="refund"):
         regime_io.read_spend(tmp_path)
+
+
+def test_cell_identity_refuses_a_different_embedding_on_the_same_graph(tmp_path):
+    embeddings = tmp_path / 'embeddings'
+    embeddings.mkdir()
+    path = embeddings / regime_io.CLIQUE_FILE
+    regime_io.atomic_write_json(path, {'topology_hash': regime_io.spec_topology_hash(SPEC),
+                                      'chains': [[0, 1], [2], [3, 4]]})
+    first = regime_io.cell_identity('clique-portfolio', SPEC, 1, embeddings)
+    regime_io.check_manifest(tmp_path / 'cell', **first)
+    regime_io.atomic_write_json(path, {'topology_hash': regime_io.spec_topology_hash(SPEC),
+                                      'chains': [[0], [1], [2], [3, 4]]})
+    with pytest.raises(ValueError, match='embedding_hash'):
+        regime_io.check_manifest(tmp_path / 'cell', **regime_io.cell_identity('clique-portfolio', SPEC, 1, embeddings))
+
+
+def test_cell_identity_preserves_the_order_that_assigns_drawn_couplings(tmp_path):
+    reordered = TopologySpec(
+        nodes=SPEC.nodes, edges=SPEC.edges[::-1], dense_edges=SPEC.dense_edges[::-1],
+        allowed_h_milli=[0], allowed_j_milli=[-1000, 1000],
+    )
+    assert regime_io.spec_topology_hash(reordered) == regime_io.spec_topology_hash(SPEC)
+    regime_io.check_manifest(tmp_path, **regime_io.cell_identity('native-pm1', SPEC, 9))
+    with pytest.raises(ValueError, match='model_order_hash'):
+        regime_io.check_manifest(tmp_path, **regime_io.cell_identity('native-pm1', reordered, 9))

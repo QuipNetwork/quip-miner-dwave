@@ -146,3 +146,43 @@ def test_done_keys_reads_back_what_a_run_wrote(tmp_path):
     writer.writerow(["aa", 2048, "-2.0", "0.2", "cpu-msa", ""])
     handle.close()
     assert path.read_text().count("nonce,") == 1
+
+
+def _run_small_ladder(tmp_path, monkeypatch, *options):
+    import json
+    import sys
+
+    pytest.importorskip('quip_msa')
+    spec = tmp_path / 'spec.json'
+    spec.write_text(json.dumps({
+        'nodes': [0, 1, 2], 'edges': [[0, 1], [1, 2]],
+        'allowed_h_milli': [0], 'allowed_j_milli': [-1000, 1000],
+    }))
+    monkeypatch.setattr(sys, 'argv', [
+        'regime_ladder.py', '--cell', 'native-pm1', '--spec', str(spec),
+        '--round-dir', str(tmp_path / 'round'), '--models', '1', '--reads', '4',
+        '--rungs', '2', '8', '--seed-sweeps', '4', '--extra-rung', '16', '--threads', '1', *options,
+    ])
+    return regime_ladder.main()
+
+
+def test_the_ladder_refuses_reads_that_differ_from_the_capture(tmp_path, monkeypatch):
+    from quip_miner_dwave import regime_io
+
+    regime_io.check_manifest(tmp_path / 'round' / 'native-pm1', reads=8)
+    with pytest.raises(SystemExit, match='reads is 8'):
+        _run_small_ladder(tmp_path, monkeypatch)
+
+
+@pytest.mark.parametrize('options, field', [
+    (['--reads', '8'], 'reads'),
+    (['--seed-sweeps', '16'], 'seed_sweeps'),
+    (['--rungs', '4', '8'], 'ladder_rungs'),
+    (['--threads', '2'], 'threads'),
+])
+def test_the_ladder_refuses_resume_with_different_run_settings(tmp_path, monkeypatch, options, field):
+    assert _run_small_ladder(tmp_path, monkeypatch) == 0
+    saved = (tmp_path / 'round' / 'native-pm1' / 'ladder.csv').read_bytes()
+    with pytest.raises(SystemExit, match=field):
+        _run_small_ladder(tmp_path, monkeypatch, *options)
+    assert (tmp_path / 'round' / 'native-pm1' / 'ladder.csv').read_bytes() == saved

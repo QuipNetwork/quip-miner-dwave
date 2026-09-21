@@ -163,7 +163,11 @@ def main() -> int:
     except ValueError as exc:
         parser.error(str(exc))
     try:
-        regime_io.check_manifest(cell_dir, **regime_io.cell_identity(args.cell, spec, args.clique_holdings))
+        regime_io.check_manifest(
+            cell_dir, **regime_io.cell_identity(args.cell, spec, args.clique_holdings, args.embeddings_dir),
+            reads=args.reads, ladder_rungs=sorted(args.rungs), extra_rung=args.extra_rung,
+            seed_sweeps=args.seed_sweeps, threads=args.threads,
+        )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
 

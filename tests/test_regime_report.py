@@ -322,3 +322,49 @@ def test_the_first_lines_count_a_job_with_no_recorded_charge(round_dir, monkeypa
     text = _report(round_dir, monkeypatch)
     assert "QPU access time spent: 0.45 s." in text                  # 8 charges of 50 ms and one estimate
     assert "Jobs with no recorded charge: 1." in text
+
+
+def test_the_report_discloses_an_unavailable_per_qubit_range(round_dir, monkeypatch):
+    properties = round_dir / 'solver-properties.json'
+    properties.write_text(json.dumps({
+        'extended_j_range': [-2.0, 1.0], 'per_qubit_coupling_range': None,
+        'per_group_coupling_range': [-13.0, 10.0],
+    }))
+    text = _report(round_dir, monkeypatch, '--solver-properties', str(properties))
+    assert 'Per-qubit coupling range is unavailable' in text
+    assert 'Group sums were not recorded' in text
+    assert '| `native-pm1` | -1 | 1 | -4 | 4 | 0 | 0 of 4 | n/a |' in text
+
+
+def test_the_report_refuses_a_candidate_without_a_baseline(tmp_path, monkeypatch):
+    _write_cell(tmp_path, 'diamond-pm1', 'cpu-msa', ladder={'aa': {8: -90.0, 64: -95.0}},
+                qpu_best={'aa': -100.0}, wall_s={8: 0.1, 64: 0.8})
+    with pytest.raises(SystemExit, match='native-pm1'):
+        _report(tmp_path, monkeypatch)
+    text = _report(tmp_path, monkeypatch, '--allow-incomplete')
+    row = next(line for line in text.splitlines() if line.startswith('| `diamond-pm1` | 80 | n/a |'))
+    assert row.endswith('| incomplete |')
+
+
+def test_the_report_requires_baseline_coverage_at_every_compared_anneal(round_dir, monkeypatch):
+    cell = round_dir / 'diamond-pm1'
+    (cell / 'qpu-80').rename(cell / 'qpu-400')
+    manifest = json.loads((cell / 'manifest.json').read_text())
+    manifest['anneal_us'] = [400]
+    (cell / 'manifest.json').write_text(json.dumps(manifest))
+    with pytest.raises(SystemExit, match='native-pm1.*400'):
+        _report(round_dir, monkeypatch)
+    text = _report(round_dir, monkeypatch, '--allow-incomplete')
+    row = next(line for line in text.splitlines() if line.startswith('| `diamond-pm1` | 400 | n/a |'))
+    assert row.endswith('| incomplete |')
+
+
+@pytest.mark.parametrize('field', ['spins', 'energies'])
+def test_the_report_refuses_a_saved_answer_with_the_wrong_row_count(round_dir, monkeypatch, field):
+    path = round_dir / 'diamond-pm1' / 'qpu-80' / 'aa.npz'
+    with np.load(path) as saved:
+        arrays = dict(saved)
+    arrays[field] = arrays[field][:-1]
+    np.savez_compressed(path, **arrays)
+    with pytest.raises(SystemExit, match='row count'):
+        _report(round_dir, monkeypatch)

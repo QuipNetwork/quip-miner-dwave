@@ -62,6 +62,8 @@ def load_cell(cell_dir: Path) -> dict:
                     "removed": int(capture["removed_couplers"]),
                     "broken": float(capture["broken_chain_share"]),
                     "spins": int(capture["spins"].shape[1]),
+                    "spin_rows": len(capture["spins"]),
+                    "energy_rows": len(capture["energies"]),
                     "held": (capture["spins"] > 0).sum(axis=1),
                     "extremes": {name: float(capture[name]) for name in EXTREMES},
                 }
@@ -86,6 +88,13 @@ def missing(cell: dict, rungs: List[int]) -> List[str]:
         lacking = sum(nonce not in cell["qpu"].get(anneal, {}) for nonce in nonces)
         if lacking:
             gaps.append(f"{lacking} of {len(nonces)} captures at {anneal} µs")
+        invalid = sum(
+            capture["spin_rows"] != cell["manifest"].get("reads")
+            or capture["energy_rows"] != cell["manifest"].get("reads")
+            for nonce, capture in cell["qpu"].get(anneal, {}).items() if nonce in nonces
+        )
+        if invalid:
+            gaps.append(f"{invalid} captures at {anneal} µs have a wrong row count")
     for sweeps in sorted(rungs):
         lacking = sum(sweeps not in cell["ladder"].get(nonce, {}) for nonce in nonces)
         if lacking:
@@ -269,7 +278,7 @@ def scale_table(cells: Dict[str, dict]) -> List[str]:
         "## Energy scale", "",
         "The cells do not share one energy scale, and the round has no control at a matched scale. "
         "A result holds for the energy scale and for the analog precision of its cell. "
-        "With `--solver-properties`, the Solver ranges table shows the cells that the solver API scales down.",
+        "With `--solver-properties`, the Solver ranges table checks the available limits and states any missing checks.",
         "Each value is the median over the models, as a share of the largest coupling size of the model. "
         "A coupling far under the largest one is close to the analog precision of the chip, "
         "and this report cannot measure that precision.", "",
@@ -368,30 +377,47 @@ def resolution_table(cells: Dict[str, dict], match: Match, rungs: List[int]) -> 
 
 
 def ranges_table(cells: Dict[str, dict], properties: dict) -> List[str]:
-    """Which cells the solver API rescales: the coupling extremes against the ranges of the solver."""
+    """Coupling extremes against available solver ranges, without inferring missing group sums."""
     j_low, j_high = properties["extended_j_range"]
-    sum_low, sum_high = properties["per_qubit_coupling_range"]
+    sum_range = properties.get("per_qubit_coupling_range")
+    if sum_range is None:
+        range_note = (
+            f"`extended_j_range` is {j_low} to {j_high}. Per-qubit coupling range is unavailable. "
+            f"`per_group_coupling_range` is {properties.get('per_group_coupling_range', 'unavailable')}. "
+            "Group sums were not recorded, so this table cannot determine which models the solver rescales."
+        )
+    else:
+        sum_low, sum_high = sum_range
+        range_note = (
+            f"`extended_j_range` is {j_low} to {j_high}. `per_qubit_coupling_range` is {sum_low} to {sum_high}. "
+            "The solver API scales a model down when a value is outside a range. "
+            "It scales a model up when the largest coefficient is less than 1."
+        )
     lines = [
         "## Solver ranges", "",
-        f"`extended_j_range` is {j_low} to {j_high}. `per_qubit_coupling_range` is {sum_low} to {sum_high}. "
-        "The solver API scales a model down when a value is outside a range. "
-        "It scales a model up when the largest coefficient is less than 1.", "",
+        range_note, "",
         "| Cell | Lowest J | Highest J | Lowest coupling sum | Highest coupling sum | Largest field "
-        "| Models outside a range |",
-        "| -- | -- | -- | -- | -- | -- | -- |",
+        + ("| Models outside J range | Coupling-sum check |" if sum_range is None
+           else "| Models outside a range |"),
+        "| -- | -- | -- | -- | -- | -- | -- |" + (" -- |" if sum_range is None else ""),
     ]
     for name, cell in cells.items():
         rows = [c["extremes"] for caps in cell["qpu"].values() for c in caps.values()]
         if not rows:
             continue
-        outside = sum(
-            r["j_min"] < j_low or r["j_max"] > j_high or r["sum_min"] < sum_low or r["sum_max"] > sum_high
-            for r in rows
-        )
+        outside_j = sum(r["j_min"] < j_low or r["j_max"] > j_high for r in rows)
+        outside_text = f"{outside_j} of {len(rows)} | n/a"
+        if sum_range is not None:
+            outside = sum(
+                r["j_min"] < j_low or r["j_max"] > j_high
+                or r["sum_min"] < sum_range[0] or r["sum_max"] > sum_range[1]
+                for r in rows
+            )
+            outside_text = f"{outside} of {len(rows)}"
         lines.append(
             f"| `{name}` | {fmt(min(r['j_min'] for r in rows))} | {fmt(max(r['j_max'] for r in rows))} | "
             f"{fmt(min(r['sum_min'] for r in rows))} | {fmt(max(r['sum_max'] for r in rows))} | "
-            f"{fmt(max(r['h_abs_max'] for r in rows))} | {outside} of {len(rows)} |"
+            f"{fmt(max(r['h_abs_max'] for r in rows))} | {outside_text} |"
         )
     return lines
 
@@ -431,7 +457,14 @@ def main() -> int:
     if len({cell["manifest"].get("topology_hash") for cell in cells.values()}) > 1:
         raise SystemExit("the cells of the round come from different topologies")
     gaps = {name: missing(cell, args.rungs) for name, cell in cells.items()}
-    incomplete = [name for name in cells if gaps[name]]
+    if BASELINE not in cells:
+        gaps[BASELINE] = ["every baseline capture and run"]
+    else:
+        baseline = cells[BASELINE]
+        compared = {anneal for cell in cells.values() for anneal in cell["manifest"].get("anneal_us", [])}
+        for anneal in sorted(compared - set(baseline["manifest"].get("anneal_us", []))):
+            gaps[BASELINE].append(f"baseline coverage at {anneal} µs")
+    incomplete = [name for name in gaps if gaps[name]]
     if incomplete and not args.allow_incomplete:
         raise SystemExit(
             "the round is not complete:\n"

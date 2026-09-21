@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -142,9 +143,21 @@ def cell_nonces(cell_dir: PathLike, count: int, rng_seed: int) -> List[str]:
     return nonces
 
 
-def cell_identity(name: str, spec: TopologySpec, clique_holdings: int) -> Dict[str, Any]:
-    """What defines the models of a cell, for its manifest. Only the clique cell has holdings."""
-    identity: Dict[str, Any] = {"topology_hash": spec_topology_hash(spec)}
+def cell_identity(
+    name: str, spec: TopologySpec, clique_holdings: int, embeddings_dir: Optional[PathLike] = None
+) -> Dict[str, Any]:
+    """Record the ordered draw inputs and the embedding, as well as the working graph."""
+    ordered = json.dumps({"nodes": spec.nodes.tolist(), "edges": spec.dense_edges.tolist()}, sort_keys=True)
+    identity: Dict[str, Any] = {
+        "topology_hash": spec_topology_hash(spec),
+        "model_order_hash": hashlib.sha256(ordered.encode()).hexdigest(),
+    }
+    if name not in ("native-pm1", "native-125"):
+        if embeddings_dir is None:
+            raise ValueError(f"{name} needs --embeddings-dir")
+        filename = CLIQUE_FILE if name == "clique-portfolio" else LATTICE_FILES[name]
+        payload = _load_embedding(Path(embeddings_dir) / filename, identity["topology_hash"])
+        identity["embedding_hash"] = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
     if name == "clique-portfolio":
         identity["clique_holdings"] = clique_holdings
     return identity

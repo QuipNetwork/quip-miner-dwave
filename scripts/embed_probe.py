@@ -30,6 +30,7 @@ PROPERTY_NAMES = (
     "extended_j_range",
     "h_range",
     "per_qubit_coupling_range",
+    "per_group_coupling_range",
     "annealing_time_range",
     "default_annealing_time",
 )

@@ -25,6 +25,7 @@ that the production clamping may handle it.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import math
 import sys
 from pathlib import Path
@@ -76,13 +77,18 @@ def check_budget(already_us: int, planned_us: int, max_qpu_seconds: float) -> No
         )
 
 
-def pending(cell_dir: Path, nonces: List[str], anneal_times: List[int]) -> List[Tuple[str, int]]:
-    return [
-        (nonce, anneal)
-        for anneal in anneal_times
-        for nonce in nonces
-        if not (cell_dir / f"qpu-{anneal}" / f"{nonce}.npz").exists()
-    ]
+def pending(cell_dir: Path, nonces: List[str], anneal_times: List[int], reads: int) -> List[Tuple[str, int]]:
+    todo = []
+    for anneal in anneal_times:
+        for nonce in nonces:
+            path = cell_dir / f"qpu-{anneal}" / f"{nonce}.npz"
+            if not path.exists():
+                todo.append((nonce, anneal))
+                continue
+            with np.load(path) as capture:
+                if len(capture["spins"]) != reads or len(capture["energies"]) != reads:
+                    raise SystemExit(f"{path} has a wrong row count; resolve the saved answer before resuming")
+    return todo
 
 
 def drift(
@@ -116,6 +122,19 @@ def main() -> int:
     if not math.isfinite(args.max_qpu_seconds) or args.max_qpu_seconds <= 0:
         parser.error("--max-qpu-seconds must be a finite positive number")
 
+    round_dir = Path(args.round_dir)
+    round_dir.mkdir(parents=True, exist_ok=True)
+    # One capture owns the round through reservation and charging. Re-reading
+    # the journal alone cannot prevent two processes spending the same allowance.
+    with open(round_dir / ".capture.lock", "a", encoding="utf-8") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise SystemExit("another capture owns this round; wait for it to finish") from exc
+        return run_capture(args, parser)
+
+
+def run_capture(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     spec = replay.load_spec(args.spec)
     round_dir = Path(args.round_dir)
     cell_dir = round_dir / args.cell
@@ -125,13 +144,13 @@ def main() -> int:
         _, model_of = regime_io.model_source(args.cell, spec, args.embeddings_dir, args.clique_holdings)
     except ValueError as exc:
         parser.error(str(exc))
-    identity = regime_io.cell_identity(args.cell, spec, args.clique_holdings)
+    identity = regime_io.cell_identity(args.cell, spec, args.clique_holdings, args.embeddings_dir)
     try:
         regime_io.check_manifest(cell_dir, **identity, reads=args.reads, anneal_us=args.anneal_us, mock=args.mock)
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
 
-    todo = pending(cell_dir, nonces, args.anneal_us)
+    todo = pending(cell_dir, nonces, args.anneal_us, args.reads)
     planned = sum(estimate_us(args.reads, anneal) for _, anneal in todo)
     already, open_jobs = regime_io.read_spend(round_dir)
     print(
