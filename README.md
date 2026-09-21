@@ -180,6 +180,39 @@ Only `capture_qpu_reads.py` spends QPU time. It prints the estimate with
 `--dry-run`, refuses to submit without `--yes`, and stops at
 `--max-qpu-seconds`.
 
+## Regime search (round 1)
+
+Four scripts compare the QPU with the classical kernels on five problem
+regimes. The scripts call a regime a cell: `native-pm1`, `native-125`,
+`diamond-pm1`, `cubic-dimer-pm1`, and `clique-portfolio`. No production code
+path of the miner imports them. They need the `quip_msa` wheel from
+quip-miner-cpu. Keep the data outside the repository, under
+`~/quip-data/regimes/`.
+
+Run them in this order:
+
+1. `scripts/embed_probe.py` places the two lattices on the working graph and
+   finds the largest clique embedding that the graph holds. That clique sets
+   the asset count of `clique-portfolio`. The script spends no QPU time. With
+   `--solver-properties` it also reads the coupling ranges of the solver.
+2. `scripts/regime_capture.py` submits the models of one cell to the QPU and
+   keeps every read. Run one cell for each process.
+3. `scripts/regime_ladder.py` runs the classical kernel on the same models at
+   each rung of a sweep ladder. After a capture it also runs the extra rung
+   for each unmatched model, and the seed arm.
+4. `scripts/regime_report.py` writes one table for each metric. It stops
+   when a cell lacks a capture or a run of the ladder.
+
+Only `regime_capture.py` spends QPU time. It prints the estimate with
+`--dry-run` and refuses to submit without `--yes`. It keeps a spend journal
+for the round in `spend.jsonl`, and it counts the spend of every cell against
+`--max-qpu-seconds` before each job. It stops before any spend when the live
+chip lacks a qubit or a coupler of the cell. With `--mock` it runs the same
+path on an offline sampler and spends nothing.
+
+Each cell has a `manifest.json` that records what defines its data. A run
+with another topology, read count, anneal time, or sampler kind stops.
+
 ## History and the profile report
 
 The miner keeps three tables in the usage database, beside the budget
