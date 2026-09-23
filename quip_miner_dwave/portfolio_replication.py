@@ -192,12 +192,22 @@ def _pair_value(j_dict: Dict[Tuple[int, int], Any], u: int, v: int) -> float:
 
 
 def _git_facts(repo: Path) -> Tuple[str, bool]:
-    """HEAD and dirty state of ``repo``. Raises if either git call fails; never returns None."""
+    """HEAD and dirty state of ``repo``. Raises if either git call fails; never returns None.
+
+    "Dirty" means a TRACKED file differs from ``HEAD`` (staged or unstaged) --
+    ``--untracked-files=no``, so a stray scratch file sitting in the working
+    tree does not trip this. Untracked files are never part of any commit, so
+    they cannot make ``d_head`` misidentify the code that wrote a bundle,
+    which is the only thing this check protects.
+    """
     head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
     if head.returncode != 0:
         raise RuntimeError(f"could not determine {repo}'s HEAD commit: {head.stderr.strip()}")
     status = subprocess.run(
-        ["git", "status", "--porcelain"], cwd=repo, capture_output=True, text=True
+        ["git", "status", "--porcelain", "--untracked-files=no"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
     )
     if status.returncode != 0:
         raise RuntimeError(f"could not determine {repo}'s dirty state: {status.stderr.strip()}")
