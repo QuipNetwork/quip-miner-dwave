@@ -727,6 +727,30 @@ def test_an_open_reservation_from_a_killed_run_is_never_retried_automatically(tm
     assert sampler.calls == []
 
 
+def test_a_charge_with_no_matching_output_is_never_retried_automatically(tmp_path, monkeypatch):
+    # Fix round 3: a kill (or lost power) between the normal success charge
+    # and atomic_savez finishing leaves the journal with a matched
+    # submit+charge (not open, per I1a) and no output file and no failed
+    # record. Unlike an open reservation, D-Wave already ran this and it was
+    # already paid for; the next run must refuse it rather than pay again.
+    manifest_path, manifest_hash = _manifest_and_hash(tmp_path)
+    approval_path = _approve(tmp_path, manifest_path, manifest_hash)
+    round_dir = tmp_path / "round"
+    round_dir.mkdir()
+    manifest = json.loads(manifest_path.read_text())
+    job = manifest["jobs"][0]
+    regime_io.append_spend(
+        round_dir, regime_io.SUBMIT, job["cell"], job["capture_key"], job["anneal_us"], int(job["reservation_us"]),
+    )
+    regime_io.append_spend(round_dir, regime_io.CHARGE, job["cell"], job["capture_key"], job["anneal_us"], 40_000)
+
+    sampler = _Sampler()
+    monkeypatch.setattr(round2_capture, "connect", lambda mock: sampler)
+    with pytest.raises(SystemExit, match="no output file"):
+        _run(_capture_argv(tmp_path, manifest_path, approval_path, round_dir, "--yes"))
+    assert sampler.calls == []
+
+
 def test_an_unknown_charge_is_charged_at_the_reservation_and_marks_the_key_failed(tmp_path, monkeypatch):
     # I2: answer._access_time_us returns 0 when SAPI's timing is missing. A
     # 0 charge on a real run would close the reservation and undercount the

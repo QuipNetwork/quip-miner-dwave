@@ -417,18 +417,26 @@ def drift(
     return lost_qubits, lost_couplers
 
 
-def open_capture_keys(round_dir: Path) -> set:
-    """Capture keys with a ``submit`` line and no matching ``charge`` -- an uncertain outcome.
+def journal_capture_status(round_dir: Path) -> Tuple[set, set]:
+    """``(open_keys, charged_keys)`` from one pass over the spend journal.
 
-    A process killed by SIGKILL, OOM, or power loss between the reservation
-    and the charge leaves exactly this: the journal counts it at its
-    estimate (``regime_io.read_spend``'s open-job count), but nothing there
-    is keyed by capture key. This is (I1a).
+    ``open_keys`` have a ``submit`` line and no matching ``charge`` -- an
+    uncertain outcome: a process killed by SIGKILL, OOM, or power loss
+    between the reservation and the charge leaves exactly this (I1a).
+
+    ``charged_keys`` have at least one ``charge`` line, real or the
+    unknown-charge branch's reservation-amount substitute. A key can be
+    charged and still have no saved reads: a kill between the charge and
+    ``atomic_savez`` finishing leaves the journal looking settled with
+    nothing to show for it, on the normal (non-mock) success path this
+    runner otherwise has no special-cased guard for. The caller cross-checks
+    this against each job's output file.
     """
     path = round_dir / regime_io.SPEND_JOURNAL
     if not path.exists():
-        return set()
+        return set(), set()
     open_count: Dict[str, int] = {}
+    charged: set = set()
     for line in path.read_text(encoding="utf-8").splitlines():
         entry = json.loads(line)
         # This runner always journals under the capture key, not the nonce.
@@ -437,7 +445,9 @@ def open_capture_keys(round_dir: Path) -> set:
             open_count[key] = open_count.get(key, 0) + 1
         elif entry["event"] == regime_io.CHARGE:
             open_count[key] = open_count.get(key, 0) - 1
-    return {key for key, count in open_count.items() if count > 0}
+            charged.add(key)
+    open_keys = {key for key, count in open_count.items() if count > 0}
+    return open_keys, charged
 
 
 def load_failed(round_dir: Path) -> Dict[str, Any]:
@@ -630,9 +640,10 @@ def run_capture(args: argparse.Namespace) -> int:
 
     by_key = {job["capture_key"]: job for job in manifest["jobs"]}
     failed = load_failed(round_dir)
-    # Computed once: within this run, a key only gains an open submit line
-    # when this loop reserves it, and it is checked before that happens.
-    open_keys = open_capture_keys(round_dir)
+    # Computed once: within this run, a key only gains a journal line when
+    # this loop reserves or charges it, and both are checked before that
+    # happens. Empty for a mock round, since a mock run journals nothing.
+    open_keys, charged_keys = journal_capture_status(round_dir)
 
     sampler = connect(args.mock)
     run_us = 0
@@ -665,6 +676,21 @@ def run_capture(args: argparse.Namespace) -> int:
             out_path = _output_path(round_dir, job)
             if out_path.exists() and _output_matches(out_path, capture_key):
                 continue
+            if capture_key in charged_keys:
+                # The journal shows this key paid for, but no output file
+                # matches it: a run charged it and then a kill, a crash, or
+                # lost power struck before atomic_savez finished. Unlike an
+                # open reservation, D-Wave already ran this and was already
+                # paid; the reads are lost, not merely uncertain, so this
+                # refuses rather than spending on it a second time.
+                raise SystemExit(
+                    f"{job['cell']}/{job['nonce']}: capture key {capture_key} has a charge in "
+                    f"{round_dir / regime_io.SPEND_JOURNAL} with no output file to show for it, from a run "
+                    "that did not finish saving its reads (killed, crashed, or lost power after the charge). "
+                    "This runner never retries an uncertain submission automatically. The QPU already ran and "
+                    "was already paid for; recover the reads by hand if possible, or accept the loss and "
+                    f"record capture key {capture_key} as failed before running again"
+                )
             data = loaded[capture_key]
             if not args.mock:
                 spent, _ = regime_io.read_spend(round_dir)
@@ -703,13 +729,14 @@ def run_capture(args: argparse.Namespace) -> int:
                     # record_failed goes first, before the closing charge
                     # line: both facts (this needs a substitute charge, and
                     # this key must never be retried) are already known here,
-                    # and the charge write is what makes open_capture_keys
+                    # and the charge write is what makes journal_capture_status
                     # (I1a) stop treating the key as open. Writing the charge
                     # first would leave a window where a kill, lost power, or
                     # record_failed's own write failing between the two left
                     # the key looking closed (a matched submit+charge) but
-                    # not failed, and neither guard would then refuse a
-                    # resubmit.
+                    # not failed -- the failed-capture check would then miss
+                    # it, though the charged-but-no-output check below would
+                    # still catch it, just without this reason attached.
                     record_failed(round_dir, capture_key, "unknown charge: the solver reported no access time")
                     regime_io.append_spend(
                         round_dir, regime_io.CHARGE, job["cell"], capture_key, job["anneal_us"],
