@@ -193,7 +193,14 @@ def run_audit(args: argparse.Namespace) -> int:
     graph = physical_range.build_zephyr_graph(nodes, edges, m=ZEPHYR_M, t=ZEPHYR_T)
     properties = json.loads(args.properties.read_text(encoding="utf-8"))
 
+    # Keep index rows for cells this run does not touch, so a --cells subset
+    # run never drops the other cells' entries from the summary index.
+    index_path = args.output_root / "index.json"
     rows: List[Dict[str, Any]] = []
+    if index_path.exists():
+        previous = json.loads(index_path.read_text(encoding="utf-8"))
+        rows = [row for row in previous["rows"] if row["cell"] not in args.cells]
+
     for cell in args.cells:
         cell_dir = args.bundles_root / cell
         if not cell_dir.is_dir():
@@ -218,6 +225,7 @@ def run_audit(args: argparse.Namespace) -> int:
             rows.append(_summarize(cell, nonce, manifest["hash"], chain_strength, chain_strength_ratio, result))
         print(f"{cell}: audited {len(nonces)} models")
 
+    rows.sort(key=lambda row: (row["cell"], row["nonce"]))
     run_manifest = {
         "d_head": d_head,
         "d_dirty": dirty,
