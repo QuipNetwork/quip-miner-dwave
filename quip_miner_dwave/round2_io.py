@@ -23,7 +23,7 @@ import numpy as np
 
 from quip_miner_dwave.regime_io import PathLike, atomic_savez, atomic_write_json
 
-ARRAY_NAMES = ("h", "edges", "j")
+ARRAY_NAMES = ("h", "edges", "j", "offset")
 
 
 def array_hash(array: np.ndarray) -> str:
@@ -86,12 +86,14 @@ def write_bundle(path: PathLike, manifest: Dict[str, Any], arrays: Dict[str, np.
     j = np.asarray(arrays["j"], dtype=np.float64)
     offset = float(manifest.get("offset", 0.0))
     _validate_bundle_arrays(h, edges, j, offset)
+    offset_array = np.asarray(offset, dtype=np.float64)
+    numeric = dict(zip(ARRAY_NAMES, (h, edges, j, offset_array)))
 
     canonical = dict(_canonical(manifest))
     canonical["offset"] = offset
     canonical["arrays"] = {
         name: {"dtype": arr.dtype.str, "shape": list(arr.shape), "hash": array_hash(arr)}
-        for name, arr in zip(ARRAY_NAMES, (h, edges, j))
+        for name, arr in numeric.items()
     }
     model_hash = run_id(canonical)
     full_manifest = {**canonical, "hash": model_hash}
@@ -107,10 +109,20 @@ def write_bundle(path: PathLike, manifest: Dict[str, Any], arrays: Dict[str, np.
                 f"refusing to replace it with {model_hash}"
             )
         if model_path.exists():
+            # The manifest claims this is already the bundle we would write. Verify the
+            # on-disk bytes actually match that claim before treating this as a no-op:
+            # a stored hash is not proof the file on disk still has the hashed content.
+            try:
+                read_bundle(bundle_dir)
+            except ValueError as exc:
+                raise ValueError(
+                    f"{bundle_dir} is recorded with hash {model_hash}, but its on-disk "
+                    f"bytes do not verify against that hash: {exc}"
+                ) from exc
             return model_hash
 
     bundle_dir.mkdir(parents=True, exist_ok=True)
-    atomic_savez(model_path, h=h, edges=edges, j=j, offset=np.asarray(offset, dtype=np.float64))
+    atomic_savez(model_path, **numeric)
     atomic_write_json(manifest_path, full_manifest)
     return model_hash
 
@@ -124,7 +136,7 @@ def read_bundle(path: PathLike) -> Tuple[Dict[str, Any], Dict[str, np.ndarray]]:
         raise ValueError(f"{bundle_dir}: manifest hash does not match its contents")
 
     with np.load(bundle_dir / "model.npz") as npz:
-        arrays = {name: np.asarray(npz[name]) for name in (*ARRAY_NAMES, "offset")}
+        arrays = {name: np.asarray(npz[name]) for name in ARRAY_NAMES}
 
     for name in ARRAY_NAMES:
         expected = manifest["arrays"][name]["hash"]

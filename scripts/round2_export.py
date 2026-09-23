@@ -22,6 +22,7 @@ import argparse
 import hashlib
 import importlib.metadata
 import json
+import platform
 import subprocess
 import sys
 import threading
@@ -44,6 +45,10 @@ MILLI_CELLS = frozenset({"native-pm1", "native-125", "diamond-pm1", "cubic-dimer
 D_REPO = Path(__file__).resolve().parents[1]
 
 
+class ExportError(RuntimeError):
+    """A model failed identity verification or rescoring; the whole export must fail."""
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
@@ -52,23 +57,25 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _git_head(repo: Path) -> Optional[str]:
-    try:
-        out = subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True
-        )
-    except (OSError, subprocess.CalledProcessError):
-        return None
-    return out.stdout.strip()
+def git_facts(repo: Path) -> Tuple[str, bool]:
+    """HEAD and dirty state of ``repo``. Raises if either git call fails; never returns None."""
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+    if head.returncode != 0:
+        raise RuntimeError(f"could not determine {repo}'s HEAD commit: {head.stderr.strip()}")
+    status = subprocess.run(["git", "status", "--porcelain"], cwd=repo, capture_output=True, text=True)
+    if status.returncode != 0:
+        raise RuntimeError(f"could not determine {repo}'s dirty state: {status.stderr.strip()}")
+    return head.stdout.strip(), bool(status.stdout.strip())
 
 
-def _package_versions() -> Dict[str, Optional[str]]:
-    versions: Dict[str, Optional[str]] = {"quip_miner_dwave": __version__}
+def package_versions() -> Dict[str, str]:
+    """Installed version of every package the export depends on. Raises if one cannot be found."""
+    versions: Dict[str, str] = {"quip_miner_dwave": __version__}
     for name in ("numpy", "quip_msa", "quip-solver-core"):
         try:
             versions[name] = importlib.metadata.version(name)
-        except importlib.metadata.PackageNotFoundError:
-            versions[name] = None
+        except importlib.metadata.PackageNotFoundError as exc:
+            raise RuntimeError(f"could not determine the installed version of {name}") from exc
     return versions
 
 
@@ -141,8 +148,10 @@ def build_manifest(
     h: np.ndarray,
     edges: np.ndarray,
     round1_dir: Path,
-    d_head: Optional[str],
-    versions: Dict[str, Optional[str]],
+    d_head: str,
+    dirty: bool,
+    versions: Dict[str, str],
+    interpreter: Dict[str, str],
 ) -> Dict[str, Any]:
     n = int(h.shape[0])
     manifest: Dict[str, Any] = {
@@ -159,8 +168,9 @@ def build_manifest(
             "milli_divisor": 1000 if cell in MILLI_CELLS else None,
         },
         "identity": identity,
-        "source_commits": {"D": d_head},
+        "source_commits": {"D": d_head, "dirty": dirty},
         "package_versions": versions,
+        "interpreter": interpreter,
         "original_data": {
             "round1_manifest_sha256": sha256_file(round1_dir / "manifest.json"),
             "round1_nonces_sha256": sha256_file(round1_dir / "nonces.json"),
@@ -179,15 +189,17 @@ def export_cell(
     spec: replay.TopologySpec,
     bundles_root: Path,
     threads: int,
-    d_head: Optional[str],
-    versions: Dict[str, Optional[str]],
+    d_head: str,
+    dirty: bool,
+    versions: Dict[str, str],
+    interpreter: Dict[str, str],
 ) -> List[Dict[str, Any]]:
     round1_dir = ROUND1 / cell
     manifest_round1 = json.loads((round1_dir / "manifest.json").read_text(encoding="utf-8"))
     identity = regime_io.cell_identity(cell, spec, HOLDINGS, EMBEDDINGS)
     for key in identity:
         if key in manifest_round1 and identity[key] != manifest_round1[key]:
-            raise SystemExit(
+            raise ExportError(
                 f"{cell}: {key} differs from Round 1: {identity[key]!r} vs {manifest_round1[key]!r}"
             )
     nonces = regime_io.cell_nonces(round1_dir, MODELS_PER_CELL, manifest_round1.get("rng_seed", 20260920))
@@ -199,18 +211,23 @@ def export_cell(
     def process_one(nonce: str) -> None:
         model = model_of(nonce)
         h, edges, j = canonical_model(cell, model)
-        manifest = build_manifest(
-            cell=cell, nonce=nonce, identity=identity, model=model, h=h, edges=edges,
-            round1_dir=round1_dir, d_head=d_head, versions=versions,
-        )
-        bundle_path = bundles_root / cell / nonce
-        model_hash = round2_io.write_bundle(bundle_path, manifest, {"h": h, "edges": edges, "j": j})
+
+        # Rescore the candidate arrays against Round 1's saved captures BEFORE
+        # freezing anything: a mismatch must never leave a written bundle
+        # directory behind for a later, corrected run to trip over.
         ok, max_abs_error = rescore_check(h, edges, j, cell, round1_dir, nonce)
         if not ok:
-            raise SystemExit(
+            raise ExportError(
                 f"{cell}/{nonce}: rescored bundle energy does not match Round 1's saved energies "
                 f"(max abs error {max_abs_error})"
             )
+
+        manifest = build_manifest(
+            cell=cell, nonce=nonce, identity=identity, model=model, h=h, edges=edges,
+            round1_dir=round1_dir, d_head=d_head, dirty=dirty, versions=versions, interpreter=interpreter,
+        )
+        bundle_path = bundles_root / cell / nonce
+        model_hash = round2_io.write_bundle(bundle_path, manifest, {"h": h, "edges": edges, "j": j})
         row = {
             "cell": cell,
             "nonce": nonce,
@@ -224,6 +241,9 @@ def export_cell(
         with lock:
             rows.append(row)
 
+    # A worker's ExportError must fail the whole run: `with` waits for every
+    # submitted nonce to finish, then list() re-raises the first exception
+    # a future recorded, instead of letting it get lost in the pool.
     with ThreadPoolExecutor(max_workers=threads) as pool:
         list(pool.map(process_one, nonces))
     return rows
@@ -234,24 +254,48 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--cells", nargs="+", default=list(regimes.CELL_NAMES), choices=regimes.CELL_NAMES)
     parser.add_argument("--bundles-root", type=Path, default=DEFAULT_BUNDLES_ROOT)
     parser.add_argument("--threads", type=int, default=8)
+    parser.add_argument(
+        "--allow-dirty", action="store_true",
+        help=(
+            "Export from a D tree with uncommitted changes. For tests only: a real export "
+            "must run from a clean, committed tree so source_commits identifies the code "
+            "that wrote the bundles."
+        ),
+    )
     args = parser.parse_args(argv)
 
-    spec = replay.load_spec(SPEC)
-    d_head = _git_head(D_REPO)
-    versions = _package_versions()
+    try:
+        d_head, dirty = git_facts(D_REPO)
+        if dirty and not args.allow_dirty:
+            print(
+                f"{D_REPO} has uncommitted changes; refusing to export from a dirty tree "
+                "(source_commits would not identify the code that wrote the bundles). "
+                "Commit or stash first, or pass --allow-dirty.",
+                file=sys.stderr,
+            )
+            return 1
+        versions = package_versions()
+        interpreter = {"path": sys.executable, "version": platform.python_version()}
 
-    # Keep index rows for cells this run does not touch, so a --cells subset
-    # run never drops the other cells' entries from the summary index.
-    index_path = args.bundles_root / "index.json"
-    all_rows: List[Dict[str, Any]] = []
-    if index_path.exists():
-        previous = json.loads(index_path.read_text(encoding="utf-8"))
-        all_rows = [row for row in previous["rows"] if row["cell"] not in args.cells]
+        spec = replay.load_spec(SPEC)
 
-    for cell in args.cells:
-        rows = export_cell(cell, spec, args.bundles_root, args.threads, d_head, versions)
-        all_rows.extend(rows)
-        print(f"{cell}: wrote {len(rows)} bundles under {args.bundles_root / cell}")
+        # Keep index rows for cells this run does not touch, so a --cells subset
+        # run never drops the other cells' entries from the summary index.
+        index_path = args.bundles_root / "index.json"
+        all_rows: List[Dict[str, Any]] = []
+        if index_path.exists():
+            previous = json.loads(index_path.read_text(encoding="utf-8"))
+            all_rows = [row for row in previous["rows"] if row["cell"] not in args.cells]
+
+        for cell in args.cells:
+            rows = export_cell(
+                cell, spec, args.bundles_root, args.threads, d_head, dirty, versions, interpreter
+            )
+            all_rows.extend(rows)
+            print(f"{cell}: wrote {len(rows)} bundles under {args.bundles_root / cell}")
+    except (RuntimeError, ExportError) as exc:
+        print(f"export failed: {exc}", file=sys.stderr)
+        return 1
 
     all_rows.sort(key=lambda row: (row["cell"], row["nonce"]))
     index = {"bundles_root": str(args.bundles_root), "models": len(all_rows), "rows": all_rows}

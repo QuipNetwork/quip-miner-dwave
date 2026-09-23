@@ -69,7 +69,7 @@ def test_round_trip_preserves_fractional_values_zero_fields_and_order(tmp_path):
         j=[0.1, -0.2, 0.3],
     )
     path = tmp_path / "bundle"
-    model_hash = round2_io.write_bundle(path, _manifest(), arrays)
+    model_hash = round2_io.write_bundle(path, _manifest(offset=2.5), arrays)
     manifest, read_arrays = round2_io.read_bundle(path)
 
     assert manifest["hash"] == model_hash
@@ -78,6 +78,7 @@ def test_round_trip_preserves_fractional_values_zero_fields_and_order(tmp_path):
     np.testing.assert_array_equal(read_arrays["j"], arrays["j"])
     assert read_arrays["h"].dtype == np.float64
     assert read_arrays["edges"].dtype == np.int64
+    assert float(read_arrays["offset"]) == 2.5
 
 
 def test_round_trip_keeps_isolated_nodes(tmp_path):
@@ -180,3 +181,32 @@ def test_read_bundle_detects_a_tampered_manifest(tmp_path):
 
     with pytest.raises(ValueError):
         round2_io.read_bundle(path)
+
+
+def test_read_bundle_detects_a_tampered_offset(tmp_path):
+    path = tmp_path / "bundle"
+    arrays = _arrays(h=[1.0, -1.0], edges=[[0, 1]], j=[0.5])
+    round2_io.write_bundle(path, _manifest(offset=0.0), arrays)
+
+    with np.load(path / "model.npz") as npz:
+        tampered = {name: npz[name] for name in npz.files}
+    tampered["offset"] = np.asarray(5.0, dtype=np.float64)
+    np.savez(path / "model.npz", **tampered)
+
+    with pytest.raises(ValueError):
+        round2_io.read_bundle(path)
+
+
+def test_write_bundle_no_op_path_verifies_the_on_disk_bytes(tmp_path):
+    """A stored hash field is not proof the file on disk still has the hashed content."""
+    path = tmp_path / "bundle"
+    arrays = _arrays(h=[1.0, -1.0], edges=[[0, 1]], j=[0.5])
+    round2_io.write_bundle(path, _manifest(), arrays)
+
+    with np.load(path / "model.npz") as npz:
+        tampered = {name: npz[name] for name in npz.files}
+    tampered["j"] = tampered["j"] + 1.0
+    np.savez(path / "model.npz", **tampered)  # manifest.json (and its "hash") is untouched
+
+    with pytest.raises(ValueError):
+        round2_io.write_bundle(path, _manifest(), arrays)
