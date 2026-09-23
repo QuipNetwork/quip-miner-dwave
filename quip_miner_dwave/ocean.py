@@ -182,6 +182,7 @@ class SupportsSample(Protocol):
         label: str = "quip-dwave-qa",
         cancel_key: Optional[bytes] = None,
         warm_start: Optional[WarmStart] = None,
+        auto_scale: Optional[bool] = None,
     ) -> SampleResult: ...
 
 
@@ -741,6 +742,7 @@ class OceanSampler:
         anneal_time_us: Optional[int] = None,
         cancel_key: Optional[bytes] = None,
         warm_start: Optional[WarmStart] = None,
+        auto_scale: Optional[bool] = None,
     ):
         """Run on a pool thread: build/submit only; do NOT touch .sampleset."""
         solver = getattr(self.sampler, "solver", None)
@@ -748,6 +750,12 @@ class OceanSampler:
         # The proto's `anneal_time_us` and SAPI's schedule times are both
         # microseconds, so no conversion is needed.
         params.update(self._anneal_params(solver, nodes, anneal_time_us, warm_start))
+        # None preserves SAPI's own default (server-side auto-scaling stays
+        # on); Round 2 always passes False once Task 6 has already scaled the
+        # physical coefficients to the solver's ranges, so SAPI must not
+        # rescale them again.
+        if auto_scale is not None:
+            params["auto_scale"] = auto_scale
 
         if self._is_mock or solver is None:
             # dimod samplers and injected doubles take dicts, and the problems
@@ -835,6 +843,7 @@ class OceanSampler:
         label: str = "quip-dwave-qa",
         cancel_key: Optional[bytes] = None,
         warm_start: Optional[WarmStart] = None,
+        auto_scale: Optional[bool] = None,
     ) -> SampleResult:
         """Submit one Ising problem and return decoded, reconstructed samples.
 
@@ -851,6 +860,11 @@ class OceanSampler:
         out of here rather than returning samples, which is what the caller
         wants: there is no Result to send for a generation the coordinator has
         already abandoned.
+
+        ``auto_scale`` leaves SAPI's own server-side scaling untouched when
+        ``None`` (the existing default). Passing ``False`` stops the server
+        from rescaling coefficients that a caller has already fit to the
+        solver's ranges (see ``quip_miner_dwave.physical_range``).
         """
         full_nodes = nodes
         nodes, h, edges, j, defect_info = self._clamp_defects(
@@ -874,6 +888,7 @@ class OceanSampler:
             anneal_time_us,
             cancel_key,
             warm_start,
+            auto_scale,
         )
         # Two failure boundaries, billed differently. A failure here is the
         # submit itself dying in this process: D-Wave never saw the problem,
