@@ -699,11 +699,22 @@ def run_capture(args: argparse.Namespace) -> int:
                     # undercount every cap check after it, so this charges
                     # the conservative reservation amount instead and marks
                     # the key failed rather than trust an unknown number.
+                    #
+                    # record_failed goes first, before the closing charge
+                    # line: both facts (this needs a substitute charge, and
+                    # this key must never be retried) are already known here,
+                    # and the charge write is what makes open_capture_keys
+                    # (I1a) stop treating the key as open. Writing the charge
+                    # first would leave a window where a kill, lost power, or
+                    # record_failed's own write failing between the two left
+                    # the key looking closed (a matched submit+charge) but
+                    # not failed, and neither guard would then refuse a
+                    # resubmit.
+                    record_failed(round_dir, capture_key, "unknown charge: the solver reported no access time")
                     regime_io.append_spend(
                         round_dir, regime_io.CHARGE, job["cell"], capture_key, job["anneal_us"],
                         int(job["reservation_us"]),
                     )
-                    record_failed(round_dir, capture_key, "unknown charge: the solver reported no access time")
                     raise SystemExit(
                         f"{job['cell']}/{job['nonce']}: the solver reported no QPU access time for capture "
                         f"key {capture_key}; charged the reservation amount ({job['reservation_us'] / 1e6:.2f} "

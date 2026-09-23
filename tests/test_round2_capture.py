@@ -750,6 +750,48 @@ def test_an_unknown_charge_is_charged_at_the_reservation_and_marks_the_key_faile
     assert list((round_dir / "native-pm1").glob("scale-*/qpu-*/*.npz")) == []
 
 
+def test_an_interruption_after_the_unknown_charge_record_still_refuses_the_key(tmp_path, monkeypatch):
+    # Re-review round 1: the unknown-charge branch wrote its closing `charge`
+    # line before record_failed, with no wrapping around either write. A
+    # kill (or a record_failed write failure) between the two left the key
+    # looking "closed" (matched submit+charge) but not failed, so the next
+    # run resubmitted and paid again -- the exact hazard I1 was built to
+    # close, reintroduced in the one branch that manufactures its own charge.
+    # record_failed must land durably before the closing charge line, so an
+    # interruption between them leaves the key refused either way (I1a's
+    # open check, or the failed-capture record itself).
+    manifest_path, manifest_hash = _manifest_and_hash(tmp_path)
+    approval_path = _approve(tmp_path, manifest_path, manifest_hash)
+    round_dir = tmp_path / "round"
+    sampler = _Sampler(access_us=0)
+    monkeypatch.setattr(round2_capture, "connect", lambda mock: sampler)
+
+    real_append_spend = round2_capture.regime_io.append_spend
+
+    def flaky_append_spend(round_dir_arg, event, cell, nonce, anneal_us, micros):
+        if event == round2_capture.regime_io.CHARGE:
+            raise OSError("interrupted between record_failed and the charge write")
+        return real_append_spend(round_dir_arg, event, cell, nonce, anneal_us, micros)
+
+    monkeypatch.setattr(round2_capture.regime_io, "append_spend", flaky_append_spend)
+    with pytest.raises(OSError, match="interrupted between"):
+        _run(_capture_argv(tmp_path, manifest_path, approval_path, round_dir, "--yes"))
+
+    # record_failed must already be durable, even though the charge write
+    # that was meant to follow it never landed.
+    failed = round2_capture.load_failed(round_dir)
+    assert len(failed) == 1 and "unknown charge" in next(iter(failed.values()))["reason"]
+
+    # A second run refuses the same key rather than resubmitting and paying
+    # for it again.
+    monkeypatch.setattr(round2_capture.regime_io, "append_spend", real_append_spend)
+    sampler2 = _Sampler()
+    monkeypatch.setattr(round2_capture, "connect", lambda mock: sampler2)
+    with pytest.raises(SystemExit, match="never retries an uncertain submission"):
+        _run(_capture_argv(tmp_path, manifest_path, approval_path, round_dir, "--yes"))
+    assert sampler2.calls == []
+
+
 def test_mismatched_physical_array_lengths_are_refused_when_building_the_manifest(tmp_path):
     _fixture(tmp_path)
     # Corrupt the range audit's scaled coefficients to disagree in length
