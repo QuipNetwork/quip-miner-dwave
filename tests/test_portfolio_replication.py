@@ -15,6 +15,7 @@ comparison.
 from __future__ import annotations
 
 import itertools
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
@@ -22,13 +23,15 @@ import pytest
 from quip_miner_dwave import portfolio_replication as pr
 from quip_miner_dwave import round2_io
 
+if TYPE_CHECKING:  # pyright needs a real class, not a pytest.importorskip() variable, for annotations
+    from qpo.problem import PortfolioProblem  # pyright: ignore[reportMissingImports]
+
 qpo = pytest.importorskip("qpo")
 dimod = pytest.importorskip("dimod")
 
 encode_select = qpo.encoders.encode_select
 resolve_frustration_beta = qpo.encoders.resolve_frustration_beta
 select_objective_scale = qpo.encoders.select_objective_scale
-PortfolioProblem = qpo.problem.PortfolioProblem
 
 ABS_TOL = 1e-12
 REL_TOL = 1e-10
@@ -61,24 +64,6 @@ def four_asset_problem(beta: float = 0.0) -> PortfolioProblem:
         cardinality_k=2,
         frustration_beta=beta,
         asset_tickers=["A", "B", "C", "D"],
-    )
-
-
-def _random_psd_problem(n: int, k: int, seed: int) -> PortfolioProblem:
-    """A larger deterministic, PSD-by-construction fixture for integration tests."""
-    rng = np.random.default_rng(seed)
-    loadings = rng.uniform(0.5, 1.5, size=n)
-    idiosyncratic = rng.uniform(0.0002, 0.0020, size=n)
-    Sigma = 0.3 * 0.0004 * np.outer(loadings, loadings) + np.diag(idiosyncratic)
-    mu = rng.normal(0.0, 0.0006, size=n)
-    return pr.make_problem(
-        mu=mu,
-        Sigma=Sigma,
-        gamma=5.0,
-        w_min=0.25 / k,
-        w_max=0.5,
-        cardinality_k=k,
-        asset_tickers=[f"A{i}" for i in range(n)],
     )
 
 
@@ -254,6 +239,12 @@ class TestPerReadDiagnostics:
         with pytest.raises(ValueError):
             pr.per_read_diagnostics(problem, np.array([-1.0, 1.0]))
 
+    def test_rejects_spin_width_mismatch(self):
+        """Same width check score_reads applies, against problem.N."""
+        problem = four_asset_problem()
+        with pytest.raises(ValueError):
+            pr.per_read_diagnostics(problem, np.array([-1.0, 1.0, -1.0]))  # 3, not 4
+
     def test_k_before_and_after_repair(self):
         problem = four_asset_problem()
         spins = np.array(
@@ -265,11 +256,26 @@ class TestPerReadDiagnostics:
         )
         diag = pr.per_read_diagnostics(problem, spins)
         records = diag["records"]
-        assert [r["raw_k"] for r in records] == [0, 3, 2]
+        assert [r["raw_cardinality"] for r in records] == [0, 3, 2]
+        assert [r["repaired_cardinality"] for r in records] == [2, 2, 2]
         assert all(len(r["repaired_support"]) == problem.cardinality_k for r in records)
         assert len(records[0]["added"]) == 2 and not records[0]["removed"]
         assert len(records[1]["removed"]) == 1 and not records[1]["added"]
         assert not records[2]["added"] and not records[2]["removed"]
+
+    def test_records_the_full_valid_weights_and_final_objective(self):
+        """weights_for_support's actual weight vector is kept, not dropped down
+        to just its objective -- it is the only place a caller can see WHERE
+        the weight went, not just how good it was."""
+        problem = four_asset_problem()
+        spins = np.array([1.0, 1.0, -1.0, -1.0])  # already exactly K=2
+        diag = pr.per_read_diagnostics(problem, spins)
+        record = diag["records"][0]
+        assert record["weights"].shape == (problem.N,)
+        assert np.isclose(record["weights"].sum(), 1.0)
+        for i in record["repaired_support"]:
+            assert record["weights"][i] > 0.0
+        assert record["objective"] == pytest.approx(problem.objective(record["weights"]))
 
     def test_support_multiplicities_count_repaired_supports(self):
         problem = four_asset_problem()
@@ -291,43 +297,38 @@ class TestPerReadDiagnostics:
         spins = np.array([1.0, 1.0, -1.0, -1.0])
         diag = pr.per_read_diagnostics(problem, spins)
         assert diag["records"][0]["post_repair_feasible"] is True
+        assert diag["records"][0]["weighting_failed"] is None  # no failure observed
+        assert diag["records"][0]["weighting_error"] is None
 
-    def test_weighting_failure_is_flagged(self, monkeypatch):
-        """Force P's documented equal-weight fallback path and confirm the
-        diagnostic's heuristic (an exact match to the fallback vector) catches
-        it. P exposes no flag for the fallback, so this monkeypatches
-        qpo.projection.weights_for_support -- the exact function
-        per_read_diagnostics imports lazily -- to return the fallback vector
-        it would have produced, rather than trying to force scipy to fail."""
+    def test_weighting_failure_is_flagged_on_a_real_raised_result(self):
+        """P's qpo.weighting.optimal_weights passes its bounds straight to
+        scipy.optimize.minimize; an inverted (w_min > w_max) bound makes scipy
+        itself raise ValueError. This is a genuine failure of P's reference
+        weighting step (verified directly against qpo.weighting.optimal_weights
+        beforehand), reached by mutating the problem after construction
+        (bypassing P's own validate(), the same way a NaN mu is used elsewhere
+        in this file) -- not a monkeypatched stub standing in for P."""
         problem = four_asset_problem()
-        support = (2, 3)
-        equal_weight_fallback = np.zeros(problem.N)
-        equal_weight_fallback[list(support)] = 1.0 / len(support)
-
-        def fake_weights_for_support(sup, prob):
-            assert sup == support
-            return equal_weight_fallback
-
-        monkeypatch.setattr(qpo.projection, "weights_for_support", fake_weights_for_support)
-
-        spins = np.array([-1.0, -1.0, 1.0, 1.0])  # already repairs to (2, 3)
+        problem.w_min, problem.w_max = 0.9, 0.1  # inverted: scipy raises on this
+        spins = np.array([1.0, 1.0, -1.0, -1.0])
         diag = pr.per_read_diagnostics(problem, spins)
-        assert diag["records"][0]["weighting_failed"] is True
+        record = diag["records"][0]
+        assert record["weighting_failed"] is True
+        assert record["weighting_error"] is not None
+        assert not record["post_repair_feasible"]
 
-    def test_single_asset_support_is_never_flagged_as_a_weighting_failure(self):
-        """K=1: the budget alone forces weight 1.0, which trivially equals the
-        'equal weight' heuristic value; that must not read as a failure."""
-        problem = pr.make_problem(
-            mu=[0.01, 0.02, 0.03],
-            Sigma=np.eye(3) * 1e-4,
-            gamma=1.0,
-            w_min=0.0,
-            w_max=1.0,
-            cardinality_k=1,
-        )
-        spins = np.array([-1.0, -1.0, 1.0])
+    def test_weighting_failure_is_flagged_on_nonfinite_output(self):
+        """A NaN mu (mutated in after construction, as elsewhere in this file)
+        makes the resulting objective nonfinite; that is also a real,
+        observed failure signal, distinct from an exception."""
+        problem = four_asset_problem()
+        problem.mu[0] = np.nan
+        spins = np.array([1.0, 1.0, -1.0, -1.0])
         diag = pr.per_read_diagnostics(problem, spins)
-        assert diag["records"][0]["weighting_failed"] is False
+        record = diag["records"][0]
+        assert record["weighting_failed"] is True
+        assert record["weighting_error"] is None  # no exception, just a NaN result
+        assert not record["post_repair_feasible"]
 
 
 # --------------------------------------------------------------------- beta handling
@@ -375,33 +376,64 @@ class TestBeta:
         )
         assert_close(problem.objective(weights), expected)
 
-    def test_manuscript_fixed_and_repository_default_ramp_fixtures_stay_separate(self, tmp_path):
-        # N=18 clears qpo.config.CARDINALITY_BETA_N_MIN (15), so the repository
-        # ramp is nonzero and distinguishable from an arbitrary manuscript value.
+    @pytest.mark.parametrize(
+        "n,k,expected_manuscript_fraction,expected_repository_fraction",
+        [
+            (4, 2, 0.0, 0.0),  # below both ramps' N_MIN=15: both are 0
+            (18, 6, 0.4 * (0.3 + 0.7 * 3 / 13), 0.3 + 0.1 * 3 / 13),  # differ mid-ramp
+            (28, 9, 0.4, 0.4),  # both reach their peak fraction at N_FULL=28
+        ],
+    )
+    def test_each_ramp_matches_its_own_formula(
+        self, n, k, expected_manuscript_fraction, expected_repository_fraction
+    ):
+        """The manuscript ramp (portfolio-paper-source.tex eq:beta-ramp) and the
+        repository ramp (qpo.encoders.resolve_frustration_beta) are DIFFERENT
+        formulas (different floor, different slope) that happen to agree only
+        at n=28. They must not be asserted to differ everywhere -- only to
+        each match their own definition."""
+        problem = pr.synthetic_one_factor_problem(n, k, seed=n)
+        assert_close(pr.manuscript_beta_fraction(n), expected_manuscript_fraction)
+
+        scale = select_objective_scale(problem)
+        repository_fraction = resolve_frustration_beta(problem) / scale if scale else 0.0
+        assert_close(repository_fraction, expected_repository_fraction)
+
+    def test_manuscript_ramp_and_repository_default_ramp_fixtures_stay_separate(self, tmp_path):
+        # N=18 sits strictly between both ramps' N_MIN and N_FULL, where the
+        # two formulas give different fractions (see the parametrized test
+        # above), so their manifests are a real, not coincidental, contrast.
         n, k = 18, 6
-        manuscript_problem = _random_psd_problem(n, k, seed=1)
-        manuscript_problem.frustration_beta = 0.25
+        manuscript_problem = pr.synthetic_one_factor_problem(n, k, seed=1)
+        manuscript_problem.frustration_beta = pr.manuscript_ramp_beta(manuscript_problem)
         manuscript_problem.invalidate_cache()
 
-        default_problem = _random_psd_problem(n, k, seed=1)
-        default_problem.frustration_beta = resolve_frustration_beta(default_problem)
+        default_problem = pr.synthetic_one_factor_problem(n, k, seed=1)
+        default_problem.frustration_beta = pr.repository_default_beta(default_problem)
         default_problem.invalidate_cache()
 
         assert default_problem.frustration_beta > 0.0
         assert manuscript_problem.frustration_beta != default_problem.frustration_beta
 
-        manuscript_path = tmp_path / "manuscript-fixed"
+        manuscript_path = tmp_path / "manuscript-ramp"
         default_path = tmp_path / "repository-default-ramp"
-        pr.write_portfolio_fixture(manuscript_path, manuscript_problem, beta_mode="manuscript-fixed")
+        # allow_dirty: this is a throwaway tmp_path fixture testing manifest
+        # structure, not the deliverable export (scripts/portfolio_replication.py
+        # requires a clean tree by default; see TestExportProvenance below).
         pr.write_portfolio_fixture(
-            default_path, default_problem, beta_mode="repository-default-ramp"
+            manuscript_path, manuscript_problem, beta_mode="manuscript-ramp", allow_dirty=True
+        )
+        pr.write_portfolio_fixture(
+            default_path, default_problem, beta_mode="repository-default-ramp", allow_dirty=True
         )
 
         manuscript_manifest, _ = round2_io.read_bundle(manuscript_path)
         default_manifest, _ = round2_io.read_bundle(default_path)
-        assert manuscript_manifest["diversification_beta"]["mode"] == "manuscript-fixed"
+        assert manuscript_manifest["diversification_beta"]["mode"] == "manuscript-ramp"
         assert default_manifest["diversification_beta"]["mode"] == "repository-default-ramp"
-        assert manuscript_manifest["diversification_beta"]["effective"] == pytest.approx(0.25)
+        assert manuscript_manifest["diversification_beta"]["effective"] == pytest.approx(
+            manuscript_problem.frustration_beta
+        )
         assert default_manifest["diversification_beta"]["effective"] == pytest.approx(
             default_problem.frustration_beta
         )
@@ -409,6 +441,16 @@ class TestBeta:
             manuscript_manifest["diversification_beta"]["effective"]
             != default_manifest["diversification_beta"]["effective"]
         )
+        for manifest in (manuscript_manifest, default_manifest):
+            beta = manifest["diversification_beta"]
+            assert set(beta) >= {"effective", "mode", "fraction", "objective_scale", "formula", "note"}
+            assert "annealing" in beta["note"] or "inverse temperature" in beta["note"]
+
+    def test_manifest_rejects_a_beta_that_does_not_match_its_declared_mode(self):
+        problem = pr.synthetic_one_factor_problem(18, 6, seed=1)
+        problem.frustration_beta = 0.999  # matches neither ramp at N=18
+        with pytest.raises(ValueError):
+            pr.portfolio_fixture_manifest(problem, beta_mode="repository-default-ramp")
 
 
 # ------------------------------------------------------------- fixture round-trip
@@ -419,17 +461,15 @@ class TestFixtureBundles:
     def test_fixture_round_trips_through_write_bundle_and_matches_direct_energy(
         self, tmp_path, n, k
     ):
-        if n == 4:
-            problem = four_asset_problem()
-            problem.frustration_beta = 0.3 * select_objective_scale(problem)
-            problem.invalidate_cache()
-        else:
-            problem = _random_psd_problem(n, k, seed=n)
-            problem.frustration_beta = resolve_frustration_beta(problem)
-            problem.invalidate_cache()
+        problem = pr.synthetic_one_factor_problem(n, k, seed=n)
+        problem.frustration_beta = pr.repository_default_beta(problem)
+        problem.invalidate_cache()
 
         path = tmp_path / f"n{n}"
-        pr.write_portfolio_fixture(path, problem, beta_mode="repository-default-ramp")
+        # allow_dirty: a throwaway tmp_path fixture, not the deliverable export.
+        pr.write_portfolio_fixture(
+            path, problem, beta_mode="repository-default-ramp", allow_dirty=True
+        )
         manifest, arrays = round2_io.read_bundle(path)
 
         assert manifest["provenance"] == "synthetic-test"
@@ -457,15 +497,14 @@ class TestFixtureBundles:
 
     @pytest.mark.parametrize("n,k", [(4, 2), (18, 6), (28, 9)])
     def test_score_reads_on_the_written_fixture(self, tmp_path, n, k):
-        if n == 4:
-            problem = four_asset_problem()
-        else:
-            problem = _random_psd_problem(n, k, seed=100 + n)
-        problem.frustration_beta = resolve_frustration_beta(problem) if n >= 15 else 0.0
+        problem = pr.synthetic_one_factor_problem(n, k, seed=100 + n)
+        problem.frustration_beta = pr.repository_default_beta(problem)
         problem.invalidate_cache()
 
         path = tmp_path / f"n{n}-score"
-        pr.write_portfolio_fixture(path, problem, beta_mode="repository-default-ramp")
+        pr.write_portfolio_fixture(
+            path, problem, beta_mode="repository-default-ramp", allow_dirty=True
+        )
         round2_io.read_bundle(path)  # exercises the hash/round-trip contract
 
         qubo = encode_select(problem)
@@ -476,3 +515,63 @@ class TestFixtureBundles:
         assert np.isfinite(result["weights"]).all()
         assert np.isfinite(result["objective"])
         assert result["weights"].shape == (n,)
+
+
+# ------------------------------------------------------------------- load_problem
+
+
+class TestLoadProblem:
+    @pytest.mark.parametrize("n,k", [(4, 2), (18, 6), (28, 9)])
+    def test_round_trips_into_a_problem_with_a_matching_objective(self, tmp_path, n, k):
+        original = pr.synthetic_one_factor_problem(n, k, seed=n)
+        original.frustration_beta = pr.repository_default_beta(original)
+        original.invalidate_cache()
+
+        path = tmp_path / f"n{n}-load"
+        pr.write_portfolio_fixture(
+            path, original, beta_mode="repository-default-ramp", allow_dirty=True
+        )
+        manifest, arrays = round2_io.read_bundle(path)
+        reloaded = pr.load_problem(manifest, arrays)
+
+        assert reloaded.N == original.N
+        assert reloaded.cardinality_k == original.cardinality_k
+        assert reloaded.frustration_beta == pytest.approx(original.frustration_beta)
+
+        rng = np.random.default_rng(n + 7)
+        for _ in range(4):
+            support = rng.choice(n, size=k, replace=False)
+            weights = np.zeros(n)
+            weights[support] = 1.0 / k
+            assert_close(reloaded.objective(weights), original.objective(weights))
+
+
+# --------------------------------------------------------------- export provenance
+
+
+class TestExportProvenance:
+    def test_records_d_head_p_head_interpreter_and_package_versions(self):
+        provenance = pr.export_provenance(allow_dirty=True)
+        assert len(provenance["d_head"]) == 40  # a git SHA
+        assert len(provenance["p_head"]) == 40
+        assert provenance["interpreter"]["executable"]
+        for name in ("numpy", "scipy", "dimod", "qpo"):
+            assert provenance["package_versions"][name]
+
+    def test_written_fixture_manifest_carries_export_provenance(self, tmp_path):
+        problem = four_asset_problem()
+        path = tmp_path / "provenance"
+        pr.write_portfolio_fixture(
+            path, problem, beta_mode="repository-default-ramp", allow_dirty=True
+        )
+        manifest, _ = round2_io.read_bundle(path)
+        assert "export_provenance" in manifest
+        assert manifest["export_provenance"]["d_dirty"] in (True, False)
+        assert len(manifest["export_provenance"]["p_head"]) == 40
+
+    def test_refuses_a_dirty_d_tree_unless_allowed(self, monkeypatch):
+        monkeypatch.setattr(pr, "_git_facts", lambda repo: ("deadbeef", True))
+        with pytest.raises(RuntimeError):
+            pr.export_provenance(allow_dirty=False)
+        # allow_dirty=True still succeeds against the same (patched) dirty state.
+        pr.export_provenance(allow_dirty=True)
