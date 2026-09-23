@@ -72,7 +72,10 @@ class _FakeSampler:
     def set_session_topology(self, nodes, edges):
         pass
 
-    def sample(self, nodes, h, edges, j, num_reads, nonce_seed, label):
+    warm_starts: list = []
+
+    def sample(self, nodes, h, edges, j, num_reads, nonce_seed, label, warm_start=None):
+        _FakeSampler.warm_starts.append(warm_start)
         spins = np.ones((num_reads, len(nodes)), dtype=np.int8)
         return _FakeResult(spins, list(nodes), access_us=200_000)
 
@@ -149,3 +152,47 @@ def test_dry_run_never_constructs_or_connects_a_sampler(tmp_path, monkeypatch):
         ],
     )
     assert capture_qpu_reads.main() == 0
+
+
+def test_seed_sweeps_reverse_anneals_from_the_best_lite_state(tmp_path, monkeypatch):
+    heavy = tmp_path / "heavy.csv"
+    heavy.write_text("set,nonce\nlow-energy,aa\n", encoding="utf-8")
+    out_dir = tmp_path / "out"
+
+    class _Spec:
+        nodes = np.array([1, 2, 3])
+        edges = np.array([[1, 2], [2, 3]])
+        dense_edges = np.array([[0, 1], [1, 2]])
+
+    class _Kernel:
+        def sample(self, h, dense_edges, j, num_sweeps, num_reads, seed):
+            assert num_sweeps == 512
+            spins = np.array([[1, 1, 1], [-1, 1, -1]], dtype=np.int8)
+            return spins, np.array([-10, -30], dtype=np.int64)
+
+    _FakeSampler.warm_starts = []
+    monkeypatch.setattr(capture_qpu_reads, "OceanSampler", _FakeSampler)
+    monkeypatch.setattr(capture_qpu_reads, "load_kernel", lambda: _Kernel())
+    monkeypatch.setattr(capture_qpu_reads.replay, "load_spec", lambda _path: _Spec())
+    monkeypatch.setattr(
+        capture_qpu_reads.replay, "model_from_nonce",
+        lambda _spec, _nonce: (np.zeros(3), np.zeros(2)),
+    )
+    monkeypatch.setattr(
+        capture_qpu_reads.replay, "spec_order", lambda spins, _variables, _spec: spins
+    )
+    monkeypatch.setattr(
+        capture_qpu_reads.sys, "argv",
+        [
+            "capture_qpu_reads.py", "--spec", "spec.json", "--heavy", str(heavy),
+            "--out-dir", str(out_dir), "--reads", "4", "--yes",
+            "--seed-sweeps", "512", "--reversal-s", "0.7",
+        ],
+    )
+    assert capture_qpu_reads.main() == 0
+    (warm_start,) = _FakeSampler.warm_starts
+    assert warm_start.state.tolist() == [-1, 1, -1]
+    assert warm_start.reversal_s == 0.7
+    loaded = np.load(out_dir / "aa.npz")
+    assert int(loaded["seed_energy_milli"]) == -30
+    assert float(loaded["reversal_s"]) == 0.7

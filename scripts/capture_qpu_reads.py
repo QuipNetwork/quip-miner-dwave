@@ -24,7 +24,10 @@ from typing import Any, List
 import numpy as np
 
 from quip_miner_dwave import replay
+from quip_miner_dwave.msa import load_kernel
 from quip_miner_dwave.ocean import OceanSampler
+from quip_miner_dwave.schedule import DEFAULT_REVERSAL_PAUSE_US, DEFAULT_REVERSAL_S
+from quip_miner_dwave.warm import WarmStart
 
 EST_ACCESS_US = 46_100
 
@@ -87,6 +90,12 @@ def main() -> int:
     parser.add_argument("--per-set", type=int, default=250)
     parser.add_argument("--reads", type=int, default=64)
     parser.add_argument("--seed", type=int, default=1387)
+    parser.add_argument(
+        "--seed-sweeps", type=int, default=0,
+        help="reverse anneal from the best MSA-lite state at this many sweeps; 0 is a fresh forward anneal",
+    )
+    parser.add_argument("--reversal-s", type=float, default=DEFAULT_REVERSAL_S)
+    parser.add_argument("--reversal-pause-us", type=int, default=DEFAULT_REVERSAL_PAUSE_US)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--yes", action="store_true", help="confirm the QPU spend")
     parser.add_argument(
@@ -107,6 +116,7 @@ def main() -> int:
         print("pass --yes to spend it")
         return 2
 
+    kernel = load_kernel() if args.seed_sweeps else None
     sampler = OceanSampler(mock=False)
     sampler.ensure_connected()
     sampler.set_session_topology(
@@ -118,9 +128,30 @@ def main() -> int:
     try:
         for count, nonce in enumerate(nonces, 1):
             h, j = replay.model_from_nonce(spec, nonce)
+            warm_start, extra = None, {}
+            if kernel is not None:
+                # The same call lite_dataset.py makes, so the seed is the state
+                # behind that model's recorded lite energy.
+                lite_spins, lite_energies = kernel.sample(
+                    h, spec.dense_edges, j, num_sweeps=args.seed_sweeps, num_reads=64,
+                    seed=int(nonce[:15], 16),
+                )
+                best = int(np.argmin(lite_energies))
+                warm_start = WarmStart(
+                    state=np.asarray(lite_spins[best], dtype=np.int8),
+                    reversal_s=args.reversal_s,
+                    reversal_pause_us=args.reversal_pause_us,
+                )
+                extra = {
+                    "seed_energy_milli": np.int64(lite_energies[best]),
+                    "seed_sweeps": np.int64(args.seed_sweeps),
+                    "reversal_s": np.float64(args.reversal_s),
+                    "reversal_pause_us": np.int64(args.reversal_pause_us),
+                }
             result = sampler.sample(
                 spec.nodes, h, spec.edges, j,
                 num_reads=args.reads, nonce_seed=bytes.fromhex(nonce), label="quip-seed-capture",
+                warm_start=warm_start,
             )
             try:
                 spins = replay.spec_order(result.spins, result.variables, spec)
@@ -137,6 +168,7 @@ def main() -> int:
                 spins=spins,
                 energies_milli=energies_milli(spins, spec.dense_edges, h, j),
                 access_us=np.int64(result.device_access_time_us),
+                **extra,
             )
             spent_us += int(result.device_access_time_us)
             if count % 50 == 0:

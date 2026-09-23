@@ -77,6 +77,7 @@ def main() -> int:
     parser.add_argument("--rates-out", required=True)
     parser.add_argument("--sweeps", type=int, nargs="+", default=[128, 256, 512, 1024, 2048, 4096])
     parser.add_argument("--threads", type=int, default=16)
+    parser.add_argument("--reads", type=int, default=64, help="reads per model; the output has no reads column, so use one file per read count")
     parser.add_argument("--seed", type=int, default=1387)
     pick = parser.add_mutually_exclusive_group(required=True)
     pick.add_argument("--sample", type=int, help="low-energy set plus this many random others")
@@ -107,7 +108,7 @@ def main() -> int:
         h, j = replay.model_from_nonce(spec, nonce)
         start = time.perf_counter()
         _, energies = kernel.sample(
-            h, spec.dense_edges, j, num_sweeps=sweeps, num_reads=64,
+            h, spec.dense_edges, j, num_sweeps=sweeps, num_reads=args.reads,
             seed=int(nonce[:15], 16),
         )
         wall_ms = (time.perf_counter() - start) * 1000.0
