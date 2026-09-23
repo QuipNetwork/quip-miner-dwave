@@ -26,11 +26,13 @@ import argparse
 import datetime
 import hashlib
 import json
+import os
 import platform
+import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, FrozenSet, List, Optional
 
 PROVENANCE_KINDS = ("historical", "prospective", "synthetic-test")
 
@@ -93,30 +95,37 @@ def _iso_mtime(path: Path) -> str:
     return datetime.datetime.fromtimestamp(stamp, tz=datetime.timezone.utc).isoformat()
 
 
-def inventory_paths(root: Path) -> List[Dict[str, Any]]:
+def inventory_paths(
+    root: Path, *, exclude_dirs: FrozenSet[str] = frozenset()
+) -> List[Dict[str, Any]]:
     """Path, size, sha256, and mtime of every non-credential file under root.
 
-    Returns an empty list when root does not exist. Never opens a path that
-    ``is_credential_like`` flags; its presence is not even recorded, so a
-    credential file's name cannot leak into round2/sources.json.
+    Returns an empty list when root does not exist. A directory named in
+    ``exclude_dirs`` (for example ``.git`` or ``.venv``) is pruned from the
+    walk before it is entered, so nothing inside it is ever opened, hashed,
+    or even stat'd. Never opens a path that ``is_credential_like`` flags
+    either; its presence is not even recorded, so a credential file's name
+    cannot leak into round2/sources.json.
     """
     root = Path(root)
     if not root.exists():
         return []
     entries = []
-    for path in sorted(root.rglob("*")):
-        if not path.is_file():
-            continue
-        if is_credential_like(path):
-            continue
-        entries.append(
-            {
-                "path": path,
-                "size_bytes": path.stat().st_size,
-                "sha256": sha256_file(path),
-                "mtime": _iso_mtime(path),
-            }
-        )
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(name for name in dirnames if name not in exclude_dirs)
+        for filename in sorted(filenames):
+            path = Path(dirpath) / filename
+            if is_credential_like(path):
+                continue
+            entries.append(
+                {
+                    "path": path,
+                    "size_bytes": path.stat().st_size,
+                    "sha256": sha256_file(path),
+                    "mtime": _iso_mtime(path),
+                }
+            )
+    entries.sort(key=lambda entry: str(entry["path"]))
     return entries
 
 
@@ -126,6 +135,7 @@ def build_source_record(
     provenance: str,
     root: Path,
     known_fields: Dict[str, Any],
+    exclude_dirs: FrozenSet[str] = frozenset(),
 ) -> Dict[str, Any]:
     """One round2/sources.json entry: known fields, file inventory, gaps.
 
@@ -133,7 +143,9 @@ def build_source_record(
     extras (for example a note on why a field is unrecoverable); fields the
     caller does not supply are recorded as explicit ``None`` rather than
     omitted, so historical_gaps sees them and so does anyone reading the
-    JSON directly.
+    JSON directly. ``exclude_dirs`` is passed straight to ``inventory_paths``
+    to prune large or irrelevant subtrees (``.git``, ``.venv``) before any
+    file inside them is opened.
     """
     if provenance not in PROVENANCE_KINDS:
         raise ValueError(f"unknown provenance {provenance!r}; expected one of {PROVENANCE_KINDS}")
@@ -143,7 +155,7 @@ def build_source_record(
     for key, value in known_fields.items():
         if key not in REQUIRED_FIELDS:
             record[key] = value
-    record["inventory"] = inventory_paths(root)
+    record["inventory"] = inventory_paths(root, exclude_dirs=exclude_dirs)
     record["gaps"] = historical_gaps(record)
     return record
 
@@ -154,34 +166,139 @@ def _json_default(value: Any) -> Any:
     raise TypeError(f"not JSON serializable: {value!r}")
 
 
+# ------------------------------------------------------- archive field extraction
+_BUDGET_RE = re.compile(r"(\d+)\s+reads?\s*x\s*(\d+)\s+sweeps")
+
+
+def extract_gutcheck_fields(root: Path) -> Dict[str, Any]:
+    """reads / sa_sweeps read from portfolio-gutcheck's own JSON output, not hardcoded.
+
+    The probe ran several budgets in the same run (kernel arms at 64 reads
+    across several sweep counts, the shipped SA arm at 500 reads and 500
+    sweeps), so no single ``(reads, sa_sweeps)`` pair is *the* historical
+    setting. When the JSON output shows more than one distinct value,
+    ``reads``/``sa_sweeps`` are left out of the returned dict entirely (so
+    ``historical_gaps`` reports them missing); every distinct value seen is
+    still recorded, under ``observed_candidates``, so the raw budgets are
+    not lost.
+    """
+    root = Path(root)
+    reads_seen: set = set()
+    sweeps_seen: set = set()
+    for path in sorted(root.glob("*.json")) if root.exists() else []:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, list):
+            continue
+        for entry in data:
+            for row in entry.get("rows", []):
+                match = _BUDGET_RE.search(row.get("budget", ""))
+                if match:
+                    reads_seen.add(int(match.group(1)))
+                    sweeps_seen.add(int(match.group(2)))
+    fields: Dict[str, Any] = {}
+    if len(reads_seen) == 1:
+        fields["reads"] = next(iter(reads_seen))
+    if len(sweeps_seen) == 1:
+        fields["sa_sweeps"] = next(iter(sweeps_seen))
+    if reads_seen or sweeps_seen:
+        fields["observed_candidates"] = {
+            "reads": sorted(reads_seen),
+            "sa_sweeps": sorted(sweeps_seen),
+        }
+    return fields
+
+
+def extract_round1_manifest_fields(root: Path) -> Dict[str, Any]:
+    """reads / qpu_anneal_us read from round1's manifest.json files, only where every one agrees.
+
+    A round1 manifest never carries a solver identity (the chip id lives in
+    the separate regimes/solver-properties.json, outside this root), so this
+    function never returns ``qpu_solver``; filling that field from a
+    different file would let ``historical_gaps`` treat it as recovered
+    when the inventoried record itself does not state it.
+    """
+    root = Path(root)
+    manifests = []
+    for path in sorted(root.glob("*/manifest.json")) if root.exists() else []:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                manifests.append(json.load(handle))
+        except (OSError, json.JSONDecodeError):
+            continue
+    fields: Dict[str, Any] = {}
+    if not manifests:
+        return fields
+    reads_values = {m.get("reads") for m in manifests}
+    if len(reads_values) == 1 and next(iter(reads_values)) is not None:
+        fields["reads"] = next(iter(reads_values))
+    anneal_values = {tuple(m.get("anneal_us") or ()) for m in manifests}
+    if len(anneal_values) == 1 and next(iter(anneal_values)):
+        fields["qpu_anneal_us"] = list(next(iter(anneal_values)))
+    return fields
+
+
 # --------------------------------------------------------------- environment
-def _run(cmd: List[str], cwd: Optional[Path] = None) -> Optional[str]:
+def _run(cmd: List[str], cwd: Optional[Path] = None) -> Dict[str, Any]:
+    """Run cmd, reporting success/failure explicitly rather than collapsing both to None.
+
+    A caller that only wants best-effort text (a version string, an import
+    path) can read ``["stdout"]`` and treat a failure as "unknown". A caller
+    where "unknown" and "definitely false" are different facts -- such as a
+    dirty-tree check -- must look at ``["ok"]`` and ``["error"]`` instead of
+    inferring failure from an empty or ``None`` result.
+    """
     try:
         out = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, check=True)
-    except (OSError, subprocess.CalledProcessError):
-        return None
-    return out.stdout.strip()
+    except FileNotFoundError as exc:
+        return {"ok": False, "stdout": None, "error": str(exc)}
+    except OSError as exc:
+        return {"ok": False, "stdout": None, "error": str(exc)}
+    except subprocess.CalledProcessError as exc:
+        message = (exc.stderr or str(exc)).strip()
+        return {"ok": False, "stdout": None, "error": message}
+    return {"ok": True, "stdout": out.stdout.strip(), "error": None}
+
+
+def _run_text(cmd: List[str], cwd: Optional[Path] = None) -> Optional[str]:
+    """Best-effort stdout of cmd, or None on failure, for callers where "unknown" reads safely."""
+    result = _run(cmd, cwd=cwd)
+    return result["stdout"] if result["ok"] else None
 
 
 def _git_facts(repo: Path) -> Dict[str, Any]:
+    """HEAD, branch, and dirty state of repo, with a failed probe recorded as a failure.
+
+    ``dirty`` is ``True``/``False`` only when ``git status`` actually ran; a
+    failed probe (repo missing, not a git checkout, git itself unavailable)
+    sets ``dirty`` to ``None`` and lists the failure in ``probe_errors``, so
+    it can never be misread as "the tree is clean".
+    """
     head = _run(["git", "rev-parse", "HEAD"], cwd=repo)
     status = _run(["git", "status", "--porcelain"], cwd=repo)
     branch = _run(["git", "branch", "--show-current"], cwd=repo)
+    probe_errors = [
+        result["error"] for result in (head, status, branch) if not result["ok"]
+    ]
     return {
         "path": str(repo),
-        "head": head,
-        "branch": branch,
-        "dirty": bool(status),
-        "dirty_files": status.splitlines() if status else [],
+        "head": head["stdout"] if head["ok"] else None,
+        "branch": branch["stdout"] if branch["ok"] else None,
+        "dirty": bool(status["stdout"]) if status["ok"] else None,
+        "dirty_files": status["stdout"].splitlines() if status["ok"] and status["stdout"] else [],
+        "probe_errors": probe_errors,
     }
 
 
 def _python_facts(python: Path, imports: List[str]) -> Dict[str, Any]:
-    version = _run([str(python), "--version"])
+    version = _run_text([str(python), "--version"])
     modules: Dict[str, Optional[str]] = {}
     for module in imports:
         code = f"import {module}; print({module}.__file__)"
-        out = _run([str(python), "-c", code])
+        out = _run_text([str(python), "-c", code])
         modules[module] = out if out else None
     return {"interpreter": str(python), "version": version, "modules": modules}
 
@@ -210,6 +327,8 @@ def collect_environment(
     )
     d_lock = d_repo / "uv.lock"
     p_lock = p_repo / "uv.lock"
+    c_cargo_lock = c_repo / "Cargo.lock"
+    c_py_cargo_lock = c_repo / "py" / "Cargo.lock"
 
     return {
         "generated_at": datetime.datetime.now(tz=datetime.timezone.utc).isoformat(),
@@ -218,12 +337,18 @@ def collect_environment(
             "platform": platform.platform(),
         },
         "compilers": {
-            "rustc": _run(["rustc", "--version"]),
-            "cargo": _run(["cargo", "--version"]),
+            "rustc": _run_text(["rustc", "--version"]),
+            "cargo": _run_text(["cargo", "--version"]),
         },
         "repositories": {
             "D": {**d_git, "lockfile_sha256": sha256_file(d_lock) if d_lock.exists() else None},
-            "C": c_git,
+            "C": {
+                **c_git,
+                "lockfile_sha256": sha256_file(c_cargo_lock) if c_cargo_lock.exists() else None,
+                "py_lockfile_sha256": (
+                    sha256_file(c_py_cargo_lock) if c_py_cargo_lock.exists() else None
+                ),
+            },
             "P": {**p_git, "lockfile_sha256": sha256_file(p_lock) if p_lock.exists() else None},
         },
         "environments": {
@@ -268,37 +393,50 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    gutcheck_root = args.archive_root / "regimes" / "portfolio-gutcheck"
+    round1_root = args.archive_root / "regimes" / "round1"
+    gutcheck_fields = extract_gutcheck_fields(gutcheck_root)
+    round1_fields = extract_round1_manifest_fields(round1_root)
+
     sources = {
         "generated_at": datetime.datetime.now(tz=datetime.timezone.utc).isoformat(),
         "records": [
             build_source_record(
                 name="portfolio-gutcheck",
                 provenance="synthetic-test",
-                root=args.archive_root / "regimes" / "portfolio-gutcheck",
+                root=gutcheck_root,
                 known_fields={
-                    "reads": 64,
-                    "sa_sweeps": 500,
+                    **gutcheck_fields,
                     "note": (
                         "Classical-only probe (2026-09-20) against qpo.build_problem's "
                         "shipped default basket, not a captured historical market "
-                        "snapshot. No QPU fields recorded; the script never ran on hardware."
+                        "snapshot. No QPU fields recorded; the script never ran on "
+                        "hardware. reads/sa_sweeps are extracted from the probe's own "
+                        "JSON output (extract_gutcheck_fields) and are left as gaps "
+                        "here because the probe used several budgets in one run; see "
+                        "observed_candidates for every distinct value seen."
                     ),
                 },
             ),
             build_source_record(
                 name="round1-regime-manifests",
                 provenance="historical",
-                root=args.archive_root / "regimes" / "round1",
+                root=round1_root,
                 known_fields={
-                    "reads": 64,
-                    "qpu_anneal_us": [80, 400],
-                    "qpu_solver": "Advantage2_system1",
+                    **round1_fields,
+                    "qpu_solver_observed_elsewhere": (
+                        "Advantage2_system1, from regimes/solver-properties.json -- "
+                        "not part of any round1 manifest.json, so qpu_solver stays a gap here"
+                    ),
                     "note": (
                         "QPU regime captures for logical-topology benchmarks "
                         "(native-125, clique-portfolio, native-pm1, diamond-pm1, "
-                        "cubic-dimer-pm1), not the portfolio problem instances. No "
-                        "market snapshot, basket, sliders, deployment commit, "
-                        "effective beta, sa_sweeps, or tie_rules recorded per manifest."
+                        "cubic-dimer-pm1), not the portfolio problem instances. reads "
+                        "and qpu_anneal_us are extracted from the manifest.json files "
+                        "(extract_round1_manifest_fields) and filled only because all "
+                        "five agree. No market snapshot, basket, sliders, deployment "
+                        "commit, effective beta, sa_sweeps, tie_rules, or solver "
+                        "identity is recorded in any manifest."
                     ),
                 },
             ),
@@ -317,24 +455,19 @@ def main(argv: Optional[List[str]] = None) -> int:
                 name="qportfolio-reference-checkout",
                 provenance="prospective",
                 root=args.p_repo,
+                exclude_dirs=frozenset({".git", ".venv"}),
                 known_fields={
                     "deployment_commit": "9136be4c4b57abdab7f0c46120c341ba94fae014",
                     "note": (
                         "Detached checkout of qtbench/Q-Portfolio-Optimization-Benchmark "
                         "at the plan-pinned commit; reference code, not a data capture. "
-                        "Inventory below excludes .git and .venv (large, not provenance-bearing)."
+                        "Inventory excludes .git and .venv (large, not provenance-bearing; "
+                        "pruned before either tree is walked, so nothing inside is opened)."
                     ),
                 },
             ),
         ],
     }
-    # The P checkout's .git and .venv trees are large and not provenance-bearing;
-    # drop them from the last record's inventory rather than walking them.
-    sources["records"][-1]["inventory"] = [
-        entry
-        for entry in sources["records"][-1]["inventory"]
-        if ".git" not in entry["path"].parts and ".venv" not in entry["path"].parts
-    ]
 
     environment = collect_environment(
         d_repo=args.d_repo,
