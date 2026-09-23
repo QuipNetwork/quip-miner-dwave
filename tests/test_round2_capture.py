@@ -135,6 +135,108 @@ def _job_spec(tmp_path, nonces=("aa",), cell="native-pm1", scale=0.5, anneal_us=
     }
 
 
+def _write_spec(path, nodes, edges):
+    path.write_text(json.dumps({
+        "nodes": nodes, "edges": [list(e) for e in edges],
+        "allowed_h_milli": [0], "allowed_j_milli": [-1000, 1000],
+    }), encoding="utf-8")
+
+
+def _write_clique_fixture(tmp_path, nonce="aa", n=3, k=2, scale=0.5, submitted_scale=1.0):
+    """A 3-asset clique-portfolio bundle, chain file, and matching range audit (I5).
+
+    Single-qubit chains on a fully-connected 3-qubit triangle keep
+    ``embed_clique`` trivial (nothing to route within a chain) while still
+    exercising the real logical-to-physical mapping, ``resolve_chains``'s
+    majority vote, and ``regimes.score``.
+    """
+    from quip_miner_dwave import regimes as regimes_module
+    from quip_miner_dwave.embeddings import edge_set, embed_clique
+
+    spec_path = tmp_path / "spec.json"
+    nodes = [100, 101, 102]
+    edges = [[100, 101], [100, 102], [101, 102]]
+    _write_spec(spec_path, nodes, edges)
+    spec = round2_capture.replay.load_spec(str(spec_path))
+    topology_hash = round2_capture.regime_io.spec_topology_hash(spec)
+
+    embeddings_dir = tmp_path / "embeddings"
+    embeddings_dir.mkdir(parents=True, exist_ok=True)
+    chains = [[100], [101], [102]]
+    (embeddings_dir / "clique.json").write_text(
+        json.dumps({"topology_hash": topology_hash, "chains": chains}), encoding="utf-8"
+    )
+
+    h, edges_dense, j = regimes_module.clique_model(nonce, n, k)
+    manifest = {"cell": "clique-portfolio", "nonce": nonce, "identity": {}}
+    round2_io.write_bundle(
+        tmp_path / "bundles" / "clique-portfolio" / nonce, manifest,
+        {"h": h, "edges": edges_dense, "j": j},
+    )
+
+    working = edge_set(spec.edges.tolist())
+    phys_nodes, phys_h, phys_edges, phys_j, _strength = embed_clique(h, edges_dense, j, chains, working, prefactor=3.0)
+    _write_range_audit(
+        tmp_path / "range-audit", "clique-portfolio", nonce,
+        [(scale, submitted_scale, phys_h * submitted_scale, phys_j * submitted_scale)],
+    )
+    (tmp_path / "properties.json").write_text(json.dumps(PROPERTIES), encoding="utf-8")
+    return spec_path, embeddings_dir, chains, phys_nodes
+
+
+def _clique_job_spec(tmp_path, spec_path, embeddings_dir, nonce="aa", scale=0.5, anneal_us=(80,), reads=8,
+                      order_seed=1, margin=1.5):
+    return {
+        "cells": ["clique-portfolio"],
+        "nonces": {"clique-portfolio": [nonce]},
+        "requested_scales": [scale],
+        "anneal_us": list(anneal_us),
+        "reads": reads,
+        "order_seed": order_seed,
+        "bundles_root": str(tmp_path / "bundles"),
+        "range_audit_dir": str(tmp_path / "range-audit"),
+        "properties_path": str(tmp_path / "properties.json"),
+        "spec_path": str(spec_path),
+        "embeddings_dir": str(embeddings_dir),
+        "reservation_margin": margin,
+    }
+
+
+def _write_clique_manifest(tmp_path, spec_path, embeddings_dir) -> pathlib.Path:
+    job_spec = _clique_job_spec(tmp_path, spec_path, embeddings_dir)
+    job_spec_path = tmp_path / "job-spec.json"
+    job_spec_path.write_text(json.dumps(job_spec), encoding="utf-8")
+    manifest_path = tmp_path / "manifest.json"
+    assert _run(["manifest", "--job-spec", str(job_spec_path), "--out", str(manifest_path)]) == 0
+    return manifest_path
+
+
+def _write_chain_fixture(tmp_path, n=40, cell="native-pm1", nonce="aa", scale=0.5, submitted_scale=1.0):
+    """A realistic-size (default 40-qubit) chain bundle and range audit (I4).
+
+    ``dimod.ExactSolver`` (the default ``MockSampler`` backend) enumerates
+    every one of ``2**n`` states, so this is exactly the size the review's
+    probe used to reproduce the out-of-memory failure against the default
+    ``--mock`` path.
+    """
+    rng = np.random.default_rng(0)
+    h = rng.uniform(-1.0, 1.0, n)
+    j = rng.uniform(-1.0, 1.0, n - 1)
+    labels = list(range(1000, 1000 + n))
+    edges = np.array([[i, i + 1] for i in range(n - 1)], dtype=np.int64)
+    manifest = {
+        "cell": cell, "nonce": nonce,
+        "identity": {"topology_hash": "topo-fixture", "model_order_hash": "order-fixture"},
+        "variable_labels": labels,
+    }
+    round2_io.write_bundle(tmp_path / "bundles" / cell / nonce, manifest, {"h": h, "edges": edges, "j": j})
+    _write_range_audit(
+        tmp_path / "range-audit", cell, nonce, [(scale, submitted_scale, h * submitted_scale, j * submitted_scale)],
+    )
+    (tmp_path / "properties.json").write_text(json.dumps(PROPERTIES), encoding="utf-8")
+    return labels, [(int(a), int(b)) for a, b in zip(labels, labels[1:])]
+
+
 def _write_job_spec(tmp_path, **kwargs) -> pathlib.Path:
     path = tmp_path / "job-spec.json"
     path.write_text(json.dumps(_job_spec(tmp_path, **kwargs)), encoding="utf-8")
@@ -145,12 +247,15 @@ class _Sampler:
     """A double of ``OceanSampler``: answers each job with +1 spins at a fixed access time."""
 
     def __init__(self, access_us=40_000, live_nodes=VARIABLE_LABELS, live_edges=((100, 101), (101, 102)),
-                 rows=None, during_job=None):
+                 rows=None, during_job=None, submitted_on_s=None, solved_on_s=None, sapi_ms=None):
         self.access_us = access_us
         self._live_nodes = list(live_nodes)
         self._live_edges = list(live_edges)
         self.rows = rows
         self.during_job = during_job
+        self.submitted_on_s = submitted_on_s
+        self.solved_on_s = solved_on_s
+        self.sapi_ms = sapi_ms
         self.calls = []
         self.closed = False
 
@@ -174,12 +279,16 @@ class _Sampler:
         if self.during_job is not None:
             self.during_job()
         rows = num_reads if self.rows is None else self.rows
+        extra = {} if self.sapi_ms is None else {"sapi_ms": str(self.sapi_ms)}
         return SampleResult(
             spins=np.ones((rows, len(nodes)), dtype=np.int8),
             variables=[int(q) for q in nodes],
             energies=[0.0] * rows,
             device_access_time_us=self.access_us,
             num_reads=rows,
+            submitted_on_s=self.submitted_on_s,
+            solved_on_s=self.solved_on_s,
+            extra=extra,
         )
 
     def close(self):
@@ -188,6 +297,23 @@ class _Sampler:
 
 def _run(argv):
     return round2_capture.main(argv)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_sampler(monkeypatch):
+    """Structural guarantee (M6): a test that forgets to patch ``connect`` for a
+    real run must fail loudly here, never reach ``ensure_connected`` on a live
+    ``OceanSampler``. A test-specific ``monkeypatch.setattr(round2_capture,
+    "connect", ...)`` still wins, since it runs after this fixture.
+    """
+    real_connect = round2_capture.connect
+
+    def guarded(mock):
+        if not mock:
+            raise AssertionError("a test tried to connect a real (non-mock) sampler; this must never happen")
+        return real_connect(mock)
+
+    monkeypatch.setattr(round2_capture, "connect", guarded)
 
 
 # ------------------------------------------------------------- pure helpers
@@ -364,6 +490,20 @@ def test_capture_refuses_an_approval_with_no_cap(tmp_path, monkeypatch):
         _run(_capture_argv(tmp_path, manifest_path, approval_path, tmp_path / "round", "--mock"))
 
 
+@pytest.mark.parametrize("cap", [float("nan"), float("inf"), 0.0, -5.0])
+def test_capture_refuses_a_hand_written_approval_with_a_non_finite_or_non_positive_cap(tmp_path, monkeypatch, cap):
+    # approve's own validation can't be bypassed through the CLI, but nothing
+    # stops an approval file from being edited or written by hand (M2):
+    # json.dumps/loads round-trips NaN and Infinity even though they are not
+    # valid JSON per the spec, so check_approval must not trust the cap as-is.
+    manifest_path, manifest_hash = _manifest_and_hash(tmp_path)
+    approval_path = tmp_path / "approval.json"
+    approval_path.write_text(json.dumps({"manifest_hash": manifest_hash, "cap_seconds": cap}), encoding="utf-8")
+    monkeypatch.setattr(round2_capture, "connect", lambda mock: _Sampler())
+    with pytest.raises(SystemExit, match="finite positive"):
+        _run(_capture_argv(tmp_path, manifest_path, approval_path, tmp_path / "round", "--mock"))
+
+
 def test_a_mock_capture_runs_the_full_path_and_saves_every_field(tmp_path, monkeypatch):
     manifest_path, manifest_hash = _manifest_and_hash(tmp_path)
     approval_path = _approve(tmp_path, manifest_path, manifest_hash)
@@ -389,6 +529,28 @@ def test_a_mock_capture_runs_the_full_path_and_saves_every_field(tmp_path, monke
     assert mode_marker == {"mock": True}
 
 
+def test_resume_does_not_trust_an_output_file_with_a_different_capture_key(tmp_path, monkeypatch):
+    # M1: the output path is cell/scale/anneal/nonce only, so a stale file at
+    # that path (for example from before a properties snapshot changed the
+    # capture key) must not be counted as this job's completed capture.
+    manifest_path, manifest_hash = _manifest_and_hash(tmp_path)
+    approval_path = _approve(tmp_path, manifest_path, manifest_hash)
+    round_dir = tmp_path / "round"
+    manifest = json.loads(manifest_path.read_text())
+    job = manifest["jobs"][0]
+    out_path = round_dir / "native-pm1" / "scale-050" / "qpu-80" / "aa.npz"
+    out_path.parent.mkdir(parents=True)
+    np.savez_compressed(out_path, spins=np.zeros((1, 1)), capture_key="stale-key-from-a-different-manifest")
+
+    sampler = _Sampler()
+    monkeypatch.setattr(round2_capture, "connect", lambda mock: sampler)
+    assert _run(_capture_argv(tmp_path, manifest_path, approval_path, round_dir, "--mock")) == 0
+
+    assert len(sampler.calls) == 1  # re-captured rather than skipped
+    with np.load(out_path) as capture:
+        assert str(capture["capture_key"]) == job["capture_key"]
+
+
 def test_a_mock_capture_is_idempotent_and_skips_a_finished_job(tmp_path, monkeypatch):
     manifest_path, manifest_hash = _manifest_and_hash(tmp_path)
     approval_path = _approve(tmp_path, manifest_path, manifest_hash)
@@ -400,6 +562,27 @@ def test_a_mock_capture_is_idempotent_and_skips_a_finished_job(tmp_path, monkeyp
     monkeypatch.setattr(round2_capture, "connect", lambda mock: second)
     assert _run(_capture_argv(tmp_path, manifest_path, approval_path, round_dir, "--mock")) == 0
     assert second.calls == []
+
+
+def test_the_unpatched_mock_connect_runs_a_realistic_sized_model(tmp_path):
+    # I4: connect(True) must use an offline sampler that scales (Round 1's
+    # OfflineSampler pattern), not MockSampler's default ExactSolver, which
+    # cannot run a problem this size (the review's probe: an out-of-memory
+    # error on a 40-qubit chain). connect() itself is not patched here.
+    labels, edges = _write_chain_fixture(tmp_path, n=40)
+    job_spec = _write_job_spec(tmp_path)
+    manifest_path = tmp_path / "manifest.json"
+    assert _run(["manifest", "--job-spec", str(job_spec), "--out", str(manifest_path)]) == 0
+    manifest_hash = round2_capture.hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    approval_path = _approve(tmp_path, manifest_path, manifest_hash)
+    round_dir = tmp_path / "round"
+
+    assert _run(_capture_argv(tmp_path, manifest_path, approval_path, round_dir, "--mock")) == 0
+
+    [path] = list((round_dir / "native-pm1").glob("scale-*/qpu-*/*.npz"))
+    with np.load(path) as capture:
+        assert capture["spins"].shape == (8, len(labels))
+        assert bool(capture["mock"]) is True
 
 
 def test_a_real_run_without_yes_submits_nothing(tmp_path, monkeypatch):
@@ -479,6 +662,9 @@ def test_a_short_answer_stops_the_run_after_the_charge_is_recorded(tmp_path, mon
     spent, open_jobs = regime_io.read_spend(round_dir)
     assert spent == sampler.access_us and open_jobs == 0  # the charge is recorded before the decode fails
     assert list((round_dir / "native-pm1").glob("scale-*/qpu-*/*.npz")) == []
+    # I1(b): a post-charge failure is not a silent retry candidate either.
+    failed = round2_capture.load_failed(round_dir)
+    assert len(failed) == 1 and "holds 2 rows" in next(iter(failed.values()))["reason"]
 
 
 def test_a_decode_failure_still_leaves_the_charge_recorded(tmp_path, monkeypatch):
@@ -498,6 +684,154 @@ def test_a_decode_failure_still_leaves_the_charge_recorded(tmp_path, monkeypatch
     spent, open_jobs = regime_io.read_spend(round_dir)
     assert spent == sampler.access_us and open_jobs == 0
     assert list((round_dir / "native-pm1").glob("scale-*/qpu-*/*.npz")) == []
+    failed = round2_capture.load_failed(round_dir)
+    assert len(failed) == 1 and "the reads lack qubits" in next(iter(failed.values()))["reason"]
+
+
+def test_a_save_failure_still_records_the_key_as_failed(tmp_path, monkeypatch):
+    manifest_path, manifest_hash = _manifest_and_hash(tmp_path)
+    approval_path = _approve(tmp_path, manifest_path, manifest_hash)
+    round_dir = tmp_path / "round"
+    monkeypatch.setattr(round2_capture, "connect", lambda mock: _Sampler())
+
+    def _broken_save(*_args, **_kwargs):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(round2_capture.regime_io, "atomic_savez", _broken_save)
+    with pytest.raises(OSError, match="no space left"):
+        _run(_capture_argv(tmp_path, manifest_path, approval_path, round_dir, "--yes"))
+
+    failed = round2_capture.load_failed(round_dir)
+    assert len(failed) == 1 and "no space left" in next(iter(failed.values()))["reason"]
+
+
+def test_an_open_reservation_from_a_killed_run_is_never_retried_automatically(tmp_path, monkeypatch):
+    # I1(a): a process killed between the reservation and the charge (SIGKILL,
+    # OOM, power loss) leaves an open ``submit`` line with no matching
+    # ``charge`` and no failed-capture record. The next run must not treat
+    # that as safe to resubmit.
+    manifest_path, manifest_hash = _manifest_and_hash(tmp_path)
+    approval_path = _approve(tmp_path, manifest_path, manifest_hash)
+    round_dir = tmp_path / "round"
+    round_dir.mkdir()
+    manifest = json.loads(manifest_path.read_text())
+    job = manifest["jobs"][0]
+    regime_io.append_spend(
+        round_dir, regime_io.SUBMIT, job["cell"], job["capture_key"], job["anneal_us"], int(job["reservation_us"]),
+    )
+
+    sampler = _Sampler()
+    monkeypatch.setattr(round2_capture, "connect", lambda mock: sampler)
+    with pytest.raises(SystemExit, match="open reservation"):
+        _run(_capture_argv(tmp_path, manifest_path, approval_path, round_dir, "--yes"))
+    assert sampler.calls == []
+
+
+def test_an_unknown_charge_is_charged_at_the_reservation_and_marks_the_key_failed(tmp_path, monkeypatch):
+    # I2: answer._access_time_us returns 0 when SAPI's timing is missing. A
+    # 0 charge on a real run would close the reservation and undercount the
+    # round's spend from then on, so a zero access time must be treated as
+    # unknown, not as "this job cost nothing".
+    manifest_path, manifest_hash = _manifest_and_hash(tmp_path)
+    approval_path = _approve(tmp_path, manifest_path, manifest_hash)
+    round_dir = tmp_path / "round"
+    manifest = json.loads(manifest_path.read_text())
+    job = manifest["jobs"][0]
+    sampler = _Sampler(access_us=0)
+    monkeypatch.setattr(round2_capture, "connect", lambda mock: sampler)
+
+    with pytest.raises(SystemExit, match="no QPU access time"):
+        _run(_capture_argv(tmp_path, manifest_path, approval_path, round_dir, "--yes"))
+
+    spent, open_jobs = regime_io.read_spend(round_dir)
+    assert spent == int(job["reservation_us"]) and open_jobs == 0  # charged the reservation, not zero
+    failed = round2_capture.load_failed(round_dir)
+    assert len(failed) == 1 and "unknown charge" in next(iter(failed.values()))["reason"]
+    assert list((round_dir / "native-pm1").glob("scale-*/qpu-*/*.npz")) == []
+
+
+def test_mismatched_physical_array_lengths_are_refused_when_building_the_manifest(tmp_path):
+    _fixture(tmp_path)
+    # Corrupt the range audit's scaled coefficients to disagree in length
+    # with the bundle's physical qubit/coupler count (I5).
+    h = np.array([0.1, -0.2, 0.3])
+    j_one_edge_short = np.array([0.4])
+    _write_range_audit(tmp_path / "range-audit", "native-pm1", "aa", [(0.5, 1.0, h, j_one_edge_short)])
+    job_spec = _job_spec(tmp_path)
+
+    with pytest.raises(ValueError, match="physical arrays do not pair"):
+        round2_capture.build_manifest(job_spec)
+
+
+def test_mismatched_physical_array_lengths_are_refused_before_reservation(tmp_path, monkeypatch):
+    manifest_path, manifest_hash = _manifest_and_hash(tmp_path)
+    approval_path = _approve(tmp_path, manifest_path, manifest_hash)
+    round_dir = tmp_path / "round"
+
+    # Corrupt the range audit after the manifest was built, so the stored
+    # coefficient_hash also no longer matches -- pin the array-length
+    # message specifically by disabling that earlier hash check.
+    h = np.array([0.1, -0.2, 0.3])
+    j_one_edge_short = np.array([0.4])
+    _write_range_audit(tmp_path / "range-audit", "native-pm1", "aa", [(0.5, 1.0, h, j_one_edge_short)])
+    monkeypatch.setattr(round2_capture, "coefficient_hash", lambda h, j: json.loads(manifest_path.read_text())["jobs"][0]["coefficient_hash"])
+
+    sampler = _Sampler()
+    monkeypatch.setattr(round2_capture, "connect", lambda mock: sampler)
+    with pytest.raises(SystemExit, match="physical arrays do not pair"):
+        _run(_capture_argv(tmp_path, manifest_path, approval_path, round_dir, "--yes"))
+    assert sampler.calls == []
+    assert regime_io.read_spend(round_dir) == (0, 0)
+
+
+def test_embedding_hash_is_recomputed_from_the_chain_file_not_the_bundles_stored_copy(tmp_path, monkeypatch):
+    # I5: the old check compared the bundle's stored identity.embedding_hash
+    # against a copy of that same field, which can never fire on its own.
+    # Changing the chain file without touching the bundle must now be
+    # caught, since embedding_hash is recomputed from the file each time.
+    spec_path, embeddings_dir, chains, phys_nodes = _write_clique_fixture(tmp_path)
+    manifest_path = _write_clique_manifest(tmp_path, spec_path, embeddings_dir)
+    manifest_hash = round2_capture.hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    approval_path = _approve(tmp_path, manifest_path, manifest_hash)
+    round_dir = tmp_path / "round"
+
+    # Change the chain file's content (still the same topology hash) without
+    # touching the bundle at all.
+    spec = round2_capture.replay.load_spec(str(spec_path))
+    topology_hash = round2_capture.regime_io.spec_topology_hash(spec)
+    (embeddings_dir / "clique.json").write_text(
+        json.dumps({"topology_hash": topology_hash, "chains": [[101], [100], [102]]}), encoding="utf-8",
+    )
+
+    # The full triangle, so preflight (which runs after the embedding check)
+    # can never be what stops this run -- only the embedding-hash guard can.
+    sampler = _Sampler(live_nodes=phys_nodes.tolist(), live_edges=[(100, 101), (100, 102), (101, 102)])
+    monkeypatch.setattr(round2_capture, "connect", lambda mock: sampler)
+    with pytest.raises(SystemExit, match="embedding file has changed"):
+        _run(_capture_argv(tmp_path, manifest_path, approval_path, round_dir, "--yes"))
+    assert sampler.calls == []
+
+
+def test_a_mock_clique_capture_decodes_chains_and_scores_energies(tmp_path, monkeypatch):
+    spec_path, embeddings_dir, chains, phys_nodes = _write_clique_fixture(tmp_path)
+    manifest_path = _write_clique_manifest(tmp_path, spec_path, embeddings_dir)
+    manifest_hash = round2_capture.hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    approval_path = _approve(tmp_path, manifest_path, manifest_hash)
+    round_dir = tmp_path / "round"
+
+    sampler = _Sampler(live_nodes=phys_nodes.tolist(), live_edges=[(100, 101), (100, 102), (101, 102)])
+    monkeypatch.setattr(round2_capture, "connect", lambda mock: sampler)
+    assert _run(_capture_argv(tmp_path, manifest_path, approval_path, round_dir, "--mock")) == 0
+
+    [path] = list((round_dir / "clique-portfolio").glob("scale-*/qpu-*/*.npz"))
+    with np.load(path) as capture:
+        # One logical asset per chain; every chain here is a single physical
+        # qubit, so a +1 physical read never breaks and always decodes to +1.
+        assert capture["spins"].shape == (8, len(chains))
+        assert (capture["spins"] == 1).all()
+        assert float(capture["broken_chain_share"]) == 0.0
+        assert capture["raw_spins"].shape == (8, len(phys_nodes))
+        assert np.isfinite(capture["energies"]).all()
 
 
 def test_a_changed_bundle_is_refused_before_any_reservation(tmp_path, monkeypatch):
@@ -581,3 +915,34 @@ def test_the_output_records_the_scale_never_promises_returned_scaling_metadata(t
     with np.load(path) as capture:
         assert bool(capture["returned_scaling_present"]) is False
         assert "auto_scale=False" in str(capture["returned_scaling_reason"])
+
+
+def test_the_output_saves_raw_reads_and_null_plus_reason_timing_when_absent(tmp_path, monkeypatch):
+    manifest_path, manifest_hash = _manifest_and_hash(tmp_path)
+    approval_path = _approve(tmp_path, manifest_path, manifest_hash)
+    round_dir = tmp_path / "round"
+    monkeypatch.setattr(round2_capture, "connect", lambda mock: _Sampler())  # no timing (I3)
+    assert _run(_capture_argv(tmp_path, manifest_path, approval_path, round_dir, "--mock")) == 0
+
+    [path] = list((round_dir / "native-pm1").glob("scale-*/qpu-*/*.npz"))
+    with np.load(path) as capture:
+        assert capture["raw_spins"].shape == (8, 3)
+        assert capture["raw_variables"].tolist() == VARIABLE_LABELS
+        assert np.isnan(capture["submitted_on_s"]) and np.isnan(capture["solved_on_s"]) and np.isnan(capture["sapi_ms"])
+        assert "cloud Future" in str(capture["timing_unavailable_reason"])
+
+
+def test_the_output_saves_sapi_timing_when_the_result_exposes_it(tmp_path, monkeypatch):
+    manifest_path, manifest_hash = _manifest_and_hash(tmp_path)
+    approval_path = _approve(tmp_path, manifest_path, manifest_hash)
+    round_dir = tmp_path / "round"
+    sampler = _Sampler(submitted_on_s=1000.0, solved_on_s=1000.25, sapi_ms=250)
+    monkeypatch.setattr(round2_capture, "connect", lambda mock: sampler)
+    assert _run(_capture_argv(tmp_path, manifest_path, approval_path, round_dir, "--mock")) == 0
+
+    [path] = list((round_dir / "native-pm1").glob("scale-*/qpu-*/*.npz"))
+    with np.load(path) as capture:
+        assert float(capture["submitted_on_s"]) == 1000.0
+        assert float(capture["solved_on_s"]) == 1000.25
+        assert float(capture["sapi_ms"]) == 250.0
+        assert str(capture["timing_unavailable_reason"]) == ""

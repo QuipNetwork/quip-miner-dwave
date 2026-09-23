@@ -183,16 +183,55 @@ def _clique_chains_for(ctx: Context) -> List[List[int]]:
     return regime_io.load_chains(Path(ctx.embeddings_dir) / regime_io.CLIQUE_FILE, topology_hash)
 
 
+_NATIVE_CELLS = ("native-pm1", "native-125")
+
+
+def _embedding_hash(cell: str, ctx: Context) -> Optional[str]:
+    """The embedding's identity, recomputed from the file on disk right now (I5).
+
+    A bundle's own ``identity.embedding_hash`` is part of the bundle's own
+    hashed content, so comparing it against itself proves nothing: it can
+    only ever equal itself, which made the old drift check tautological.
+    This instead re-reads the chain (or placement) file fresh, so a file
+    that changed after the bundle was written -- while the bundle's stored
+    copy of its hash did not -- is caught. Native cells have no embedding.
+    """
+    if cell in _NATIVE_CELLS:
+        return None
+    if ctx.spec is None or ctx.embeddings_dir is None:
+        raise ValueError(f"{cell} needs spec_path and embeddings_dir in the job spec")
+    identity = regime_io.cell_identity(cell, ctx.spec, regimes.CLIQUE_HOLDINGS, ctx.embeddings_dir)
+    return identity.get("embedding_hash")
+
+
+def _assert_arrays_pair(cell: str, nonce: str, phys_nodes, phys_edges, h, j) -> None:
+    """Physical nodes must parallel ``h``, and physical edges must parallel ``j`` (I5).
+
+    ``physical_arrays_for`` recomputes physical nodes/edges from whatever
+    chain (or placement) file is on disk right now; the scaled ``h``/``j``
+    come from Task 6's ``arrays.npz``, written earlier and unconditionally.
+    Nothing else ties those two sources together positionally, so a changed
+    chain file with the same topology hash could pair Task 6's coefficients
+    with the wrong qubits without changing any hash this runner checks.
+    """
+    if len(phys_nodes) != len(h) or len(phys_edges) != len(j):
+        raise ValueError(
+            f"{cell}/{nonce}: physical arrays do not pair (nodes={len(phys_nodes)} vs h={len(h)}, "
+            f"edges={len(phys_edges)} vs j={len(j)}); refusing to submit a mismatched problem"
+        )
+
+
 # ---------------------------------------------------------------- manifest
 
 
 def build_job(
     cell: str, nonce: str, requested_scale: float, anneal_us: int, reads: int, margin: float, ctx: Context
 ) -> Dict[str, Any]:
-    manifest, _arrays, phys_nodes, _phys_edges, _chain_strength = _bundle_and_physical(cell, nonce, ctx)
+    manifest, _arrays, phys_nodes, phys_edges, _chain_strength = _bundle_and_physical(cell, nonce, ctx)
     ra_manifest, ra_arrays = _range_audit_entry(cell, nonce, ctx)
     submitted_scale, h_scaled, j_scaled = _scaled_hj(ra_manifest, ra_arrays, requested_scale)
-    embedding_hash = manifest.get("identity", {}).get("embedding_hash")
+    _assert_arrays_pair(cell, nonce, phys_nodes, phys_edges, h_scaled, j_scaled)
+    embedding_hash = _embedding_hash(cell, ctx)
     model_hash = manifest["hash"]
     estimate_us = estimate_access_us(ctx.properties, len(phys_nodes), reads, anneal_us)
     capture_key = round2_io.run_id({
@@ -319,7 +358,14 @@ def check_approval(manifest_path: Path, approval_path: Path) -> float:
     cap_seconds = approval.get("cap_seconds")
     if cap_seconds is None:
         raise SystemExit(f"{approval_path} names no cap; refusing to submit with no cap")
-    return float(cap_seconds)
+    cap_seconds = float(cap_seconds)
+    # approve enforces this before writing the file, but an approval can also
+    # be edited or written by hand; json round-trips NaN and Infinity even
+    # though they are not valid JSON, and a NaN cap disables every comparison
+    # against it silently.
+    if not math.isfinite(cap_seconds) or cap_seconds <= 0:
+        raise SystemExit(f"{approval_path} names a cap of {cap_seconds}, which is not a finite positive number")
+    return cap_seconds
 
 
 # ------------------------------------------------------------------ dry-run
@@ -371,6 +417,29 @@ def drift(
     return lost_qubits, lost_couplers
 
 
+def open_capture_keys(round_dir: Path) -> set:
+    """Capture keys with a ``submit`` line and no matching ``charge`` -- an uncertain outcome.
+
+    A process killed by SIGKILL, OOM, or power loss between the reservation
+    and the charge leaves exactly this: the journal counts it at its
+    estimate (``regime_io.read_spend``'s open-job count), but nothing there
+    is keyed by capture key. This is (I1a).
+    """
+    path = round_dir / regime_io.SPEND_JOURNAL
+    if not path.exists():
+        return set()
+    open_count: Dict[str, int] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        entry = json.loads(line)
+        # This runner always journals under the capture key, not the nonce.
+        key = entry["nonce"]
+        if entry["event"] == regime_io.SUBMIT:
+            open_count[key] = open_count.get(key, 0) + 1
+        elif entry["event"] == regime_io.CHARGE:
+            open_count[key] = open_count.get(key, 0) - 1
+    return {key for key, count in open_count.items() if count > 0}
+
+
 def load_failed(round_dir: Path) -> Dict[str, Any]:
     path = round_dir / FAILED_FILE
     if not path.exists():
@@ -419,10 +488,10 @@ def validate_and_load(manifest: Dict[str, Any], ctx: Context) -> Dict[str, Dict[
         )
         if bundle_manifest["hash"] != job["model_hash"]:
             raise SystemExit(f"{job['cell']}/{job['nonce']}: the bundle has changed since the manifest was built")
-        embedding_hash = bundle_manifest.get("identity", {}).get("embedding_hash")
+        embedding_hash = _embedding_hash(job["cell"], ctx)
         if embedding_hash != job["embedding_hash"]:
             raise SystemExit(
-                f"{job['cell']}/{job['nonce']}: the embedding has changed since the manifest was built"
+                f"{job['cell']}/{job['nonce']}: the embedding file has changed since the manifest was built"
             )
         ra_manifest, ra_arrays = _range_audit_entry(job["cell"], job["nonce"], ctx)
         submitted_scale, h_scaled, j_scaled = _scaled_hj(ra_manifest, ra_arrays, job["requested_scale"])
@@ -432,6 +501,10 @@ def validate_and_load(manifest: Dict[str, Any], ctx: Context) -> Dict[str, Dict[
                 f"{job['cell']}/{job['nonce']} at scale {job['requested_scale']}: the scaled coefficients "
                 "have changed since the manifest was built; refusing to submit an unaudited problem"
             )
+        try:
+            _assert_arrays_pair(job["cell"], job["nonce"], phys_nodes, phys_edges, h_scaled, j_scaled)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
         chains = _clique_chains_for(ctx) if job["cell"] == "clique-portfolio" else None
         loaded[job["capture_key"]] = {
             "bundle_arrays": bundle_arrays,
@@ -474,6 +547,18 @@ def _output_path(round_dir: Path, job: Dict[str, Any]) -> Path:
     return round_dir / job["cell"] / f"scale-{suffix}" / f"qpu-{job['anneal_us']}" / f"{job['nonce']}.npz"
 
 
+def _output_matches(out_path: Path, capture_key: str) -> bool:
+    """Whether a file already at ``out_path`` is really this job's capture.
+
+    The path alone (cell/scale/anneal/nonce) does not carry the model,
+    embedding, or solver-property hashes a capture key does, so a resume
+    must not trust a file left over from before one of those changed
+    (M1) -- for example a properties snapshot update between manifest runs.
+    """
+    with np.load(out_path) as existing:
+        return str(existing["capture_key"]) == capture_key
+
+
 def _model_for(job: Dict[str, Any], data: Dict[str, Any]) -> regimes.Model:
     bundle_arrays = data["bundle_arrays"]
     return regimes.Model(
@@ -484,11 +569,31 @@ def _model_for(job: Dict[str, Any], data: Dict[str, Any]) -> regimes.Model:
     )
 
 
+class OfflineSampler:
+    """The stand-in for ``--mock``: Ocean's compiled annealer at a few sweeps.
+
+    Matches ``scripts/regime_capture.py``'s ``OfflineSampler``. The miner's
+    own ``MockSampler`` defaults to dimod's ``ExactSolver``, which enumerates
+    every state and cannot run a realistic Round 2 model (a 40-qubit problem
+    already asks it for 40.0 TiB). The reads here only have to be valid
+    spins, so every later step in the pipeline runs on real files.
+    """
+
+    def __init__(self) -> None:
+        from dwave.samplers import SimulatedAnnealingSampler
+
+        self._sampler = SimulatedAnnealingSampler()
+        self.properties: dict = {}
+
+    def sample_ising(self, h, j, **kwargs):
+        return self._sampler.sample_ising(h, j, num_reads=int(kwargs.get("num_reads") or 1), num_sweeps=20)
+
+
 def connect(mock: bool) -> Any:
     """The sampler of a run. Only the real one reaches the QPU."""
     from quip_miner_dwave.ocean import OceanSampler
 
-    return OceanSampler(mock=True) if mock else OceanSampler(mock=False)
+    return OceanSampler(sampler=OfflineSampler(), mock=True) if mock else OceanSampler(mock=False)
 
 
 def run_capture(args: argparse.Namespace) -> int:
@@ -525,6 +630,9 @@ def run_capture(args: argparse.Namespace) -> int:
 
     by_key = {job["capture_key"]: job for job in manifest["jobs"]}
     failed = load_failed(round_dir)
+    # Computed once: within this run, a key only gains an open submit line
+    # when this loop reserves it, and it is checked before that happens.
+    open_keys = open_capture_keys(round_dir)
 
     sampler = connect(args.mock)
     run_us = 0
@@ -546,8 +654,16 @@ def run_capture(args: argparse.Namespace) -> int:
                     f"({failed[capture_key]['reason']}); this runner never retries an uncertain submission "
                     f"automatically. Resolve it and remove it from {round_dir / FAILED_FILE} before running again"
                 )
+            if capture_key in open_keys:
+                raise SystemExit(
+                    f"{job['cell']}/{job['nonce']}: capture key {capture_key} has an open reservation in "
+                    f"{round_dir / regime_io.SPEND_JOURNAL} with no matching charge, from a run that did not "
+                    "finish (killed, crashed, or lost power mid-submission). This runner never retries an "
+                    "uncertain submission automatically. Confirm with D-Wave whether it ran, then append a "
+                    "charge line or a failed-capture record before running again"
+                )
             out_path = _output_path(round_dir, job)
-            if out_path.exists():
+            if out_path.exists() and _output_matches(out_path, capture_key):
                 continue
             data = loaded[capture_key]
             if not args.mock:
@@ -576,46 +692,86 @@ def run_capture(args: argparse.Namespace) -> int:
                 raise
             access_us = 0 if args.mock else int(result.device_access_time_us)
             if not args.mock:
+                if access_us <= 0:
+                    # SAPI accepted the problem but reported no usable timing
+                    # (answer._access_time_us's 0 for missing timing info).
+                    # Charging 0 would close the reservation and silently
+                    # undercount every cap check after it, so this charges
+                    # the conservative reservation amount instead and marks
+                    # the key failed rather than trust an unknown number.
+                    regime_io.append_spend(
+                        round_dir, regime_io.CHARGE, job["cell"], capture_key, job["anneal_us"],
+                        int(job["reservation_us"]),
+                    )
+                    record_failed(round_dir, capture_key, "unknown charge: the solver reported no access time")
+                    raise SystemExit(
+                        f"{job['cell']}/{job['nonce']}: the solver reported no QPU access time for capture "
+                        f"key {capture_key}; charged the reservation amount ({job['reservation_us'] / 1e6:.2f} "
+                        "s) and marked it failed. This runner never retries an uncertain submission "
+                        "automatically"
+                    )
                 # The charge goes to the journal before decoding or any file write.
                 regime_io.append_spend(round_dir, regime_io.CHARGE, job["cell"], capture_key, job["anneal_us"], access_us)
                 run_us += access_us
-            model = _model_for(job, data)
-            spins, broken = regimes.decode_reads(model, result.spins, result.variables)
-            if len(spins) != job["reads"]:
-                raise SystemExit(
-                    f"{job['cell']}/{job['nonce']} holds {len(spins)} rows, and the job asked for "
-                    f"{job['reads']} reads. The answer format of the solver has changed, so the run stops"
+            try:
+                model = _model_for(job, data)
+                spins, broken = regimes.decode_reads(model, result.spins, result.variables)
+                if len(spins) != job["reads"]:
+                    raise SystemExit(
+                        f"{job['cell']}/{job['nonce']} holds {len(spins)} rows, and the job asked for "
+                        f"{job['reads']} reads. The answer format of the solver has changed, so the run stops"
+                    )
+                request_hash = request_identity_hash(
+                    data["phys_nodes"], data["h_scaled"], data["phys_edges"], data["j_scaled"]
                 )
-            request_hash = request_identity_hash(data["phys_nodes"], data["h_scaled"], data["phys_edges"], data["j_scaled"])
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            regime_io.atomic_savez(
-                out_path,
-                spins=spins,
-                energies=regimes.score(model, spins),
-                access_us=np.int64(access_us),
-                anneal_us=np.int64(job["anneal_us"]),
-                mock=np.bool_(args.mock),
-                requested_scale=np.float64(job["requested_scale"]),
-                submitted_scale=np.float64(job["submitted_scale"]),
-                auto_scale=np.bool_(False),
-                coefficient_hash=job["coefficient_hash"],
-                request_bytes_hash=request_hash,
-                ceiling=np.float64(job["ceiling"]),
-                limiting_constraint=json.dumps(job["limiting_constraint"]),
-                chain_strength=np.float64(job["chain_strength"] or 0.0),
-                chain_strength_ratio_to_logical=np.float64(
-                    job["chain_strength_ratio_to_logical"]
-                    if job["chain_strength_ratio_to_logical"] is not None else np.nan
-                ),
-                broken_chain_share=np.float64(broken),
-                # SAPI reports no scaling metadata for a submission that
-                # already carries auto_scale=False. If a future solver ever
-                # returns one, thread it through here instead of this notice.
-                returned_scaling_present=np.bool_(False),
-                returned_scaling_reason="auto_scale=False; SAPI reports no scaling metadata for an unscaled submission",
-                capture_key=capture_key,
-                model_hash=job["model_hash"],
-            )
+                timing_known = result.submitted_on_s is not None and result.solved_on_s is not None
+                timing_reason = (
+                    "" if timing_known else
+                    "mock or non-cloud sampler; SAPI's submitted_on/solved_on/sapi_ms need a real cloud Future"
+                )
+                sapi_ms = result.extra.get("sapi_ms")
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                regime_io.atomic_savez(
+                    out_path,
+                    spins=spins,
+                    raw_spins=np.asarray(result.spins),
+                    raw_variables=np.asarray(result.variables, dtype=np.int64),
+                    energies=regimes.score(model, spins),
+                    access_us=np.int64(access_us),
+                    anneal_us=np.int64(job["anneal_us"]),
+                    mock=np.bool_(args.mock),
+                    requested_scale=np.float64(job["requested_scale"]),
+                    submitted_scale=np.float64(job["submitted_scale"]),
+                    auto_scale=np.bool_(False),
+                    coefficient_hash=job["coefficient_hash"],
+                    request_bytes_hash=request_hash,
+                    ceiling=np.float64(job["ceiling"]),
+                    limiting_constraint=json.dumps(job["limiting_constraint"]),
+                    chain_strength=np.float64(job["chain_strength"] or 0.0),
+                    chain_strength_ratio_to_logical=np.float64(
+                        job["chain_strength_ratio_to_logical"]
+                        if job["chain_strength_ratio_to_logical"] is not None else np.nan
+                    ),
+                    broken_chain_share=np.float64(broken),
+                    # SAPI reports no scaling metadata for a submission that
+                    # already carries auto_scale=False. If a future solver ever
+                    # returns one, thread it through here instead of this notice.
+                    returned_scaling_present=np.bool_(False),
+                    returned_scaling_reason=(
+                        "auto_scale=False; the OceanSampler wrapper does not expose any returned scaling "
+                        "metadata for this submission"
+                    ),
+                    submitted_on_s=np.float64(result.submitted_on_s) if result.submitted_on_s is not None else np.nan,
+                    solved_on_s=np.float64(result.solved_on_s) if result.solved_on_s is not None else np.nan,
+                    sapi_ms=np.float64(sapi_ms) if sapi_ms is not None else np.nan,
+                    timing_unavailable_reason=timing_reason,
+                    capture_key=capture_key,
+                    model_hash=job["model_hash"],
+                )
+            except BaseException as exc:
+                if not args.mock:
+                    record_failed(round_dir, capture_key, f"{type(exc).__name__}: {exc}")
+                raise
             submitted += 1
     finally:
         sampler.close()
