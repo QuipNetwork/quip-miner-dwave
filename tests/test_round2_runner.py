@@ -379,6 +379,16 @@ def test_portfolio_deadline_uses_caller_visible_result_delivery_time():
     assert merged["answer"] == {"available": True, "status": "completed_late"}
 
 
+def test_a_failed_child_stays_failed_when_parent_bookkeeping_passes_the_deadline():
+    merged = runner.portfolio_deadline_result(
+        None, {"status": "failed", "elapsed_s": 9.0, "returncode": 1}, 10.0,
+        caller_elapsed_s=10.5,
+    )
+    assert merged["status"] == "failed"
+    assert merged["deadline_status"] == "timeout"
+    assert merged["answer"] == {"available": False, "status": "unavailable"}
+
+
 def test_portfolio_interrupted_parent_timing_remains_unknown():
     saved = {"status": "completed", "objective": 1.25, "run_key": "k"}
     merged = runner.portfolio_deadline_result(

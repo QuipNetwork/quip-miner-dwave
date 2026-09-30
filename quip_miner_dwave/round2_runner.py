@@ -635,7 +635,9 @@ def portfolio_deadline_result(
     )
     answer_available = saved is not None and saved.get("status") == "completed"
     answer_unsupported = saved is not None and saved.get("status") == "unsupported"
+    # A failed child stays failed; a late parent shows only in deadline_status.
     result["status"] = (
+        "failed" if outcome["status"] == "failed" else
         "timeout" if timed_out else
         "unsupported" if answer_unsupported else
         "completed" if answer_available and outcome["status"] == "unknown" else
