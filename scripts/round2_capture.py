@@ -41,6 +41,7 @@ import json
 import math
 import random
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -253,6 +254,20 @@ def build_job(
     }
 
 
+def _randomized_job_order(jobs: Sequence[Dict[str, Any]], seed: int) -> List[str]:
+    """Shuffle settings within model blocks, then flatten shuffled whole blocks."""
+    blocks: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    for job in jobs:
+        blocks.setdefault((str(job["cell"]), str(job["nonce"])), []).append(job)
+
+    rng = random.Random(seed)
+    shuffled_blocks = list(blocks.values())
+    rng.shuffle(shuffled_blocks)
+    for block in shuffled_blocks:
+        rng.shuffle(block)
+    return [str(job["capture_key"]) for block in shuffled_blocks for job in block]
+
+
 def build_manifest(job_spec: Dict[str, Any]) -> Dict[str, Any]:
     properties_path = Path(job_spec["properties_path"])
     properties = json.loads(properties_path.read_text(encoding="utf-8"))
@@ -286,8 +301,7 @@ def build_manifest(job_spec: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("two jobs in this job spec produced the same capture key; refusing to build a manifest")
 
     order_seed = int(job_spec["order_seed"])
-    job_order = list(keys)
-    random.Random(order_seed).shuffle(job_order)
+    job_order = _randomized_job_order(jobs, order_seed)
     job_order_hash = hashlib.sha256(json.dumps(job_order).encode()).hexdigest()
 
     return {
@@ -645,6 +659,7 @@ def run_capture(args: argparse.Namespace) -> int:
     # happens. Empty for a mock round, since a mock run journals nothing.
     open_keys, charged_keys = journal_capture_status(round_dir)
 
+    capture_setup_started_ns = time.monotonic_ns()
     sampler = connect(args.mock)
     run_us = 0
     submitted = 0
@@ -657,6 +672,10 @@ def run_capture(args: argparse.Namespace) -> int:
                 [int(q) for q in first["phys_nodes"]],
                 [(int(u), int(v)) for u, v in first["phys_edges"]],
             )
+        capture_setup_finished_ns = time.monotonic_ns()
+        if capture_setup_finished_ns < capture_setup_started_ns:
+            raise ValueError("invalid monotonic timestamp order for capture setup")
+        capture_setup_s = (capture_setup_finished_ns - capture_setup_started_ns) / 1e9
         for count, capture_key in enumerate(manifest["job_order"], 1):
             job = by_key[capture_key]
             if capture_key in failed:
@@ -692,6 +711,7 @@ def run_capture(args: argparse.Namespace) -> int:
                     f"record capture key {capture_key} as failed before running again"
                 )
             data = loaded[capture_key]
+            job_started_ns = time.monotonic_ns()
             if not args.mock:
                 spent, _ = regime_io.read_spend(round_dir)
                 if (spent + job["reservation_us"]) / 1e6 > cap_seconds:
@@ -706,12 +726,15 @@ def run_capture(args: argparse.Namespace) -> int:
                     round_dir, regime_io.SUBMIT, job["cell"], capture_key, job["anneal_us"],
                     int(job["reservation_us"]),
                 )
+            submitted_at_utc = datetime.now(timezone.utc).isoformat()
+            submitted_ns = time.monotonic_ns()
             try:
                 result = sampler.sample(
                     data["phys_nodes"], data["h_scaled"], data["phys_edges"], data["j_scaled"],
                     num_reads=job["reads"], anneal_time_us=job["anneal_us"],
                     nonce_seed=bytes.fromhex(job["nonce"]), label=args.label, auto_scale=False,
                 )
+                sampler_finished_ns = time.monotonic_ns()
             except BaseException as exc:
                 if not args.mock:
                     record_failed(round_dir, capture_key, f"{type(exc).__name__}: {exc}")
@@ -762,6 +785,11 @@ def run_capture(args: argparse.Namespace) -> int:
                 request_hash = request_identity_hash(
                     data["phys_nodes"], data["h_scaled"], data["phys_edges"], data["j_scaled"]
                 )
+                energies = regimes.score(model, spins)
+                scored_usable_ns = time.monotonic_ns()
+                timing_points = (job_started_ns, submitted_ns, sampler_finished_ns, scored_usable_ns)
+                if timing_points != tuple(sorted(timing_points)):
+                    raise ValueError("invalid monotonic timestamp order for captured answer")
                 timing_known = result.submitted_on_s is not None and result.solved_on_s is not None
                 timing_reason = (
                     "" if timing_known else
@@ -774,8 +802,24 @@ def run_capture(args: argparse.Namespace) -> int:
                     spins=spins,
                     raw_spins=np.asarray(result.spins),
                     raw_variables=np.asarray(result.variables, dtype=np.int64),
-                    energies=regimes.score(model, spins),
+                    energies=energies,
                     access_us=np.int64(access_us),
+                    device_access_s=np.float64(access_us / 1e6),
+                    capture_setup_s=np.float64(capture_setup_s),
+                    job_setup_s=np.float64((submitted_ns - job_started_ns) / 1e9),
+                    sampler_call_s=np.float64((sampler_finished_ns - submitted_ns) / 1e9),
+                    decode_score_s=np.float64((scored_usable_ns - sampler_finished_ns) / 1e9),
+                    end_to_end_s=np.float64((scored_usable_ns - job_started_ns) / 1e9),
+                    job_started_monotonic_s=np.float64(job_started_ns / 1e9),
+                    submitted_monotonic_s=np.float64(submitted_ns / 1e9),
+                    scored_usable_monotonic_s=np.float64(scored_usable_ns / 1e9),
+                    submitted_at_utc=submitted_at_utc,
+                    model_setup_cache_status="cached",
+                    cold_model_setup_s=np.float64(np.nan),
+                    cold_model_setup_unavailable_reason=(
+                        "physical model and embedding were prepared before capture; "
+                        "cold cache construction was not measured in this process"
+                    ),
                     anneal_us=np.int64(job["anneal_us"]),
                     mock=np.bool_(args.mock),
                     requested_scale=np.float64(job["requested_scale"]),

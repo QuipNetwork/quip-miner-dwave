@@ -217,8 +217,9 @@ def test_the_clique_table_gives_the_share_of_reads_with_exactly_k_assets(round_d
     ])
     assert regime_report.main() == 0
     text = out.read_text(encoding="utf-8")
-    assert "| QPU, 80 µs | 0.5 |" in text
-    assert "| Kernel, all rungs | 0.75 |" in text
+    assert "| QPU, 80 µs | 2 / 4 (50%) |" in text
+    # A 0.75 share of 2 reads matches no whole count, so none is invented.
+    assert "| Kernel, all rungs | 0.75 mean share; counts not recoverable |" in text
 
 
 def test_the_ranges_table_counts_the_models_outside_a_solver_range(round_dir, monkeypatch):
@@ -368,3 +369,19 @@ def test_the_report_refuses_a_saved_answer_with_the_wrong_row_count(round_dir, m
     np.savez_compressed(path, **arrays)
     with pytest.raises(SystemExit, match='row count'):
         _report(round_dir, monkeypatch)
+
+
+def test_seven_infeasible_reads_of_32000_never_render_as_perfect():
+    # Round 1 clique: 7 of 500 kernel runs held k assets on 63 of 64 reads.
+    cell = {"manifest": {"clique_holdings": 9, "reads": 64}, "qpu": {}, "k_share": [0.9844] * 7 + [1.0] * 493}
+    table = regime_report.clique_table(cell, [])
+    assert "| Kernel, all rungs | 31993 / 32000 (99.978125%) [reconstructed from rounded shares] |" in table
+
+
+def test_a_share_below_one_never_renders_as_perfect():
+    assert regime_report.fmt_share((7 * 63 / 64 + 493) / 500) == "0.9998"
+    assert regime_report.fmt_share(1 - 1e-9) == "0.999999999"
+    assert regime_report.fmt_share(1.0) == "1"
+    assert regime_report.fmt_share(0.0) == "0"
+    assert regime_report.fmt_share(0.75) == "0.75"
+    assert regime_report.fmt_share(None) == "n/a"

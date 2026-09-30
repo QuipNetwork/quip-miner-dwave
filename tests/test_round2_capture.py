@@ -368,6 +368,21 @@ def test_build_manifest_writes_every_job_with_a_seeded_order_and_its_own_hash(tm
     assert job["reservation_us"] == pytest.approx(job["estimate_us"] * job_spec["reservation_margin"])
 
 
+def test_job_order_randomizes_whole_model_blocks_without_splitting_them():
+    jobs = [
+        {"cell": "a", "nonce": "1", "capture_key": "a1-x"},
+        {"cell": "a", "nonce": "1", "capture_key": "a1-y"},
+        {"cell": "a", "nonce": "2", "capture_key": "a2-x"},
+        {"cell": "a", "nonce": "2", "capture_key": "a2-y"},
+        {"cell": "b", "nonce": "1", "capture_key": "b1-x"},
+        {"cell": "b", "nonce": "1", "capture_key": "b1-y"},
+    ]
+
+    assert round2_capture._randomized_job_order(jobs, 7) == [
+        "b1-x", "b1-y", "a1-y", "a1-x", "a2-y", "a2-x",
+    ]
+
+
 def test_the_manifest_file_hash_is_its_own_raw_bytes(tmp_path):
     _fixture(tmp_path)
     job_spec = _write_job_spec(tmp_path)
@@ -527,6 +542,68 @@ def test_a_mock_capture_runs_the_full_path_and_saves_every_field(tmp_path, monke
         assert str(capture["request_bytes_hash"])
     mode_marker = json.loads((round_dir / round2_capture.MODE_MARKER_FILE).read_text())
     assert mode_marker == {"mock": True}
+
+
+def test_capture_times_through_scoring_and_discloses_cached_setup(tmp_path, monkeypatch):
+    manifest_path, manifest_hash = _manifest_and_hash(tmp_path)
+    approval_path = _approve(tmp_path, manifest_path, manifest_hash)
+    round_dir = tmp_path / "round"
+    sampler = _Sampler()
+    monkeypatch.setattr(round2_capture, "connect", lambda mock: sampler)
+
+    ticks = iter((1_000_000_000, 1_200_000_000, 2_000_000_000,
+                  2_100_000_000, 2_600_000_000, 2_900_000_000))
+    score_finished = False
+
+    def monotonic_ns():
+        value = next(ticks)
+        if value == 2_900_000_000:
+            assert score_finished, "usable-answer time was recorded before scoring finished"
+        return value
+
+    real_score = round2_capture.regimes.score
+
+    def score(model, spins):
+        nonlocal score_finished
+        energies = real_score(model, spins)
+        score_finished = True
+        return energies
+
+    monkeypatch.setattr(round2_capture.time, "monotonic_ns", monotonic_ns)
+    monkeypatch.setattr(round2_capture.regimes, "score", score)
+
+    assert _run(_capture_argv(tmp_path, manifest_path, approval_path, round_dir, "--mock")) == 0
+
+    [path] = list((round_dir / "native-pm1").glob("scale-*/qpu-*/*.npz"))
+    with np.load(path) as capture:
+        assert float(capture["capture_setup_s"]) == pytest.approx(0.2)
+        assert float(capture["job_setup_s"]) == pytest.approx(0.1)
+        assert float(capture["sampler_call_s"]) == pytest.approx(0.5)
+        assert float(capture["decode_score_s"]) == pytest.approx(0.3)
+        assert float(capture["end_to_end_s"]) == pytest.approx(0.9)
+        assert float(capture["device_access_s"]) == 0.0
+        assert float(capture["job_started_monotonic_s"]) == 2.0
+        assert float(capture["submitted_monotonic_s"]) == 2.1
+        assert float(capture["scored_usable_monotonic_s"]) == 2.9
+        assert str(capture["submitted_at_utc"])
+        assert str(capture["model_setup_cache_status"]) == "cached"
+        assert np.isnan(capture["cold_model_setup_s"])
+        assert "prepared before capture" in str(capture["cold_model_setup_unavailable_reason"])
+
+
+def test_capture_refuses_an_invalid_monotonic_timestamp_order(tmp_path, monkeypatch):
+    manifest_path, manifest_hash = _manifest_and_hash(tmp_path)
+    approval_path = _approve(tmp_path, manifest_path, manifest_hash)
+    round_dir = tmp_path / "round"
+    monkeypatch.setattr(round2_capture, "connect", lambda mock: _Sampler())
+    ticks = iter((1_000_000_000, 1_200_000_000, 2_000_000_000,
+                  2_100_000_000, 2_050_000_000, 2_900_000_000))
+    monkeypatch.setattr(round2_capture.time, "monotonic_ns", lambda: next(ticks))
+
+    with pytest.raises(ValueError, match="monotonic timestamp order"):
+        _run(_capture_argv(tmp_path, manifest_path, approval_path, round_dir, "--mock"))
+
+    assert list((round_dir / "native-pm1").glob("scale-*/qpu-*/*.npz")) == []
 
 
 def test_resume_does_not_trust_an_output_file_with_a_different_capture_key(tmp_path, monkeypatch):

@@ -26,7 +26,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from quip_miner_dwave import regime_io, regimes
+from quip_miner_dwave import regime_io, regimes, round2_metrics
 from quip_miner_dwave import regime_metrics as metrics
 
 BASELINE = "native-pm1"
@@ -148,6 +148,16 @@ def matching(cell: dict, anneal: int, rungs: List[int], extra_rung: int) -> dict
 
 def fmt(value: Optional[float], digits: int = 3) -> str:
     return "n/a" if value is None or value != value else f"{value:.{digits}g}"
+
+
+def fmt_share(value: Optional[float]) -> str:
+    """Format a share so that a value below one never prints as a perfect 1."""
+    text = fmt(value)
+    digits = 3
+    while value is not None and value < 1.0 and text == "1" and digits < 15:
+        digits += 1
+        text = fmt(value, digits)
+    return text
 
 
 def interval(count: int, total: int) -> str:
@@ -427,8 +437,19 @@ def clique_table(cell: dict, anneals: List[int]) -> List[str]:
     lines = ["## Clique cell", "", f"| Arm | Reads with exactly {holdings} assets |", "| -- | -- |"]
     for anneal in anneals:
         held = np.concatenate([c["held"] for c in cell["qpu"].get(anneal, {}).values()] or [np.array([])])
-        lines.append(f"| QPU, {anneal} µs | {fmt(float((held == holdings).mean()) if len(held) else None)} |")
-    lines.append(f"| Kernel, all rungs | {fmt(float(np.mean(cell['k_share'])) if cell['k_share'] else None)} |")
+        count = int((held == holdings).sum())
+        lines.append(f"| QPU, {anneal} µs | {round2_metrics.format_feasibility(count, len(held)) if len(held) else 'n/a'} |")
+    # The ladder CSV keeps only rounded shares. The manifest pins the reads of every run.
+    reads = int(cell["manifest"]["reads"])
+    ranges = [round2_metrics.reconstructed_feasible_range(share, reads) for share in cell["k_share"]]
+    if not ranges:
+        kernel = "n/a"
+    elif all(low == high for low, high in ranges):
+        total = sum(low for low, _ in ranges)
+        kernel = f"{round2_metrics.format_feasibility(total, reads * len(ranges))} [reconstructed from rounded shares]"
+    else:
+        kernel = f"{fmt_share(float(np.mean(cell['k_share'])))} mean share; counts not recoverable"
+    lines.append(f"| Kernel, all rungs | {kernel} |")
     return lines
 
 
