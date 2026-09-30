@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Sequence, Tuple
+from typing import Tuple
 
 import numpy as np
+from numpy.typing import ArrayLike
 
 
-def ks_two_sample(a: Sequence[float], b: Sequence[float]) -> Tuple[float, float]:
+def ks_two_sample(a: ArrayLike, b: ArrayLike) -> Tuple[float, float]:
     """Two-sample Kolmogorov-Smirnov: ``(D, p)`` from the asymptotic distribution.
 
     ``D`` is the largest gap between the two empirical distribution functions.
@@ -30,7 +31,7 @@ def ks_two_sample(a: Sequence[float], b: Sequence[float]) -> Tuple[float, float]
     return d_stat, min(1.0, max(0.0, p_value))
 
 
-def _mean_ranks(values: Sequence[float]) -> np.ndarray:
+def _mean_ranks(values: ArrayLike) -> np.ndarray:
     arr = np.asarray(values, dtype=float)
     order = np.argsort(arr, kind="stable")
     ranks = np.empty(len(arr), dtype=float)
@@ -41,7 +42,7 @@ def _mean_ranks(values: Sequence[float]) -> np.ndarray:
     return sums[inverse] / counts[inverse]
 
 
-def spearman(a: Sequence[float], b: Sequence[float]) -> float:
+def spearman(a: ArrayLike, b: ArrayLike) -> float:
     """Spearman rank correlation, with mean ranks for ties."""
     ra, rb = _mean_ranks(a), _mean_ranks(b)
     return float(np.corrcoef(ra, rb)[0, 1])
