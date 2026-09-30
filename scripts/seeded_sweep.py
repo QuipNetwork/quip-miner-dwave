@@ -81,9 +81,29 @@ def expected_keys(nonce: str, sweeps_list: List[int], fractions: List[float]) ->
     return keys
 
 
+def check_qpu_lanes(path: str, qpu_lanes: int) -> None:
+    """Refuse to resume ``path`` with a --qpu-lanes other than the one it was started with.
+
+    The CSV's qpu_lanes column holds the lanes left after de-duplication, not
+    the requested count, so the request lives in a sidecar file.
+    """
+    sidecar = path + ".qpu-lanes"
+    if os.path.exists(path):
+        if not os.path.exists(sidecar):
+            raise SystemExit(f"{path} has no {sidecar}, so its --qpu-lanes is unknown; use a new --out")
+        with open(sidecar, encoding="utf-8") as fh:
+            recorded = int(fh.read().strip())
+        if recorded != qpu_lanes:
+            raise SystemExit(f"{path} was started with --qpu-lanes {recorded}, not {qpu_lanes}")
+        return
+    with open(sidecar, "w", encoding="utf-8") as fh:
+        fh.write(f"{qpu_lanes}\n")
+
+
 def run(args: argparse.Namespace) -> int:
     spec = replay.load_spec(args.spec)
     kernel = load_kernel()
+    check_qpu_lanes(args.out, args.qpu_lanes)
     done = done_rows(args.out)
     lock = threading.Lock()
     new_file = not os.path.exists(args.out)

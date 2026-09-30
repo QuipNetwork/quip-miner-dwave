@@ -222,3 +222,26 @@ def test_ceiling_fraction_is_normalised_like_the_stored_key(tmp_path, capsys, mo
 
     assert rc == 0
     assert "skipped" not in text
+
+
+def test_resume_with_a_different_qpu_lanes_is_refused(tmp_path, monkeypatch):
+    reads_dir = tmp_path / "reads"
+    reads_dir.mkdir()
+    np.savez(
+        reads_dir / "aa.npz",
+        spins=_distinct_spins(64, 6),
+        energies_milli=np.arange(64, dtype=np.int64),
+    )
+    out = tmp_path / "seeded.csv"
+    _patch_run_deps(monkeypatch, _FakeKernel())
+    assert seeded_sweep.run(_run_args(reads_dir, out, qpu_lanes=32)) == 0
+    assert seeded_sweep.run(_run_args(reads_dir, out, qpu_lanes=32)) == 0
+    with pytest.raises(SystemExit, match="started with --qpu-lanes 32, not 16"):
+        seeded_sweep.run(_run_args(reads_dir, out, qpu_lanes=16))
+
+
+def test_resume_of_a_csv_without_the_lanes_sidecar_is_refused(tmp_path):
+    out = tmp_path / "seeded.csv"
+    _write_csv(out, [["n1", "cold", "", 1024, -100, 0, "", "", "5", "0"]])
+    with pytest.raises(SystemExit, match="--qpu-lanes is unknown"):
+        seeded_sweep.check_qpu_lanes(str(out), 32)
