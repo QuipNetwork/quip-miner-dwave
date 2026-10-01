@@ -8,6 +8,13 @@ hourly returns, and the returns come from one of two families:
   contiguous window and :func:`block_bootstrap` resamples it in whole-row
   blocks, so co-movement, subgroups, heavy tails, volatility clustering, and
   closed-market hours all survive.
+- Family B is synthetic, so N can exceed the real asset count.
+  :func:`fit_factor_model` fits statistical factors to the real history, and
+  :func:`factor_synthetic` draws new assets from them: each one resamples a
+  fitted loading row with a small jitter, adds Student-t idiosyncratic noise
+  with the fitted tail, and keeps its source asset's missing hours. The factor
+  scores are block-bootstrapped in whole hours, so co-movement and volatility
+  clustering survive.
 - Family C removes the structure but keeps the marginals.
   :func:`null_iid_normal` and :func:`null_shuffle` act on the returns and keep
   every asset's missing hours. :func:`null_rotate_correlation` acts on the
@@ -27,6 +34,7 @@ from __future__ import annotations
 
 import itertools
 import math
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -35,6 +43,12 @@ ENUMERATION_LIMIT = 10_000_000
 _CHUNK = 100_000
 #: Fisher z above which a pair's correlation counts as significant.
 SIGNIFICANCE_Z = 3.0
+#: Smallest idiosyncratic share of a standardized asset's variance in family B.
+IDIOSYNCRATIC_FLOOR = 0.05
+#: Bounds on the fitted Student-t degrees of freedom: finite kurtosis, and close to normal.
+TAIL_DF_BOUNDS = (5.0, 50.0)
+#: Most refits :func:`fit_factor_model` makes before it keeps the communalities it has.
+PRINCIPAL_AXIS_ITERATIONS = 500
 
 
 def sample_window(returns: np.ndarray, rng: np.random.Generator, rows: int) -> tuple[int, np.ndarray]:
@@ -94,6 +108,114 @@ def null_rotate_correlation(sigma: np.ndarray, rng: np.random.Generator) -> np.n
     rotated = correlation((q * values) @ q.T)
     scale = np.sqrt(np.diagonal(sigma))
     return rotated * np.outer(scale, scale)
+
+
+@dataclass(frozen=True)
+class FactorModel:
+    """Statistical factors fitted to a real return history, on the standardized scale.
+
+    ``loadings`` is (assets, factors) and ``scores`` is (hours, factors). Each
+    asset's standardized variance is its squared loading norm plus
+    ``idiosyncratic``. ``observed`` marks the hours each asset traded.
+    """
+
+    mean: np.ndarray
+    vol: np.ndarray
+    loadings: np.ndarray
+    idiosyncratic: np.ndarray
+    scores: np.ndarray
+    observed: np.ndarray
+    tail_df: float
+
+
+def marchenko_pastur_factors(corr: np.ndarray, hours: float) -> int:
+    """Eigenvalues of ``corr`` above the Marchenko-Pastur edge of pure noise over ``hours``, at least 1."""
+    edge = (1.0 + math.sqrt(corr.shape[0] / hours)) ** 2
+    return max(1, int((np.linalg.eigvalsh(corr) > edge).sum()))
+
+
+def t_tail_df(excess_kurtosis: float) -> float:
+    """Student-t degrees of freedom with this excess kurtosis, 6 / (df - 4), within :data:`TAIL_DF_BOUNDS`."""
+    low, high = TAIL_DF_BOUNDS
+    if excess_kurtosis <= 6.0 / (high - 4.0):
+        return high
+    return float(min(high, max(low, 4.0 + 6.0 / excess_kurtosis)))
+
+
+def _cap_communality(loadings: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Loadings shrunk to leave at least :data:`IDIOSYNCRATIC_FLOOR`, and the idiosyncratic share for unit variance."""
+    communality = (loadings**2).sum(axis=1)
+    loadings = loadings * np.sqrt(np.minimum(1.0, (1.0 - IDIOSYNCRATIC_FLOOR) / communality))[:, None]
+    return loadings, 1.0 - (loadings**2).sum(axis=1)
+
+
+def fit_factor_model(returns: np.ndarray, sigma: np.ndarray, factors: int) -> FactorModel:
+    """Principal-axis factors of ``sigma``'s correlation, with Bartlett scores for every hour of ``returns``.
+
+    ``sigma`` is the covariance estimated from ``returns``, so the loadings
+    follow the production estimator. Principal-axis factoring starts from the
+    squared multiple correlations and refits the reduced correlation until the
+    communalities settle, so the idiosyncratic variances are fitted rather than
+    left over from principal components. Each hour's scores are a weighted
+    least squares fit over the assets that traded in it. The tail comes from the
+    pooled excess kurtosis of the standardized residuals.
+    """
+    observed = ~np.isnan(returns)
+    mean = np.nanmean(returns, axis=0)
+    vol = np.sqrt(np.diagonal(sigma))
+    corr = correlation(sigma)
+    communality = np.clip(1.0 - 1.0 / np.diagonal(np.linalg.inv(corr)), 0.0, 1.0 - IDIOSYNCRATIC_FLOOR)
+    loadings = np.zeros((corr.shape[0], factors))
+    for _ in range(PRINCIPAL_AXIS_ITERATIONS):
+        reduced = corr.copy()
+        np.fill_diagonal(reduced, communality)
+        values, vectors = np.linalg.eigh(reduced)
+        top = np.argsort(values)[::-1][:factors]
+        loadings, idiosyncratic = _cap_communality(vectors[:, top] * np.sqrt(np.clip(values[top], 0.0, None)))
+        settled = np.abs(1.0 - idiosyncratic - communality).max() < 1e-8
+        communality = 1.0 - idiosyncratic
+        if settled:
+            break
+    loadings, idiosyncratic = _cap_communality(loadings)
+    standardized = np.where(observed, (returns - mean) / vol, 0.0)
+    scores = np.zeros((returns.shape[0], factors))
+    residuals = []
+    for hour in range(returns.shape[0]):
+        traded = observed[hour]
+        weighted = loadings[traded] / idiosyncratic[traded, None]
+        scores[hour] = np.linalg.lstsq(weighted.T @ loadings[traded], weighted.T @ standardized[hour, traded],
+                                       rcond=None)[0]
+        fitted = loadings[traded] @ scores[hour]
+        residuals.append((standardized[hour, traded] - fitted) / np.sqrt(idiosyncratic[traded]))
+    pooled = np.concatenate(residuals)
+    pooled = (pooled - pooled.mean()) / pooled.std()
+    tail_df = t_tail_df(float((pooled**4).mean() - 3.0))
+    return FactorModel(mean, vol, loadings, idiosyncratic, scores, observed, tail_df)
+
+
+def factor_synthetic(model: FactorModel, rng: np.random.Generator, assets: int, rows: int, block: int,
+                     loading_jitter: float, vol_jitter: float) -> tuple[np.ndarray, np.ndarray]:
+    """``(returns, sources)``: ``assets`` synthetic assets over ``rows`` hours, and each one's source asset.
+
+    Every synthetic asset copies a uniformly drawn real asset's loading row
+    plus normal jitter of scale ``loading_jitter``, and its volatility times a
+    lognormal jitter of scale ``vol_jitter``. Its idiosyncratic share makes the
+    standardized variance 1, floored at :data:`IDIOSYNCRATIC_FLOOR`. The hours
+    come from a random ``rows``-hour window, block-bootstrapped in ``block``-hour
+    blocks; each asset keeps its source's missing hours in them.
+    """
+    sources = rng.integers(0, model.loadings.shape[0], size=assets)
+    loadings = model.loadings[sources] + loading_jitter * rng.standard_normal((assets, model.loadings.shape[1]))
+    loadings, idiosyncratic = _cap_communality(loadings)
+    vol = model.vol[sources] * np.exp(vol_jitter * rng.standard_normal(assets))
+    start, _ = sample_window(model.scores, rng, rows)
+    hours = block_bootstrap(np.arange(start, start + rows)[:, None], rng, block)[:, 0]
+    df = model.tail_df
+    noise = rng.standard_t(df, size=(rows, assets)) * math.sqrt((df - 2.0) / df)
+    standardized = model.scores[hours] @ loadings.T + noise * np.sqrt(idiosyncratic)
+    returns = model.mean[sources] + vol * standardized
+    returns[~model.observed[hours][:, sources]] = np.nan
+    return returns, sources
 
 
 def pair_overlaps(returns: np.ndarray) -> np.ndarray:

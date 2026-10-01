@@ -25,6 +25,7 @@ PROVENANCE = {
     "iid": "null-iid-normal",
     "shuffle": "null-time-shuffle",
     "rotate": "null-correlation-rotation",
+    "factor": "fitted-factor-synthetic",
 }
 
 

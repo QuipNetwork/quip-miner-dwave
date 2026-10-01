@@ -147,3 +147,83 @@ def test_near_degenerate_count_matches_brute_force_on_a_random_qubo():
 
 def test_near_degenerate_count_declines_an_enumeration_that_is_too_large():
     assert families.near_degenerate_count(np.zeros((40, 40)), 20, tolerance=0.01) is None
+
+
+def _factor_returns(rng: np.random.Generator, rows: int = 4000) -> tuple[np.ndarray, np.ndarray]:
+    """Eight assets on two factors, with stock-style closed hours on the last three."""
+    loadings = np.array([[0.8, 0.0]] * 3 + [[0.6, 0.3]] * 2 + [[0.0, 0.7]] * 3)
+    idiosyncratic = 1.0 - (loadings**2).sum(axis=1)
+    standardized = rng.standard_normal((rows, 2)) @ loadings.T + rng.standard_normal((rows, 8)) * np.sqrt(idiosyncratic)
+    returns = 0.01 * standardized
+    returns[rng.random(rows) < 0.7, 5:] = np.nan
+    return returns, loadings
+
+
+def test_the_marchenko_pastur_rule_counts_only_eigenvalues_above_noise():
+    rng = np.random.default_rng(16)
+    returns, _ = _factor_returns(rng)
+    sigma = np.cov(np.nan_to_num(returns), rowvar=False)
+    assert families.marchenko_pastur_factors(families.correlation(sigma), 4000) == 2
+    noise = np.cov(rng.standard_normal((4000, 8)), rowvar=False)
+    assert families.marchenko_pastur_factors(families.correlation(noise), 4000) == 1
+
+
+def test_the_tail_df_inverts_the_t_excess_kurtosis_within_bounds():
+    assert families.t_tail_df(1.0) == pytest.approx(10.0)
+    assert families.t_tail_df(100.0) == families.TAIL_DF_BOUNDS[0]
+    assert families.t_tail_df(0.0) == families.TAIL_DF_BOUNDS[1]
+
+
+def test_the_factor_fit_recovers_the_common_covariance():
+    returns, loadings = _factor_returns(np.random.default_rng(17))
+    observed = ~np.isnan(returns)
+    sigma = np.ma.cov(np.ma.masked_invalid(returns), rowvar=False, allow_masked=True).filled(0.0)
+    model = families.fit_factor_model(returns, sigma, 2)
+    np.testing.assert_allclose(model.loadings @ model.loadings.T, loadings @ loadings.T, atol=0.1)
+    np.testing.assert_allclose((model.loadings**2).sum(axis=1) + model.idiosyncratic, 1.0)
+    assert model.scores.shape == (returns.shape[0], 2)
+    assert np.array_equal(model.observed, observed)
+    assert families.TAIL_DF_BOUNDS[0] <= model.tail_df <= families.TAIL_DF_BOUNDS[1]
+
+
+def test_the_factor_fit_leaves_every_asset_an_idiosyncratic_floor():
+    returns, _ = _factor_returns(np.random.default_rng(18))
+    sigma = np.cov(np.nan_to_num(returns), rowvar=False)
+    sigma[:3, :3] = 0.9999 * sigma[0, 0] + 0.0001 * np.diag(np.diagonal(sigma[:3, :3]))
+    model = families.fit_factor_model(returns, sigma, 2)
+    assert model.idiosyncratic.min() >= families.IDIOSYNCRATIC_FLOOR - 1e-12
+
+
+def test_synthetic_assets_keep_the_source_structure_and_missing_hours():
+    returns, _ = _factor_returns(np.random.default_rng(19))
+    sigma = np.ma.cov(np.ma.masked_invalid(returns), rowvar=False, allow_masked=True).filled(0.0)
+    model = families.fit_factor_model(returns, sigma, 2)
+    synthetic, sources = families.factor_synthetic(
+        model, np.random.default_rng(20), assets=80, rows=2000, block=24, loading_jitter=0.0, vol_jitter=0.0)
+    assert synthetic.shape == (2000, 80) and sources.shape == (80,)
+    assert set(sources.tolist()) == set(range(8))
+    stock = np.isin(sources, [5, 6, 7])
+    assert not np.isnan(synthetic[:, ~stock]).any()
+    assert np.isnan(synthetic[:, stock]).mean() == pytest.approx(0.7, abs=0.05)
+    copies = np.flatnonzero(sources == 6)
+    for column in copies:
+        assert np.array_equal(np.isnan(synthetic[:, column]), np.isnan(synthetic[:, copies[0]]))
+    first, second = np.flatnonzero(sources == 0)[0], np.flatnonzero(sources == 1)[0]
+    unrelated = np.flatnonzero(sources == 2)[0], np.flatnonzero(sources == 5)[0]
+    assert np.corrcoef(synthetic[:, first], synthetic[:, second])[0, 1] > 0.5
+    pair = synthetic[:, list(unrelated)]
+    pair = pair[~np.isnan(pair).any(axis=1)]
+    assert abs(np.corrcoef(pair[:, 0], pair[:, 1])[0, 1]) < 0.15
+    np.testing.assert_allclose(np.nanstd(synthetic, axis=0), model.vol[sources], rtol=0.15)
+
+
+def test_synthetic_draws_are_reproducible_and_jitter_moves_the_loadings():
+    returns, _ = _factor_returns(np.random.default_rng(21))
+    sigma = np.cov(np.nan_to_num(returns), rowvar=False)
+    model = families.fit_factor_model(returns, sigma, 2)
+
+    def draw(jitter: float) -> np.ndarray:
+        return families.factor_synthetic(model, np.random.default_rng(22), 12, 500, 24, jitter, jitter)[0]
+
+    assert np.array_equal(draw(0.05), draw(0.05), equal_nan=True)
+    assert not np.array_equal(draw(0.05), draw(0.0), equal_nan=True)

@@ -123,10 +123,14 @@ def _source(bk, body: dict[str, Any]):
 
 
 def build_problem(bk, sliders: dict[str, Any], tickers: Sequence[str], returns: np.ndarray,
-                  sigma: np.ndarray | None = None):
-    """The production problem for these returns, as ``backend.orchestration.job`` builds it."""
+                  sigma: np.ndarray | None = None, classes: Sequence[str] | None = None):
+    """The production problem for these returns, as ``backend.orchestration.job`` builds it.
+
+    ``classes`` gives the asset classes of tickers the backend does not list, such as synthetic ones.
+    """
     params = bk.map_sliders(bk.SliderValues.model_validate(sliders), len(tickers))
-    classes = [bk.get_asset(t).asset_class for t in tickers]
+    if classes is None:
+        classes = [bk.get_asset(t).asset_class for t in tickers]
     problem = bk.PortfolioProblem(
         mu=bk.expected_return(returns, bk.config.MU_WINDOW_HOURS),
         Sigma=bk.covariance(returns, classes) if sigma is None else sigma,
