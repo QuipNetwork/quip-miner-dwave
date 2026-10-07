@@ -4,7 +4,7 @@ D-Wave (Ocean) QPU Ising miner for the [quip.network](https://gitlab.com/quip.ne
 v0.3 mining protocol. Ships as a pip-installable Python package with a
 `quip-dwave-qa` console entry point.
 
-Unlike the classical miners (`quip-miner-cpu`/`-cuda`/`-metal`), there is no
+Unlike the classical miners (`quip-solver-cpu`/`-cuda`/`-metal`), there is no
 SA/Gibbs binary split: this backend samples on a D-Wave QPU via Ocean
 (`dwave.system.DWaveSampler`), and every job goes to the QPU.
 
