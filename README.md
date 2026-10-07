@@ -1,4 +1,4 @@
-# quip-miner-dwave
+# quip-solver-dwave
 
 D-Wave (Ocean) QPU Ising miner for the [quip.network](https://gitlab.com/quip.network)
 v0.3 mining protocol. Ships as a pip-installable Python package with a
@@ -31,6 +31,9 @@ chmod +x quip-dwave-qa-darwin-arm64
 mv quip-dwave-qa-darwin-arm64 /usr/local/bin/quip-dwave-qa
 ```
 
+The package path keeps the repository's pre-rename name, `quip-miner-dwave`,
+so every release sits under one package.
+
 Rename it, because the coordinator spawns whatever `[dwave] binary` names and
 its default is `quip-dwave-qa`. The CPU, CUDA, and Metal miners install the
 same way.
@@ -38,7 +41,7 @@ same way.
 ### From source
 
 ```sh
-pip install "quip-miner-dwave @ git+https://gitlab.com/quip.network/quip-miner-dwave.git"
+pip install "git+https://gitlab.com/quip.network/quip-solver-dwave.git"
 ```
 
 The `quip_solver_core` SDK dependency installs from a published PyPI wheel on
@@ -71,7 +74,7 @@ it.
 
 ```sh
 quip-dwave-qa --quip-coordinator unix:///run/quip/coord.sock
-# or: python -m quip_miner_dwave --quip-coordinator ...
+# or: python -m quip_solver_dwave --quip-coordinator ...
 ```
 
 **Driver / fixed-input (run in isolation, no chain).** Use the coordinator's
@@ -213,7 +216,7 @@ Three reasons predate the strategy and still appear where it plays no part: `bud
 
 ```sh
 pip install -e ".[dev]"
-pytest quip_miner_dwave/tests -v
+pytest quip_solver_dwave/tests -v
 ```
 
 ## License
