@@ -1,6 +1,6 @@
 # AGENTS.md
 
-`quip-miner-dwave` is a D-Wave QPU Ising miner for the quip.network v0.3
+`quip-solver-dwave` is a D-Wave QPU Ising miner for the quip.network v0.3
 mining protocol. It speaks the miner gRPC protocol to a coordinator over a
 Unix socket and samples every job on a real QPU through the Ocean SDK.
 
@@ -9,13 +9,13 @@ Unix socket and samples every job on a real QPU through the Ocean SDK.
 ```sh
 pip install -e ".[dev]"                      # dev install
 
-pytest quip_miner_dwave/tests -q             # full suite (~2s, no QPU needed)
-pytest quip_miner_dwave/tests/test_qp_encoding.py -q          # one file
-pytest quip_miner_dwave/tests -q -k "cancel and not accounting"  # by name
-pytest quip_miner_dwave/tests -q --durations=10               # find slow tests
+pytest quip_solver_dwave/tests -q             # full suite (~2s, no QPU needed)
+pytest quip_solver_dwave/tests/test_qp_encoding.py -q          # one file
+pytest quip_solver_dwave/tests -q -k "cancel and not accounting"  # by name
+pytest quip_solver_dwave/tests -q --durations=10               # find slow tests
 
-ruff check quip_miner_dwave/                 # linter (CI does not run it; keep it clean anyway)
-pyright quip_miner_dwave/                    # type checker (same)
+ruff check quip_solver_dwave/                 # linter (CI does not run it; keep it clean anyway)
+pyright quip_solver_dwave/                    # type checker (same)
 
 QUIP_DWAVE_MOCK=1 quip-dwave-qa --check      # offline self-test
 quip-dwave-qa --capabilities                 # print the advertised Capabilities
@@ -23,11 +23,11 @@ quip-dwave-qa --profile --usage-db /data/qpu-usage.db   # day-of-month by hour h
 quip-dwave-qa --quip-coordinator unix:///run/quip/coord.sock
 ```
 
-CI (`.gitlab-ci.yml`) runs `pytest quip_miner_dwave/tests -v`, a wheel build,
+CI (`.gitlab-ci.yml`) runs `pytest quip_solver_dwave/tests -v`, a wheel build,
 and a conformance job that needs the external `quip-solver-drive` harness:
 
 ```sh
-QUIP_SOLVER_DRIVE=/path/to/quip-solver-drive pytest quip_miner_dwave/tests/test_conformance.py -v
+QUIP_SOLVER_DRIVE=/path/to/quip-solver-drive pytest quip_solver_dwave/tests/test_conformance.py -v
 ```
 
 `ruff format` is not this project's baseline — several files predate it and
@@ -55,7 +55,7 @@ They are deliberately separate messages.
 Because everything funnels through that one thread, **nothing on it may block**.
 Two bugs of exactly that shape have been fixed (see `test_ledger_contention`,
 `test_budget_cache`), and a sibling miner lost up to 87 seconds per round to the same
-class of problem (`quip-miner#33`). Do not add IO under `state_lock`.
+class of problem (`quip-solver#33`). Do not add IO under `state_lock`.
 
 ### A Cancel is the only round boundary the miner can see
 
