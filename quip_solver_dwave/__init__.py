@@ -24,5 +24,6 @@ ALGORITHM = "quantum-anneal"
 # drift apart.
 MAX_NODES = 10_000
 MAX_EDGES = 100_000
-# "anneal-time" is SPEC section 2's: --solve accepts anneal_time_us.
-FEATURES = ("quantum-anneal", "native-topology", "anneal-time")
+# "anneal-time" and "embed" are SPEC section 2's: --solve accepts
+# anneal_time_us, and the binary accepts --embed.
+FEATURES = ("quantum-anneal", "native-topology", "anneal-time", "embed")
