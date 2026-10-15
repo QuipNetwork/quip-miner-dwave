@@ -56,22 +56,48 @@ build-wheel:
 # the suffix gives the binary the coordinator asks for. The user's machine
 # needs nothing but the file.
 #
-# Runs on the group's Apple Silicon runners (`cray`, `tesla-arm`), which are
-# shell executors: `image:` does not apply and the default before_script's
-# apt-get would fail, so this job replaces it wholesale.
-build-macos-arm64:
+# Every platform shares this template. A job sets PLATFORM (`<os>-<arch>`, the
+# asset suffix), activates a venv carrying Python 3.12 in its before_script,
+# and appends its own linked-library check to the script below.
+.build-frozen:
   stage: build
-  tags: [macos, arm64]
   rules:
     - if: $CI_COMMIT_TAG
-    # Also run on a merge request that changes the build itself. The macOS
-    # bootstrap can only be proved on a real macOS runner, and proving it after
-    # a tag is pushed is too late: a tag pipeline runs the .gitlab-ci.yml that
-    # exists at that tag, so a fix cannot rescue a release already cut.
+    # Also run on a merge request that changes the build itself. Each platform's
+    # bootstrap can only be proved on that platform's runner, and proving it
+    # after a tag is pushed is too late: a tag pipeline runs the .gitlab-ci.yml
+    # that exists at that tag, so a fix cannot rescue a release already cut.
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
       changes:
         - .gitlab-ci.yml
         - pyinstaller/**/*
+  script:
+    - uv pip install -q ".[dev]" pyinstaller
+    # Library-level check before freezing. A break in Ocean or
+    # quip_solver_core surfaces here with a readable traceback instead of as a
+    # ModuleNotFoundError from inside the bundle.
+    - pytest quip_solver_dwave/tests -q
+    - pyinstaller --clean --noconfirm --distpath dist --workpath .pyi-build pyinstaller/quip-dwave-qa.spec
+    - mv dist/quip-dwave-qa "dist/quip-dwave-qa-${PLATFORM}"
+    - ls -l dist/
+    # The bundle has to run, not just build: PyInstaller reports success for a
+    # binary that cannot import Ocean. `--check` imports dimod and dwave, which
+    # is exactly what the namespace-package handling in the spec fixes.
+    - ./dist/quip-dwave-qa-${PLATFORM} --version
+    - ./dist/quip-dwave-qa-${PLATFORM} --capabilities
+    - QUIP_DWAVE_MOCK=1 ./dist/quip-dwave-qa-${PLATFORM} --check
+  artifacts:
+    paths: [dist/]
+    expire_in: 1 week
+
+# Runs on the group's Apple Silicon runners (`cray`, `tesla-arm`), which are
+# shell executors: `image:` does not apply and the default before_script's
+# apt-get would fail, so this job replaces it wholesale.
+build-macos-arm64:
+  extends: .build-frozen
+  tags: [macos, arm64]
+  variables:
+    PLATFORM: darwin-arm64
   before_script:
     # No Homebrew. This job needs one thing from the host, a Python 3.12
     # interpreter, and Homebrew is the wrong way to get it on a shared runner:
@@ -104,33 +130,61 @@ build-macos-arm64:
     - . .venv/bin/activate
     - python --version
   script:
-    - uv pip install -q ".[dev]" pyinstaller
-    # Library-level check before freezing. A break in Ocean or
-    # quip_solver_core surfaces here with a readable traceback instead of as a
-    # ModuleNotFoundError from inside the bundle.
-    - pytest quip_solver_dwave/tests -q
-    - pyinstaller --clean --noconfirm --distpath dist --workpath .pyi-build pyinstaller/quip-dwave-qa.spec
-    - mv dist/quip-dwave-qa dist/quip-dwave-qa-darwin-arm64
-    - ls -l dist/
-    # The bundle has to run, not just build: PyInstaller reports success for a
-    # binary that cannot import Ocean. `--check` imports dimod and dwave, which
-    # is exactly what the namespace-package handling in the spec fixes.
-    - ./dist/quip-dwave-qa-darwin-arm64 --version
-    - ./dist/quip-dwave-qa-darwin-arm64 --capabilities
-    - QUIP_DWAVE_MOCK=1 ./dist/quip-dwave-qa-darwin-arm64 --check
+    - !reference [.build-frozen, script]
     # Self-contained means macOS system libraries only. A link against a
     # Homebrew or uv-managed libpython would mean the binary runs on this
     # builder and nowhere else.
     - otool -L dist/quip-dwave-qa-darwin-arm64 | tail -n +2
     - "! otool -L dist/quip-dwave-qa-darwin-arm64 | grep -qE '/opt/homebrew|/usr/local|/\\.local/share/uv'"
-  artifacts:
-    paths: [dist/]
-    expire_in: 1 week
 
-# On a tag: upload the wheel and the macOS executable to the generic package
-# registry, then cut a Release linking both. Neither build job is optional, so
-# a missing artifact means one of them failed — fail here rather than quietly
-# publishing a release with a hole in it.
+# Linux builds run in a container. Debian bookworm rather than the default
+# image's newer base: the binary carries the builder's libpython, and that sets
+# the oldest glibc the binary will start on. quip-solver-core's wheels are
+# manylinux_2_34, so glibc 2.34 is the floor in any case.
+.build-frozen-linux:
+  extends: .build-frozen
+  image: python:3.12-slim-bookworm
+  before_script:
+    # PyInstaller reads every extension's shared-library dependencies with
+    # objdump, which the slim image does not carry.
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends binutils
+    - pip install -q "uv==${UV_VERSION}"
+    - uv --version
+    # Freeze the image's own interpreter rather than letting uv fetch another.
+    # before_script and script share one shell, so this venv stays active
+    # below.
+    - uv venv --python-preference only-system --python 3.12 .venv
+    - . .venv/bin/activate
+    - python --version
+  script:
+    - !reference [.build-frozen, script]
+    # ldd sees only the bootloader; the bundled libraries are unpacked and
+    # loaded at run time. The bootloader must resolve against the base system
+    # alone, not against the image's /usr/local Python or the build venv.
+    - ldd dist/quip-dwave-qa-${PLATFORM}
+    - "! ldd dist/quip-dwave-qa-${PLATFORM} | grep -qE 'not found|/usr/local|/\\.venv/'"
+
+build-linux-amd64:
+  extends: .build-frozen-linux
+  tags: [linux, amd64]
+  variables:
+    PLATFORM: linux-amd64
+
+# `docker` picks the group's Docker executors on Apple Silicon Macs
+# (`tesla-docker`, `roman-mac-docker`), which run linux/arm64 images natively.
+# `arm64` alone would also match the macOS shell runners, which ignore
+# `image:`.
+build-linux-arm64:
+  extends: .build-frozen-linux
+  tags: [arm64, docker]
+  variables:
+    PLATFORM: linux-arm64
+
+# On a tag: upload the wheel and every frozen executable to the generic package
+# registry, then cut a Release linking them. No build job is optional: a failed
+# one stops the pipeline before this stage. The check below catches a glob that
+# matched nothing, which the shell would otherwise pass on as a literal path —
+# fail here rather than quietly publishing a release with a hole in it.
 upload:
   stage: release
   image: curlimages/curl:latest
@@ -139,13 +193,13 @@ upload:
   before_script: []
   script:
     - |
-      for want in dist/*.whl dist/quip-dwave-qa-darwin-arm64; do
+      for want in dist/*.whl dist/quip-dwave-qa-*; do
         if [ ! -f "$want" ]; then
           echo "missing $want — an upstream build job did not produce it" >&2
           exit 1
         fi
       done
-      for f in dist/*.whl dist/quip-dwave-qa-darwin-arm64; do
+      for f in dist/*.whl dist/quip-dwave-qa-*; do
         n=$(basename "$f")
         curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$f" \
           "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PKG}/${CI_COMMIT_TAG}/${n}"
@@ -156,13 +210,17 @@ release:
   image: registry.gitlab.com/gitlab-org/release-cli:latest
   rules:
     - if: $CI_COMMIT_TAG
-  needs: [upload, build-wheel, build-macos-arm64]
+  needs: [upload, build-wheel, build-macos-arm64, build-linux-amd64, build-linux-arm64]
   before_script: []
   script:
     - |
       whl=$(basename dist/*.whl)
-      bin=quip-dwave-qa-darwin-arm64
       base="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PKG}/${CI_COMMIT_TAG}"
-      release-cli create --name "quip-solver-dwave ${CI_COMMIT_TAG}" --tag-name "${CI_COMMIT_TAG}" \
-        --assets-link "{\"name\":\"${whl}\",\"url\":\"${base}/${whl}\"}" \
-        --assets-link "{\"name\":\"${bin}\",\"url\":\"${base}/${bin}\"}"
+      # POSIX sh has no arrays; the positional parameters collect one
+      # --assets-link per file.
+      set -- --assets-link "{\"name\":\"${whl}\",\"url\":\"${base}/${whl}\"}"
+      for f in dist/quip-dwave-qa-*; do
+        bin=$(basename "$f")
+        set -- "$@" --assets-link "{\"name\":\"${bin}\",\"url\":\"${base}/${bin}\"}"
+      done
+      release-cli create --name "quip-solver-dwave ${CI_COMMIT_TAG}" --tag-name "${CI_COMMIT_TAG}" "$@"

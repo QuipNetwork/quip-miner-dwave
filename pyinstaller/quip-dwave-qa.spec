@@ -18,6 +18,7 @@ cannot import Ocean.
 """
 
 import os
+import sys
 
 from PyInstaller.utils.hooks import collect_all
 
@@ -108,5 +109,9 @@ exe = EXE(  # noqa: F821 - PyInstaller global
     strip=False,
     upx=False,
     console=True,
-    target_arch="arm64",
+    # target_arch is a macOS-only option that PyInstaller discards elsewhere.
+    # Passing None off macOS says so here too, instead of a spec that reads as
+    # if it built arm64 on an x86_64 Linux runner. A Linux build always targets
+    # the interpreter's own arch.
+    target_arch="arm64" if sys.platform == "darwin" else None,
 )
