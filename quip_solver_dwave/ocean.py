@@ -154,6 +154,9 @@ class SampleResult:
     # Problems this sampler already had on the QPU when this one was handed
     # over. With the round trip, Little's law turns it into throughput.
     inflight_at_submit: int = 0
+    # Anneals behind each row of ``spins``: the cloud folds identical reads
+    # into one row. None from a sampler double that does not say.
+    occurrences: Optional[List[int]] = None
 
 
 class SupportsSample(Protocol):
@@ -217,6 +220,19 @@ class MockSampler:
             # ExactSolver returns every state; keep the lowest-energy rows.
             if len(ss) > num_reads:
                 ss = ss.truncate(num_reads)
+            elif len(ss) < num_reads:
+                # A chip runs every anneal it is asked for, so a model with
+                # fewer states than reads still answers num_reads anneals. The
+                # extra ones land in the ground state, the first sorted row.
+                ss = ss.truncate(len(ss))
+                occurrences = np.ones(len(ss), dtype=np.int64)
+                occurrences[0] += num_reads - len(ss)
+                ss = dimod.SampleSet.from_samples(
+                    (ss.record.sample, ss.variables),
+                    dimod.SPIN,
+                    energy=ss.record.energy,
+                    num_occurrences=occurrences,
+                )
         else:
             ss = self._sampler.sample_ising(h, j, num_reads=num_reads)
         elapsed_us = max(1, int((time.monotonic() - t0) * 1_000_000))
@@ -418,6 +434,22 @@ class OceanSampler:
     @property
     def live_edges(self) -> List[Tuple[int, int]]:
         return list(self._live_edges)
+
+    @property
+    def max_reads(self) -> Optional[int]:
+        """Most reads one problem may ask for, from the connected solver's
+        ``num_reads_range``. ``None`` when the solver publishes no range."""
+        props = getattr(self._qpu_solver, "properties", None) or {}
+        reads_range = props.get("num_reads_range")
+        return int(reads_range[1]) if reads_range else None
+
+    @property
+    def anneal_time_range(self) -> Optional[Tuple[float, float]]:
+        """The anneal times in microseconds the connected solver accepts, from
+        its ``annealing_time_range``. ``None`` when it publishes no range."""
+        props = getattr(self._qpu_solver, "properties", None) or {}
+        time_range = props.get("annealing_time_range")
+        return (float(time_range[0]), float(time_range[1])) if time_range else None
 
     def set_session_topology(
         self,
@@ -813,4 +845,5 @@ class OceanSampler:
             submitted_on_s=submitted_on_s,
             solved_on_s=solved_on_s,
             inflight_at_submit=inflight_before,
+            occurrences=view.occurrences,
         )
