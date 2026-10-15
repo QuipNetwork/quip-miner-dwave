@@ -13,6 +13,7 @@ from quip_solver_core.session import DEFAULT_NUM_SWEEPS
 from quip_solver_dwave import MAX_EDGES, MAX_NODES
 from quip_solver_dwave.config import SamplingDefaults
 from quip_solver_dwave.ocean import SampleResult, SupportsSample, is_solver_offline
+from quip_solver_dwave.qp import OffChipError
 
 logger = logging.getLogger(__name__)
 
@@ -405,6 +406,14 @@ def handle_job(
             # a job with no defects is given no seed at all.
             cancel_key=bytes(job_id) if job_id else None,
         )
+    except OffChipError as exc:
+        # A graph that does not fit this chip never will, so the coordinator
+        # must route it elsewhere rather than resend it here. Expected input,
+        # so no traceback.
+        logger.warning(
+            "job %s: %s; rejecting TOPOLOGY_MISMATCH", job_id.hex(), exc
+        )
+        return _reject(job_id, miner_pb2.TOPOLOGY_MISMATCH)
     except Exception as exc:
         if is_solver_offline(exc):
             raise SolverUnavailable(job_id) from exc
